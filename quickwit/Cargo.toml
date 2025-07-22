@@ -349,6 +349,7 @@ tantivy = { git = "https://github.com/SekoiaLab/tantivy", branch = "feat/query_g
     "mmap",
     "quickwit",
     "zstd-compression",
+    "columnar-zstd-compression",
 ] }
 tantivy-fst = "0.5"
 
