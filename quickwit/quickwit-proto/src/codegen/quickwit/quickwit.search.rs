@@ -143,6 +143,9 @@ pub struct SearchRequest {
     /// Time filter, expressed in seconds since epoch.
     /// That filter is to be interpreted as the semi-open interval:
     /// [start_timestamp, end_timestamp).
+    /// If the query AST contains a range query over the timestamp field,
+    /// then the the bounds of the range query are used directly and
+    /// these two fields are ignored.
     #[prost(int64, optional, tag = "4")]
     pub start_timestamp: ::core::option::Option<i64>,
     #[prost(int64, optional, tag = "5")]
@@ -178,6 +181,10 @@ pub struct SearchRequest {
     pub search_after: ::core::option::Option<PartialHit>,
     #[prost(enumeration = "CountHits", tag = "17")]
     pub count_hits: i32,
+    /// When an exact index_id is provided (not a pattern), the query fails if that
+    /// index is missing and this is false.
+    #[prost(bool, tag = "18")]
+    pub ignore_missing_indexes: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Eq, Hash)]
