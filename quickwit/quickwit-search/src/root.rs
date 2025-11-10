@@ -40,11 +40,11 @@ use quickwit_query::query_ast::{
     BoolQuery, QueryAst, QueryAstVisitor, RangeQuery, TermQuery, TermSetQuery,
 };
 use serde::{Deserialize, Serialize};
-use tantivy::TantivyError;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::collector::Collector;
 use tantivy::schema::{Field, FieldEntry, FieldType, Schema};
+use tantivy::{TantivyError, query};
 use tracing::{debug, info_span, instrument};
 
 use crate::cluster_client::ClusterClient;
@@ -1196,6 +1196,15 @@ pub async fn root_search(
     mut metastore: MetastoreServiceClient,
     cluster_client: &ClusterClient,
 ) -> crate::Result<SearchResponse> {
+    use once_cell::sync::OnceCell;
+    static QUERY_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static SAMPLING_RATE: OnceCell<u64> = OnceCell::new();
+    let rate = *SAMPLING_RATE
+        .get_or_init(|| quickwit_common::get_from_env("QW_SEARCH_SAMPLING", 100, false));
+    let counter = QUERY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if counter.wrapping_mul(2654435761) % 100 >= rate {
+        return Err(crate::SearchError::TooManyRequests);
+    }
     let start_instant = Instant::now();
 
     let (split_metadatas, indexes_meta_for_leaf_search) = RootSearchMetricsFuture {
