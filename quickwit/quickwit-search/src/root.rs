@@ -1212,6 +1212,24 @@ pub async fn root_search(
     current_span.record("num_docs", num_docs);
     current_span.record("num_splits", num_splits);
 
+    if let Some(max_total_split_searches) =
+        searcher_context.searcher_config.max_total_split_searches
+    {
+        if max_total_split_searches < num_splits {
+            tracing::error!(
+                num_splits,
+                max_total_split_searches,
+                index=?search_request.index_id_patterns,
+                query=%search_request.query_ast,
+                "max total splits exceeded"
+            );
+            return Err(SearchError::InvalidArgument(format!(
+                "Number of targeted splits {num_splits} exceeds the limit \
+                 {max_total_split_searches}"
+            )));
+        }
+    }
+
     let mut search_response_result = RootSearchMetricsFuture {
         start: start_instant,
         tracked: root_search_aux(
