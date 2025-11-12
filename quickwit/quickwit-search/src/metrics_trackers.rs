@@ -26,6 +26,7 @@ use crate::metrics::SEARCH_METRICS;
 
 // root
 
+#[derive(Debug)]
 pub enum RootSearchMetricsStep {
     Plan,
     Exec { num_targeted_splits: usize },
@@ -85,14 +86,17 @@ impl<F> PinnedDrop for RootSearchMetricsFuture<F> {
     }
 }
 
-impl<F, R, E> Future for RootSearchMetricsFuture<F>
-where F: Future<Output = Result<R, E>>
+impl<F, R> Future for RootSearchMetricsFuture<F>
+where F: Future<Output = crate::Result<R>>
 {
-    type Output = Result<R, E>;
+    type Output = crate::Result<R>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let response = ready!(this.tracked.poll(cx));
+        if let Err(err) = &response {
+            tracing::error!(?err, step = ?this.step, "root search failed");
+        }
         *this.is_success = Some(response.is_ok());
         Poll::Ready(Ok(response?))
     }
