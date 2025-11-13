@@ -201,77 +201,64 @@ where
     }
 }
 
-pub struct S3Marker;
+mod s3_impls {
+    use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 
-impl<R, E> AsRequestStatus<S3Marker> for Result<R, E>
-where E: aws_sdk_s3::error::ProvideErrorMetadata
-{
-    fn as_status(&self) -> RequestStatus {
-        let status_str = match self {
-            Ok(_) => "success".to_string(),
-            Err(e) => e.meta().code().unwrap_or("unknown").to_string(),
-        };
-        RequestStatus::Ready(status_str)
-    }
-}
+    use super::{AsRequestStatus, RequestStatus};
 
-#[cfg(feature = "azure")]
-pub struct AzureMarker;
+    pub struct S3Marker;
 
-#[cfg(feature = "azure")]
-impl<R> AsRequestStatus<AzureMarker> for Result<R, azure_storage::Error> {
-    fn as_status(&self) -> RequestStatus {
-        let Err(err) = self else {
-            return RequestStatus::Ready("success".to_string());
-        };
-        let err_status_str = match err.kind() {
-            azure_storage::ErrorKind::HttpResponse { status, .. } => status.to_string(),
-            azure_storage::ErrorKind::Credential => "credential".to_string(),
-            azure_storage::ErrorKind::Io => "io".to_string(),
-            azure_storage::ErrorKind::DataConversion => "data_conversion".to_string(),
-            _ => "unknown".to_string(),
-        };
-        RequestStatus::Ready(err_status_str)
-    }
-}
-
-// The Azure SDK get_blob request returns Option<Result> because it chunks
-// the download into a stream of get requests.
-#[cfg(feature = "azure")]
-impl<R> AsRequestStatus<AzureMarker> for Option<Result<R, azure_storage::Error>> {
-    fn as_status(&self) -> RequestStatus {
-        match self {
-            None => RequestStatus::Done,
-            Some(res) => res.as_status(),
+    impl<R, E: ProvideErrorMetadata> AsRequestStatus<S3Marker> for Result<R, SdkError<E>> {
+        fn as_status(&self) -> RequestStatus {
+            let status_str = match self {
+                Ok(_) => "success".to_string(),
+                Err(SdkError::ConstructionFailure(_)) => "construction_failure".to_string(),
+                Err(SdkError::TimeoutError(_)) => "timeout_error".to_string(),
+                Err(SdkError::DispatchFailure(_)) => "dispatch_failure".to_string(),
+                Err(SdkError::ResponseError(_)) => "response_error".to_string(),
+                Err(e @ SdkError::ServiceError(_)) => e
+                    .meta()
+                    .code()
+                    .unwrap_or("unknown_service_error")
+                    .to_string(),
+                Err(_) => "unknown".to_string(),
+            };
+            RequestStatus::Ready(status_str)
         }
     }
 }
 
-#[cfg(feature = "gcs")]
-pub struct GcsMarker;
+#[cfg(feature = "azure")]
+mod azure_impl {
+    use super::{AsRequestStatus, RequestStatus};
 
-#[cfg(feature = "gcs")]
-impl<R> AsRequestStatus<GcsMarker> for Result<R, opendal::Error> {
-    fn as_status(&self) -> RequestStatus {
-        let Err(err) = self else {
-            return RequestStatus::Ready("success".to_string());
-        };
-        let err_status_str = match err.kind() {
-            opendal::ErrorKind::Unexpected => "unexpected".to_string(),
-            opendal::ErrorKind::Unsupported => "unsupported".to_string(),
-            opendal::ErrorKind::ConfigInvalid => "config_invalid".to_string(),
-            opendal::ErrorKind::NotFound => "not_found".to_string(),
-            opendal::ErrorKind::PermissionDenied => "permission_denied".to_string(),
-            opendal::ErrorKind::IsADirectory => "is_a_directory".to_string(),
-            opendal::ErrorKind::NotADirectory => "not_a_directory".to_string(),
-            opendal::ErrorKind::AlreadyExists => "already_exists".to_string(),
-            opendal::ErrorKind::RateLimited => "rate_limited".to_string(),
-            opendal::ErrorKind::IsSameFile => "is_same_file".to_string(),
-            opendal::ErrorKind::ConditionNotMatch => "condition_not_match".to_string(),
-            opendal::ErrorKind::RangeNotSatisfied => "range_not_satisfied".to_string(),
-            _ => "unknown".to_string(),
-        };
-        RequestStatus::Ready(err_status_str)
+    pub struct AzureMarker;
+
+    impl<R> AsRequestStatus<AzureMarker> for Result<R, azure_storage::Error> {
+        fn as_status(&self) -> RequestStatus {
+            let Err(err) = self else {
+                return RequestStatus::Ready("success".to_string());
+            };
+            let err_status_str = match err.kind() {
+                azure_storage::ErrorKind::HttpResponse { status, .. } => status.to_string(),
+                azure_storage::ErrorKind::Credential => "credential".to_string(),
+                azure_storage::ErrorKind::Io => "io".to_string(),
+                azure_storage::ErrorKind::DataConversion => "data_conversion".to_string(),
+                _ => "unknown".to_string(),
+            };
+            RequestStatus::Ready(err_status_str)
+        }
+    }
+
+    // The Azure SDK get_blob request returns Option<Result> because it chunks
+    // the download into a stream of get requests.
+    impl<R> AsRequestStatus<AzureMarker> for Option<Result<R, azure_storage::Error>> {
+        fn as_status(&self) -> RequestStatus {
+            match self {
+                None => RequestStatus::Done,
+                Some(res) => res.as_status(),
+            }
+        }
     }
 }
 
