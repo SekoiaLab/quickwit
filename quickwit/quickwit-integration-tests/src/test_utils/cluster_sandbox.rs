@@ -48,7 +48,7 @@ use reqwest::Url;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::shutdown::NodeShutdownHandle;
 
@@ -178,7 +178,7 @@ impl ResolvedClusterConfig {
     pub async fn start(self) -> ClusterSandbox {
         rustls::crypto::ring::default_provider()
             .install_default()
-            .expect("rustls crypto ring default provider installation should not fail");
+            .unwrap_or_else(|_| warn!("failed to install default ring crypto provider"));
 
         let mut node_shutdown_handles = Vec::new();
         let runtimes_config = RuntimesConfig::light_for_tests();
