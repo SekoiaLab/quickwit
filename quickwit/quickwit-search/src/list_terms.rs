@@ -215,7 +215,7 @@ async fn leaf_list_terms_single_split(
     let cache =
         ByteRangeCache::with_infinite_capacity(&quickwit_storage::STORAGE_METRICS.shortlived_cache);
     let (index, _) =
-        open_index_with_caches(searcher_context, storage, &split, None, Some(cache)).await?;
+        open_index_with_caches(searcher_context, storage, &split, None, Some(cache), false).await?;
     let split_schema = index.schema();
     let reader = index
         .reader_builder()

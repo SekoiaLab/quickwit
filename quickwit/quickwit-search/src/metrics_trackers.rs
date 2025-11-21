@@ -114,6 +114,7 @@ where F: Future<Output = Result<LeafSearchResponse, SearchError>>
     pub start: Instant,
     pub targeted_splits: usize,
     pub status: Option<&'static str>,
+    pub is_broad_search: bool,
 }
 
 #[pinned_drop]
@@ -121,7 +122,12 @@ impl<F> PinnedDrop for LeafSearchMetricsFuture<F>
 where F: Future<Output = Result<LeafSearchResponse, SearchError>>
 {
     fn drop(self: Pin<&mut Self>) {
-        let label_values = [self.status.unwrap_or("cancelled")];
+        let queue_label = if self.is_broad_search {
+            "secondary"
+        } else {
+            "primary"
+        };
+        let label_values = [self.status.unwrap_or("cancelled"), queue_label];
         SEARCH_METRICS
             .leaf_search_requests_total
             .with_label_values(label_values)
