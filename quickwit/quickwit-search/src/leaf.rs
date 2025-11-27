@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bytesize::ByteSize;
+use futures::TryFutureExt;
 use futures::future::try_join_all;
 use quickwit_common::pretty::PrettySample;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
@@ -1167,6 +1168,7 @@ pub async fn multi_index_leaf_search(
     leaf_search_request: LeafSearchRequest,
     storage_resolver: &StorageResolver,
     is_broad_search: bool,
+    timeout_deadline: tokio::time::Instant,
 ) -> Result<LeafSearchResponse, SearchError> {
     let search_request: Arc<SearchRequest> = leaf_search_request
         .search_request
@@ -1216,7 +1218,7 @@ pub async fn multi_index_leaf_search(
             let searcher_context = searcher_context.clone();
             let search_request = search_request.clone();
             let aggregation_limits = aggregation_limits.clone();
-            async move {
+            let instrumented_future = async move {
                 let storage = storage_resolver.resolve(&index_uri).await?;
                 single_doc_mapping_leaf_search(
                     searcher_context,
@@ -1226,21 +1228,18 @@ pub async fn multi_index_leaf_search(
                     doc_mapper,
                     aggregation_limits,
                     is_broad_search,
+                    timeout_deadline,
                 )
                 .await
-            }
-            .in_current_span()
+            };
+            async move { tokio::time::timeout_at(timeout_deadline, instrumented_future).await? }
+                .in_current_span()
         });
         leaf_request_tasks.push(leaf_request_future);
     }
 
-    let timeout = if is_broad_search {
-        searcher_context.searcher_config.secondary_request_timeout()
-    } else {
-        searcher_context.searcher_config.request_timeout()
-    };
     let leaf_responses: Vec<crate::Result<LeafSearchResponse>> =
-        tokio::time::timeout(timeout, try_join_all(leaf_request_tasks)).await??;
+        try_join_all(leaf_request_tasks).await?;
     let merge_collector = make_merge_collector(&search_request, &aggregation_limits)?;
     let mut incremental_merge_collector = IncrementalCollector::new(merge_collector);
     for result in leaf_responses {
@@ -1294,6 +1293,7 @@ fn disable_search_request_hits(search_request: &mut SearchRequest) {
 /// [PartialHit](quickwit_proto::search::PartialHit) candidates. The root will be in
 /// charge to consolidate, identify the actual final top hits to display, and
 /// fetch the actual documents to convert the partial hits into actual Hits.
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(index = ?PrettySample::new(&request.index_id_patterns, 5)))]
 pub async fn single_doc_mapping_leaf_search(
     searcher_context: Arc<SearcherContext>,
@@ -1303,6 +1303,7 @@ pub async fn single_doc_mapping_leaf_search(
     doc_mapper: Arc<DocMapper>,
     aggregations_limits: AggregationLimitsGuard,
     is_broad_search: bool,
+    timeout_deadline: tokio::time::Instant,
 ) -> Result<LeafSearchResponse, SearchError> {
     let num_docs: u64 = splits.iter().map(|split| split.num_docs).sum();
     let num_splits = splits.len();
@@ -1362,18 +1363,22 @@ pub async fn single_doc_mapping_leaf_search(
         leaf_search_single_split_join_handles.push((
             split.split_id.clone(),
             tokio::spawn(
-                leaf_search_single_split_wrapper(
-                    request,
-                    searcher_context.clone(),
-                    index_storage.clone(),
-                    doc_mapper.clone(),
-                    split,
-                    split_filter.clone(),
-                    incremental_merge_collector.clone(),
-                    leaf_split_search_permit,
-                    aggregations_limits.clone(),
-                    is_broad_search,
+                tokio::time::timeout_at(
+                    timeout_deadline,
+                    leaf_search_single_split_wrapper(
+                        request,
+                        searcher_context.clone(),
+                        index_storage.clone(),
+                        doc_mapper.clone(),
+                        split,
+                        split_filter.clone(),
+                        incremental_merge_collector.clone(),
+                        leaf_split_search_permit,
+                        aggregations_limits.clone(),
+                        is_broad_search,
+                    ),
                 )
+                .unwrap_or_else(|_| ())
                 .in_current_span(),
             ),
         ));

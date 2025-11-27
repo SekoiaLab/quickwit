@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use assert_json_diff::{assert_json_eq, assert_json_include};
 use quickwit_config::SearcherConfig;
@@ -1059,6 +1060,7 @@ async fn test_search_util(test_sandbox: &TestSandbox, query: &str) -> Vec<u32> {
         test_sandbox.doc_mapper(),
         agg_limits,
         false,
+        tokio::time::Instant::now() + Duration::from_secs(60),
     )
     .await
     .unwrap();

@@ -196,20 +196,28 @@ impl SearchService for SearchServiceImpl {
         } else {
             false
         };
+        let timeout = if is_broad_search {
+            self.searcher_context
+                .searcher_config
+                .secondary_request_timeout()
+        } else {
+            self.searcher_context.searcher_config.request_timeout()
+        };
 
-        LeafSearchMetricsFuture {
+        let tracked_multi_index_leaf_search_future = LeafSearchMetricsFuture {
             tracked: multi_index_leaf_search(
                 self.searcher_context.clone(),
                 leaf_search_request,
                 &self.storage_resolver,
                 is_broad_search,
+                tokio::time::Instant::now() + timeout,
             ),
             start: Instant::now(),
             targeted_splits: num_splits,
             status: None,
             is_broad_search,
-        }
-        .await
+        };
+        tokio::time::timeout(timeout, tracked_multi_index_leaf_search_future).await?
     }
 
     async fn fetch_docs(
