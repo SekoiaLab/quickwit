@@ -75,6 +75,8 @@ pub struct DocMapper {
     timestamp_field_name: Option<String>,
     /// Timestamp field path (name parsed)
     timestamp_field_path: Option<Vec<String>>,
+    /// Secondary timestamp field name.
+    secondary_timestamp_field_name: Option<String>,
     /// Root node of the field mapping tree.
     /// See [`MappingNode`].
     field_mappings: MappingNode,
@@ -138,6 +140,7 @@ impl From<DocMapper> for DocMapperBuilder {
             mode: default_doc_mapper.mode,
             field_mappings: default_doc_mapper.field_mappings.into(),
             timestamp_field: default_doc_mapper.timestamp_field_name,
+            secondary_timestamp_field: default_doc_mapper.secondary_timestamp_field_name,
             tag_fields: default_doc_mapper.tag_field_names,
             partition_key: partition_key_opt,
             max_num_partitions: default_doc_mapper.max_num_partitions,
@@ -288,6 +291,7 @@ impl TryFrom<DocMapperBuilder> for DocMapper {
             default_search_field_names,
             timestamp_field_name: doc_mapping.timestamp_field,
             timestamp_field_path,
+            secondary_timestamp_field_name: doc_mapping.secondary_timestamp_field,
             field_mappings,
             concatenate_dynamic_fields,
             tag_field_names,
@@ -665,6 +669,11 @@ impl DocMapper {
     /// Returns the timestamp field name.
     pub fn timestamp_field_name(&self) -> Option<&str> {
         self.timestamp_field_name.as_deref()
+    }
+
+    /// Returns the secondary timestamp field name.
+    pub fn secondary_timestamp_field_name(&self) -> Option<&str> {
+        self.secondary_timestamp_field_name.as_deref()
     }
 
     /// Returns the tag `NameField`s on the current schema.
