@@ -14,4 +14,7 @@
 
 mod rest_handler;
 
-pub use rest_handler::{IndexingApi, indexing_get_handler};
+pub use rest_handler::{
+    IndexingApi, IndexingPipelineResponse, IndexingPipelinesResponse, indexing_get_handler,
+    indexing_pipelines_handler,
+};
