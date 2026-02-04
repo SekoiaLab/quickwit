@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use quickwit_actors::ActorExitStatus;
 use quickwit_common::tower::BoxFutureInfaillible;
-use quickwit_config::service::QuickwitService;
-use quickwit_proto::types::NodeId;
 use tokio::sync::watch::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
@@ -26,19 +24,15 @@ type NodeJoinHandle = JoinHandle<Result<HashMap<String, ActorExitStatus>, anyhow
 pub(crate) struct NodeShutdownHandle {
     sender: Sender<()>,
     receiver: Receiver<()>,
-    pub node_services: HashSet<QuickwitService>,
-    pub node_id: NodeId,
     join_handle_opt: Option<NodeJoinHandle>,
 }
 
 impl NodeShutdownHandle {
-    pub(crate) fn new(node_id: NodeId, node_services: HashSet<QuickwitService>) -> Self {
+    pub(crate) fn new() -> Self {
         let (sender, receiver) = watch::channel(());
         Self {
             sender,
             receiver,
-            node_id,
-            node_services,
             join_handle_opt: None,
         }
     }

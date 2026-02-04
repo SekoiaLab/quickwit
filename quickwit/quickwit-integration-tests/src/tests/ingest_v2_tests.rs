@@ -24,12 +24,12 @@ use quickwit_metastore::SplitState;
 use quickwit_proto::ingest::ParseFailureReason;
 use quickwit_rest_client::error::{ApiError, Error};
 use quickwit_rest_client::models::IngestSource;
-use quickwit_rest_client::rest_client::CommitType;
+use quickwit_rest_client::rest_client::{CommitType, QuickwitClientBuilder};
 use quickwit_serve::{ListSplitsQueryParams, RestIngestResponse, RestParseFailure};
 use serde_json::json;
 
 use crate::ingest_json;
-use crate::test_utils::{ClusterSandboxBuilder, ingest};
+use crate::test_utils::{ClusterSandboxBuilder, STANDALONE_NODE_NAME, ingest};
 
 /// Ingesting on a freshly re-created index sometimes fails, see #5430
 #[tokio::test]
@@ -54,14 +54,14 @@ async fn test_ingest_recreated_index() {
             "#
     );
     let current_index_metadata = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config.clone(), ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "first record"}),
         CommitType::Force,
@@ -75,7 +75,7 @@ async fn test_ingest_recreated_index() {
         .unwrap();
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .delete(index_id, false)
         .await
@@ -84,7 +84,7 @@ async fn test_ingest_recreated_index() {
     // Recreate the index and start ingesting into it again
 
     let new_index_metadata = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config, ConfigFormat::Yaml, false)
         .await
@@ -96,7 +96,7 @@ async fn test_ingest_recreated_index() {
     );
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "second record"}),
         CommitType::Force,
@@ -110,7 +110,7 @@ async fn test_ingest_recreated_index() {
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "third record"}),
         CommitType::Force,
@@ -124,7 +124,7 @@ async fn test_ingest_recreated_index() {
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "fourth record"}),
         CommitType::Force,
@@ -152,7 +152,7 @@ async fn test_ingest_recreated_index() {
 
     // Delete the index to avoid potential hanging on shutdown #5068
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .delete(index_id, false)
         .await
@@ -184,14 +184,14 @@ async fn test_indexing_directory_cleanup() {
             "#
     );
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config.clone(), ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "first record"}),
         CommitType::Force,
@@ -205,14 +205,14 @@ async fn test_indexing_directory_cleanup() {
         .unwrap();
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .delete(index_id, false)
         .await
         .unwrap();
 
     // The index is deleted so the `indexing` directory should be cleaned up
-    let data_dir_path = &sandbox.node_configs.first().unwrap().0.data_dir_path;
+    let data_dir_path = &sandbox.node_configs().next().unwrap().data_dir_path;
     let indexing_dir_path = data_dir_path.join(INDEXING_DIR_NAME);
     wait_until_predicate(
         || async {
@@ -232,17 +232,26 @@ async fn test_indexing_directory_cleanup() {
 #[tokio::test]
 async fn test_ingest_v2_index_not_found() {
     let sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Indexer, QuickwitService::Janitor])
-        .add_node([QuickwitService::Indexer, QuickwitService::Janitor])
-        .add_node([
-            QuickwitService::ControlPlane,
-            QuickwitService::Metastore,
-            QuickwitService::Searcher,
-        ])
+        .add_node(
+            "indexitor-1",
+            [QuickwitService::Indexer, QuickwitService::Janitor],
+        )
+        .add_node(
+            "indexitor-2",
+            [QuickwitService::Indexer, QuickwitService::Janitor],
+        )
+        .add_node(
+            "other",
+            [
+                QuickwitService::ControlPlane,
+                QuickwitService::Metastore,
+                QuickwitService::Searcher,
+            ],
+        )
         .build_and_start()
         .await;
     let missing_index_err: Error = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexitor-1")
         .ingest(
             "missing_index",
             ingest_json!({"body": "doc1"}),
@@ -265,13 +274,22 @@ async fn test_ingest_v2_index_not_found() {
 #[tokio::test]
 async fn test_ingest_v2_happy_path() {
     let sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Indexer, QuickwitService::Janitor])
-        .add_node([QuickwitService::Indexer, QuickwitService::Janitor])
-        .add_node([
-            QuickwitService::ControlPlane,
-            QuickwitService::Metastore,
-            QuickwitService::Searcher,
-        ])
+        .add_node(
+            "indexitor-1",
+            [QuickwitService::Indexer, QuickwitService::Janitor],
+        )
+        .add_node(
+            "indexitor-2",
+            [QuickwitService::Indexer, QuickwitService::Janitor],
+        )
+        .add_node(
+            "other",
+            [
+                QuickwitService::ControlPlane,
+                QuickwitService::Metastore,
+                QuickwitService::Searcher,
+            ],
+        )
         .build_and_start()
         .await;
     let index_id = "test_happy_path";
@@ -288,14 +306,14 @@ async fn test_ingest_v2_happy_path() {
         "#
     );
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexitor-1")
         .indexes()
         .create(index_config, ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
     let ingest_resp = ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client("indexitor-1"),
         index_id,
         ingest_json!({"body": "doc1"}),
         CommitType::Auto,
@@ -321,7 +339,7 @@ async fn test_ingest_v2_happy_path() {
 
     // Delete the index to avoid potential hanging on shutdown #5068
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexitor-1")
         .indexes()
         .delete(index_id, false)
         .await
@@ -348,7 +366,7 @@ async fn test_commit_force() {
     );
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config, ConfigFormat::Yaml, false)
         .await
@@ -359,7 +377,7 @@ async fn test_commit_force() {
     let ingest_resp = tokio::time::timeout(
         Duration::from_secs(20),
         ingest(
-            &sandbox.rest_client(QuickwitService::Indexer),
+            &sandbox.rest_client(STANDALONE_NODE_NAME),
             index_id,
             ingest_json!({"body": "force"}),
             CommitType::Force,
@@ -382,7 +400,7 @@ async fn test_commit_force() {
 
     // Delete the index to avoid waiting for the commit timeout on shutdown #5068
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .delete(index_id, false)
         .await
@@ -410,7 +428,7 @@ async fn test_commit_wait_for() {
 
     // Create index
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config, ConfigFormat::Yaml, false)
         .await
@@ -418,7 +436,7 @@ async fn test_commit_wait_for() {
 
     // run 2 ingest requests at the same time on the same index
     // wait_for shouldn't force the commit so expect only 1 published split
-    let client = sandbox.rest_client(QuickwitService::Indexer);
+    let client = sandbox.rest_client(STANDALONE_NODE_NAME);
     let ingest_1_fut = client
         .ingest(
             index_id,
@@ -474,7 +492,7 @@ async fn test_commit_wait_for() {
         ..Default::default()
     };
     let published_splits = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .splits(index_id)
         .list(splits_query_params)
         .await
@@ -502,14 +520,14 @@ async fn test_commit_auto() {
     );
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config, ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
     let ingest_resp = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .ingest(
             index_id,
             ingest_json!({"body": "auto"}),
@@ -558,14 +576,25 @@ async fn test_detailed_ingest_response() {
         "#
     );
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config, ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
+    // Create a client configured to ingest documents and return detailed parse failures
+    let node_config = sandbox
+        .node_configs()
+        .find(|cfg| cfg.enabled_services.contains(&QuickwitService::Indexer))
+        .unwrap();
+    let url =
+        reqwest::Url::parse(&format!("http://{}", node_config.rest_config.listen_addr)).unwrap();
+    let detailed_ingest_client = QuickwitClientBuilder::new(url)
+        .detailed_response(true)
+        .build();
+
     let ingest_resp = ingest(
-        &sandbox.detailed_ingest_client(),
+        &detailed_ingest_client,
         index_id,
         IngestSource::Str("{\"body\":\"hello\"}\naouch!".to_string()),
         CommitType::Auto,
@@ -592,11 +621,11 @@ async fn test_detailed_ingest_response() {
 #[tokio::test]
 async fn test_very_large_index_name() {
     let sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Searcher])
-        .add_node([QuickwitService::Metastore])
-        .add_node([QuickwitService::Indexer])
-        .add_node([QuickwitService::ControlPlane])
-        .add_node([QuickwitService::Janitor])
+        .add_node("searcher", [QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node("indexer", [QuickwitService::Indexer])
+        .add_node("control-plane", [QuickwitService::ControlPlane])
+        .add_node("janitor", [QuickwitService::Janitor])
         .build_and_start()
         .await;
 
@@ -608,7 +637,7 @@ async fn test_very_large_index_name() {
     let oversized_index_id = format!("{acceptable_index_id}1");
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .create(
             format!(
@@ -630,7 +659,7 @@ async fn test_very_large_index_name() {
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client("indexer"),
         acceptable_index_id,
         ingest_json!({"body": "not too long"}),
         CommitType::Auto,
@@ -649,14 +678,14 @@ async fn test_very_large_index_name() {
 
     // Delete the index to avoid potential hanging on shutdown #5068
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .delete(acceptable_index_id, false)
         .await
         .unwrap();
 
     let error = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .create(
             format!(
@@ -691,7 +720,7 @@ async fn test_shutdown_single_node() {
     let index_id = "test_shutdown_single_node";
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(
             format!(
@@ -713,7 +742,7 @@ async fn test_shutdown_single_node() {
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "one"}),
         CommitType::Force,
@@ -722,7 +751,7 @@ async fn test_shutdown_single_node() {
     .unwrap();
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .ingest(
             index_id,
             ingest_json!({"body": "two"}),
@@ -742,20 +771,23 @@ async fn test_shutdown_single_node() {
 #[tokio::test]
 async fn test_shutdown_control_plane_first() {
     let mut sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Indexer])
-        .add_node([
-            QuickwitService::ControlPlane,
-            QuickwitService::Searcher,
-            QuickwitService::Metastore,
-            QuickwitService::Janitor,
-        ])
+        .add_node("indexer", [QuickwitService::Indexer])
+        .add_node(
+            "other",
+            [
+                QuickwitService::ControlPlane,
+                QuickwitService::Searcher,
+                QuickwitService::Metastore,
+                QuickwitService::Janitor,
+            ],
+        )
         .build_and_start()
         .await;
     let index_id = "test_shutdown_control_plane_first";
 
     // Create index
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .create(
             format!(
@@ -777,7 +809,7 @@ async fn test_shutdown_control_plane_first() {
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client("indexer"),
         index_id,
         ingest_json!({"body": "one"}),
         CommitType::Force,
@@ -785,15 +817,7 @@ async fn test_shutdown_control_plane_first() {
     .await
     .unwrap();
 
-    sandbox
-        .shutdown_services([
-            QuickwitService::ControlPlane,
-            QuickwitService::Searcher,
-            QuickwitService::Metastore,
-            QuickwitService::Janitor,
-        ])
-        .await
-        .unwrap();
+    sandbox.shutdown_nodes(["other"]).await.unwrap();
 
     // The indexer hangs on shutdown because it cannot commit the shard EOF
     tokio::time::timeout(Duration::from_secs(5), sandbox.shutdown())
@@ -804,19 +828,22 @@ async fn test_shutdown_control_plane_first() {
 #[tokio::test]
 async fn test_shutdown_indexer_first() {
     let mut sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Indexer])
-        .add_node([
-            QuickwitService::ControlPlane,
-            QuickwitService::Searcher,
-            QuickwitService::Metastore,
-            QuickwitService::Janitor,
-        ])
+        .add_node("indexer", [QuickwitService::Indexer])
+        .add_node(
+            "other",
+            [
+                QuickwitService::ControlPlane,
+                QuickwitService::Searcher,
+                QuickwitService::Metastore,
+                QuickwitService::Janitor,
+            ],
+        )
         .build_and_start()
         .await;
     let index_id = "test_shutdown_indexer_first";
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .create(
             format!(
@@ -838,7 +865,7 @@ async fn test_shutdown_indexer_first() {
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client("indexer"),
         index_id,
         ingest_json!({"body": "one"}),
         CommitType::Force,
@@ -846,10 +873,7 @@ async fn test_shutdown_indexer_first() {
     .await
     .unwrap();
 
-    sandbox
-        .shutdown_services([QuickwitService::Indexer])
-        .await
-        .unwrap();
+    sandbox.shutdown_nodes(["indexer"]).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), sandbox.shutdown())
         .await

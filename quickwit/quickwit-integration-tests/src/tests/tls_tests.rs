@@ -24,10 +24,10 @@ use crate::test_utils::ClusterSandboxBuilder;
 async fn test_tls_rest() {
     quickwit_common::setup_logging_for_tests();
     let mut sandbox_config = ClusterSandboxBuilder::default()
-        .add_node(QuickwitService::supported_services())
+        .add_node("tls-standalone", QuickwitService::supported_services())
         .build_config()
         .await;
-    sandbox_config.node_configs[0].0.rest_config.tls = Some(quickwit_config::TlsConfig {
+    sandbox_config.node_configs[0].rest_config.tls = Some(quickwit_config::TlsConfig {
         cert_path: concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/server.crt").to_string(),
         key_path: concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/server.key").to_string(),
         ca_path: concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/ca.crt").to_string(),
@@ -35,12 +35,12 @@ async fn test_tls_rest() {
         validate_client: false,
     });
     let sandbox = sandbox_config.start().await;
-    let node_config = sandbox.node_configs.first().unwrap();
+    let node_config = sandbox.node_configs().next().unwrap();
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(30))
         .http2_only(true)
         .build_http::<String>();
-    let root_uri = format!("http://{}/", node_config.0.rest_config.listen_addr)
+    let root_uri = format!("http://{}/", node_config.rest_config.listen_addr)
         .parse::<hyper::Uri>()
         .unwrap();
     client
@@ -50,7 +50,7 @@ async fn test_tls_rest() {
 
     assert_eq!(
         sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client("tls-standalone")
             .indexes()
             .list()
             .await
@@ -66,16 +66,16 @@ async fn test_tls_rest() {
 async fn test_tls_grpc() {
     quickwit_common::setup_logging_for_tests();
     let mut sandbox_config = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Searcher])
-        .add_node([QuickwitService::Metastore])
-        .add_node([QuickwitService::Indexer])
-        .add_node([QuickwitService::ControlPlane])
-        .add_node([QuickwitService::Janitor])
+        .add_node("searcher", [QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node("indexer", [QuickwitService::Indexer])
+        .add_node("control-plane", [QuickwitService::ControlPlane])
+        .add_node("janitor", [QuickwitService::Janitor])
         .build_config()
         .await;
 
     for node in &mut sandbox_config.node_configs {
-        node.0.rest_config.tls = Some(quickwit_config::TlsConfig {
+        node.rest_config.tls = Some(quickwit_config::TlsConfig {
             cert_path: concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/server.crt").to_string(),
             key_path: concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/server.key").to_string(),
             ca_path: concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/ca.crt").to_string(),
@@ -89,7 +89,7 @@ async fn test_tls_grpc() {
     // TODO connect to grpc port and verify it refuses non-tls connection
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .create(
             r#"
@@ -110,7 +110,7 @@ async fn test_tls_grpc() {
 
     assert!(
         sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client("indexer")
             .node_health()
             .is_live()
             .await
@@ -118,11 +118,14 @@ async fn test_tls_grpc() {
     );
 
     // Assert that at least 1 indexing pipelines is successfully started
-    sandbox.wait_for_indexing_pipelines(1).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines("indexer", 1)
+        .await
+        .unwrap();
 
     // Check that search is working
     let search_response_empty = sandbox
-        .rest_client(QuickwitService::Searcher)
+        .rest_client("searcher")
         .search(
             "my-new-multi-node-index",
             SearchRequestQueryString {
