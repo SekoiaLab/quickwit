@@ -18,9 +18,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use quickwit_actors::{
     Actor, ActorContext, ActorExitStatus, ActorHandle, HEARTBEAT, Handler, Health, Mailbox,
-    QueueCapacity, Supervisable,
+    Observe, QueueCapacity, Supervisable,
 };
 use quickwit_common::KillSwitch;
 use quickwit_common::metrics::OwnedGaugeGuard;
@@ -570,6 +572,52 @@ impl Handler<AssignShards> for IndexingPipeline {
         // We perform observe to make sure the set of shard ids is up to date.
         self.perform_observe(ctx);
         Ok(())
+    }
+}
+
+/// Request to observe the pipeline members.
+///
+/// Only source is observed for now.
+#[derive(Clone, Copy, Debug)]
+pub struct ObservePipelineMembers;
+
+/// The response to `ObservePipelineMembers`.
+///
+/// Delegates the waiting to the caller to avoid blocking the actor.
+pub struct PipelineSourceObservation {
+    pub source_observation_fut: BoxFuture<'static, anyhow::Result<serde_json::Value>>,
+}
+
+#[async_trait]
+impl Handler<ObservePipelineMembers> for IndexingPipeline {
+    type Reply = PipelineSourceObservation;
+
+    async fn handle(
+        &mut self,
+        _msg: ObservePipelineMembers,
+        _ctx: &ActorContext<Self>,
+    ) -> Result<PipelineSourceObservation, ActorExitStatus> {
+        let Some(handles) = &self.handles_opt else {
+            return Ok(PipelineSourceObservation {
+                source_observation_fut: Box::pin(async { Ok(serde_json::json!({})) }),
+            });
+        };
+        let source_observation_res = handles
+            .source_mailbox
+            .send_message_with_high_priority(Observe);
+        let source_observation_rx = match source_observation_res {
+            Ok(rx) => rx,
+            Err(send_error) => {
+                return Ok(PipelineSourceObservation {
+                    source_observation_fut: Box::pin(async { Err(send_error.into()) }),
+                });
+            }
+        };
+        let source_observation_fut =
+            Box::pin(source_observation_rx.map(|obs| obs.map_err(Into::into)));
+        Ok(PipelineSourceObservation {
+            source_observation_fut,
+        })
     }
 }
 

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::TryStreamExt;
+use futures::future::BoxFuture;
 use itertools::Itertools;
 use quickwit_actors::{
     Actor, ActorContext, ActorExitStatus, ActorHandle, ActorState, Handler, Healthz, Mailbox,
@@ -52,7 +53,7 @@ use quickwit_proto::metastore::{
     ListIndexesMetadataRequest, ListSplitsRequest, MetastoreResult, MetastoreService,
     MetastoreServiceClient,
 };
-use quickwit_proto::types::{IndexId, IndexUid, NodeId, PipelineUid, ShardId};
+use quickwit_proto::types::{IndexId, IndexUid, NodeId, PipelineUid, ShardId, SourceId};
 use quickwit_storage::StorageResolver;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -61,6 +62,7 @@ use tracing::{debug, error, info, warn};
 
 use super::merge_pipeline::{MergePipeline, MergePipelineParams};
 use super::{MergePlanner, MergeSchedulerService};
+use crate::actors::indexing_pipeline::ObservePipelineMembers;
 use crate::actors::merge_pipeline::FinishPendingMergesAndShutdownPipeline;
 use crate::models::{DetachIndexingPipeline, DetachMergePipeline, ObservePipeline, SpawnPipeline};
 use crate::source::{AssignShards, Assignment};
@@ -1007,6 +1009,84 @@ impl Handler<Healthz> for IndexingService {
     ) -> Result<bool, ActorExitStatus> {
         // In the future, check metrics such as available disk space.
         Ok(true)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ObservePipelines {
+    /// If set, filters indexing pipelines belonging to the specified index.
+    pub index_id: Option<IndexId>,
+    /// If set, filters indexing pipelines belonging to the specified source.
+    pub source_id: Option<SourceId>,
+}
+
+pub struct PipelineObservation {
+    pub index_id: IndexId,
+    pub source_id: SourceId,
+    pub pipeline_uid: PipelineUid,
+    pub indexing_statistics: IndexingStatistics,
+    pub source_observation_fut: BoxFuture<'static, anyhow::Result<serde_json::Value>>,
+}
+
+pub struct PipelinesObservations {
+    pub indexing_pipelines: Vec<PipelineObservation>,
+}
+
+#[async_trait]
+impl Handler<ObservePipelines> for IndexingService {
+    type Reply = PipelinesObservations;
+
+    async fn handle(
+        &mut self,
+        query: ObservePipelines,
+        _ctx: &ActorContext<Self>,
+    ) -> Result<PipelinesObservations, ActorExitStatus> {
+        let mut indexing_pipelines = Vec::new();
+        for handle in self.indexing_pipelines.values() {
+            if let Some(source_id) = &query.source_id
+                && handle.indexing_pipeline_id.source_id != *source_id
+            {
+                continue;
+            }
+            if let Some(index_id) = &query.index_id
+                && handle.indexing_pipeline_id.index_uid.index_id != *index_id
+            {
+                continue;
+            }
+
+            let response_res = handle
+                .mailbox
+                .send_message_with_high_priority(ObservePipelineMembers);
+            let response_rx = match response_res {
+                Ok(response_rx) => response_rx,
+                Err(send_error) => {
+                    indexing_pipelines.push(PipelineObservation {
+                        index_id: handle.indexing_pipeline_id.index_uid.index_id.clone(),
+                        source_id: handle.indexing_pipeline_id.source_id.clone(),
+                        pipeline_uid: handle.indexing_pipeline_id.pipeline_uid,
+                        indexing_statistics: handle.handle.last_observation().clone(),
+                        source_observation_fut: Box::pin(async { Err(send_error.into()) }),
+                    });
+                    continue;
+                }
+            };
+            let response_fut = async move {
+                let source_observation_res = response_rx.await;
+                match source_observation_res {
+                    Ok(source_observation) => Ok(source_observation.source_observation_fut.await?),
+                    Err(error) => Err(error.into()),
+                }
+            };
+            indexing_pipelines.push(PipelineObservation {
+                index_id: handle.indexing_pipeline_id.index_uid.index_id.clone(),
+                source_id: handle.indexing_pipeline_id.source_id.clone(),
+                pipeline_uid: handle.indexing_pipeline_id.pipeline_uid,
+                indexing_statistics: handle.handle.last_observation().clone(),
+                source_observation_fut: Box::pin(response_fut),
+            });
+        }
+
+        Ok(PipelinesObservations { indexing_pipelines })
     }
 }
 

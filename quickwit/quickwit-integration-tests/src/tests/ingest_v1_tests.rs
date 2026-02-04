@@ -14,6 +14,7 @@
 
 use quickwit_config::ConfigFormat;
 use quickwit_config::service::QuickwitService;
+use quickwit_indexing::actors::ObservePipelines;
 use quickwit_metastore::SplitState;
 use quickwit_rest_client::rest_client::{CommitType, QuickwitClientBuilder};
 use serde_json::json;
@@ -86,6 +87,28 @@ async fn test_ingest_v1_happy_path() {
         .unwrap();
 
     sandbox.assert_hit_count(index_id, "*", 1).await;
+
+    let response = indexer_client
+        .node_stats()
+        .indexing_pipelines(ObservePipelines::default())
+        .await
+        .unwrap();
+
+    assert_eq!(response.indexing_pipelines.len(), 1);
+
+    let pipeline_response = &response.indexing_pipelines[0];
+
+    assert_eq!(pipeline_response.index_id, index_id);
+    assert_eq!(pipeline_response.source_id, "_ingest-api-source");
+    assert_eq!(pipeline_response.error, None);
+    assert_eq!(pipeline_response.indexing_statistics.num_docs, 1);
+    let num_docs_from_source = pipeline_response
+        .source_observation
+        .get("num_docs_processed")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_eq!(num_docs_from_source, 1);
 
     // Delete the index to avoid potential hanging on shutdown #5068
     indexer_client

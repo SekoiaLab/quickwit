@@ -168,7 +168,7 @@ impl Hash for IndexingTask {
         self.source_id.hash(state);
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PipelineMetrics {
     pub cpu_load: CpuCapacity,
     // Indexing throughput (when the CPU is working).

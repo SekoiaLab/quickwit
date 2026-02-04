@@ -18,12 +18,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use quickwit_cluster::ClusterSnapshot;
 use quickwit_config::{ConfigFormat, SourceConfig};
-use quickwit_indexing::actors::IndexingServiceCounters;
+use quickwit_indexing::actors::{IndexingServiceCounters, ObservePipelines};
 pub use quickwit_ingest::CommitType;
 use quickwit_metastore::{IndexMetadata, Split, SplitInfo};
 use quickwit_proto::ingest::Shard;
 use quickwit_serve::{
-    ListSplitsQueryParams, ListSplitsResponse, RestIngestResponse, SearchRequestQueryString,
+    IndexingPipelinesResponse, ListSplitsQueryParams, ListSplitsResponse, RestIngestResponse,
+    SearchRequestQueryString,
 };
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::tls::Certificate;
@@ -735,6 +736,25 @@ impl<'a> NodeStatsClient<'a> {
         let response = self
             .transport
             .send::<()>(Method::GET, "indexing", None, None, None, self.timeout)
+            .await?;
+        let indexing_stats = response.deserialize().await?;
+        Ok(indexing_stats)
+    }
+
+    pub async fn indexing_pipelines(
+        &self,
+        query: ObservePipelines,
+    ) -> Result<IndexingPipelinesResponse, Error> {
+        let response = self
+            .transport
+            .send::<ObservePipelines>(
+                Method::GET,
+                "indexing/pipelines",
+                None,
+                Some(&query),
+                None,
+                self.timeout,
+            )
             .await?;
         let indexing_stats = response.deserialize().await?;
         Ok(indexing_stats)
