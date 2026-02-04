@@ -15,4 +15,6 @@
 mod cluster_sandbox;
 mod shutdown;
 
+pub(crate) const STANDALONE_NODE_NAME: &str = "standalone";
+
 pub(crate) use cluster_sandbox::{ClusterSandbox, ClusterSandboxBuilder, ingest};

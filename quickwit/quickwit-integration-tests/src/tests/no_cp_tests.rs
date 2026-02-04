@@ -34,9 +34,9 @@ fn initialize_tests() {
 async fn test_search_after_control_plane_shutdown() {
     initialize_tests();
     let mut sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::ControlPlane])
-        .add_node([QuickwitService::Metastore])
-        .add_node([QuickwitService::Searcher])
+        .add_node("control-plane", [QuickwitService::ControlPlane])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node("searcher", [QuickwitService::Searcher])
         .build_and_start()
         .await;
     let index_id = "test-search-after-control-plane-shutdown";
@@ -54,16 +54,13 @@ async fn test_search_after_control_plane_shutdown() {
     );
 
     sandbox
-        .rest_client(QuickwitService::Metastore)
+        .rest_client("metastore")
         .indexes()
         .create(index_config.clone(), ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
-    sandbox
-        .shutdown_services([QuickwitService::ControlPlane])
-        .await
-        .unwrap();
+    sandbox.shutdown_nodes(["control-plane"]).await.unwrap();
 
     sandbox.assert_hit_count(index_id, "", 0).await;
 
@@ -74,15 +71,15 @@ async fn test_search_after_control_plane_shutdown() {
 async fn test_searcher_and_metastore_without_control_plane() {
     initialize_tests();
     let sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Metastore])
-        .add_node([QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node("searcher", [QuickwitService::Searcher])
         .build_and_start()
         .await;
 
     // we cannot create an actual index without control plane
 
     let search_error = sandbox
-        .rest_client(QuickwitService::Searcher)
+        .rest_client("searcher")
         .search(
             "does-not-exist",
             SearchRequestQueryString {
@@ -112,8 +109,11 @@ async fn test_searcher_and_metastore_without_control_plane() {
 async fn test_indexer_fails_without_control_plane() {
     initialize_tests();
     let sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Metastore])
-        .add_node([QuickwitService::Indexer, QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node(
+            "indexer-searcher",
+            [QuickwitService::Indexer, QuickwitService::Searcher],
+        )
         .build_and_start()
         .await;
 

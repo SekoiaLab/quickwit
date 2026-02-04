@@ -15,7 +15,6 @@
 use std::fmt::Write;
 use std::time::Duration;
 
-use quickwit_config::service::QuickwitService;
 use quickwit_metastore::SplitState;
 use quickwit_proto::types::DocMappingUid;
 use quickwit_rest_client::models::IngestSource;
@@ -23,29 +22,20 @@ use quickwit_rest_client::rest_client::CommitType;
 use quickwit_serve::ListSplitsQueryParams;
 use serde_json::json;
 
-use crate::test_utils::ClusterSandboxBuilder;
+use crate::test_utils::{ClusterSandboxBuilder, STANDALONE_NODE_NAME};
 
 #[tokio::test]
 async fn test_update_doc_mapping_restart_indexing_pipeline() {
     let index_id = "update-restart-ingest";
     quickwit_common::setup_logging_for_tests();
-    let sandbox = ClusterSandboxBuilder::default()
-        .add_node([
-            QuickwitService::Searcher,
-            QuickwitService::Metastore,
-            QuickwitService::Indexer,
-            QuickwitService::ControlPlane,
-            QuickwitService::Janitor,
-        ])
-        .build_and_start()
-        .await;
+    let sandbox = ClusterSandboxBuilder::build_and_start_standalone().await;
 
     {
         // Wait for indexer to fully start.
         // The starting time is a bit long for a cluster.
         tokio::time::sleep(Duration::from_secs(3)).await;
         let indexing_service_counters = sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client(STANDALONE_NODE_NAME)
             .node_stats()
             .indexing()
             .await
@@ -60,7 +50,7 @@ async fn test_update_doc_mapping_restart_indexing_pipeline() {
 
     // Create index
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(
             json!({
@@ -85,7 +75,7 @@ async fn test_update_doc_mapping_restart_indexing_pipeline() {
 
     assert!(
         sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client(STANDALONE_NODE_NAME)
             .node_health()
             .is_live()
             .await
@@ -93,7 +83,10 @@ async fn test_update_doc_mapping_restart_indexing_pipeline() {
     );
 
     // Wait until indexing pipelines are started.
-    sandbox.wait_for_indexing_pipelines(1).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines(STANDALONE_NODE_NAME, 1)
+        .await
+        .unwrap();
 
     let payload = (0..1000).fold(String::new(), |mut buffer, id| {
         writeln!(&mut buffer, "{{\"body\": {id}}}").unwrap();
@@ -103,7 +96,7 @@ async fn test_update_doc_mapping_restart_indexing_pipeline() {
     // ingest some documents with old doc mapping.
     // we *don't* use local ingest to use a normal indexing pipeline
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .ingest(
             index_id,
             IngestSource::Str(payload.clone()),
@@ -125,7 +118,7 @@ async fn test_update_doc_mapping_restart_indexing_pipeline() {
     // the pipeline gets killed and restarted (in practice as this cluster is very lightly loaded,
     // it will almost always kill the pipeline before these documents are committed)
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .ingest(
             index_id,
             IngestSource::Str(payload.clone()),
@@ -138,7 +131,7 @@ async fn test_update_doc_mapping_restart_indexing_pipeline() {
 
     // Update index
     sandbox
-        .rest_client(QuickwitService::Searcher)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .update(
             index_id,
@@ -166,7 +159,7 @@ async fn test_update_doc_mapping_restart_indexing_pipeline() {
     // the pipeline gets killed and restarted. In practice this will almost always use the new
     // mapping on a lightly loaded cluster.
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .ingest(
             index_id,
             IngestSource::Str(payload.clone()),
@@ -186,7 +179,7 @@ async fn test_update_doc_mapping_restart_indexing_pipeline() {
 
     // we ingest again, definitely with the up to date doc mapper this time
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .ingest(
             index_id,
             IngestSource::Str(payload.clone()),
@@ -204,7 +197,7 @@ async fn test_update_doc_mapping_restart_indexing_pipeline() {
         .unwrap();
 
     let splits = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .splits(index_id)
         .list(ListSplitsQueryParams::default())
         .await

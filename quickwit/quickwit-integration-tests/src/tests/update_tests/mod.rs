@@ -25,8 +25,11 @@ async fn assert_hits_unordered(
     query: &str,
     expected_result: Result<&[Value], ()>,
 ) {
+    let searcher_node_id = sandbox
+        .find_node_for_service(QuickwitService::Searcher)
+        .node_id;
     let search_res = sandbox
-        .rest_client(QuickwitService::Searcher)
+        .rest_client(searcher_node_id.as_str())
         .search(
             index_id,
             SearchRequestQueryString {
