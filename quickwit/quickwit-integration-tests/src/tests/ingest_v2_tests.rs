@@ -880,3 +880,105 @@ async fn test_shutdown_indexer_first() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn test_add_node() {
+    let mut sandbox = ClusterSandboxBuilder::default()
+        .add_node("indexer-1", [QuickwitService::Indexer])
+        .add_node(
+            "other",
+            [
+                QuickwitService::ControlPlane,
+                QuickwitService::Metastore,
+                QuickwitService::Searcher,
+                QuickwitService::Janitor,
+            ],
+        )
+        .build_and_start()
+        .await;
+    let index_id = "test_add_node";
+    let index_config = format!(
+        r#"
+        version: 0.8
+        index_id: {index_id}
+        doc_mapping:
+            field_mappings:
+            - name: body
+              type: text
+        indexing_settings:
+            commit_timeout_secs: 1
+        "#
+    );
+    sandbox
+        .rest_client("indexer-1")
+        .indexes()
+        .create(index_config, ConfigFormat::Yaml, false)
+        .await
+        .unwrap();
+
+    let ingest_resp = ingest(
+        &sandbox.rest_client("indexer-1"),
+        index_id,
+        ingest_json!({"body": "doc1"}),
+        CommitType::Auto,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ingest_resp,
+        RestIngestResponse {
+            num_docs_for_processing: 1,
+            num_ingested_docs: Some(1),
+            num_rejected_docs: Some(0),
+            parse_failures: None,
+        },
+    );
+
+    sandbox
+        .wait_for_splits(index_id, Some(vec![SplitState::Published]), 1)
+        .await
+        .unwrap();
+
+    sandbox.assert_hit_count(index_id, "*", 1).await;
+
+    // Add a new indexer node and ingest data on it
+    sandbox
+        .add_node("indexer-2", [QuickwitService::Indexer])
+        .await
+        .unwrap();
+
+    let ingest_resp2 = ingest(
+        &sandbox.rest_client("indexer-2"),
+        index_id,
+        ingest_json!({"body": "doc2"}),
+        CommitType::Auto,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ingest_resp2,
+        RestIngestResponse {
+            num_docs_for_processing: 1,
+            num_ingested_docs: Some(1),
+            num_rejected_docs: Some(0),
+            parse_failures: None,
+        },
+    );
+    sandbox
+        .wait_for_splits(index_id, Some(vec![SplitState::Published]), 2)
+        .await
+        .unwrap();
+
+    sandbox.assert_hit_count(index_id, "*", 2).await;
+
+    // Delete the index to avoid potential hanging on shutdown #5068
+    sandbox
+        .rest_client("indexer-1")
+        .indexes()
+        .delete(index_id, false)
+        .await
+        .unwrap();
+
+    sandbox.shutdown().await.unwrap();
+}

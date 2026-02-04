@@ -64,7 +64,9 @@ pub async fn init_ingest_api(
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .await;
-    if let Some(mailbox) = guard.get(queues_dir_path) {
+    if let Some(mailbox) = guard.get(queues_dir_path)
+        && !mailbox.is_disconnected()
+    {
         return Ok(mailbox.clone());
     }
     let ingest_api_actor = IngestApiService::with_queues_dir(
