@@ -16,13 +16,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Formatter;
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use itertools::Itertools;
+use once_cell::sync::Lazy;
 use quickwit_actors::{
     Actor, ActorContext, ActorExitStatus, ActorHandle, DeferableReplyHandler, Handler, Mailbox,
     Supervisor, Universe, WeakMailbox,
@@ -33,7 +34,7 @@ use quickwit_cluster::{
 use quickwit_common::pretty::PrettyDisplay;
 use quickwit_common::pubsub::EventSubscriber;
 use quickwit_common::uri::Uri;
-use quickwit_common::{Progress, shared_consts};
+use quickwit_common::{Progress, get_from_env, shared_consts};
 use quickwit_config::service::QuickwitService;
 use quickwit_config::{ClusterConfig, IndexConfig, IndexTemplate, SourceConfig};
 use quickwit_ingest::{IngesterPool, LocalShardsUpdate};
@@ -76,6 +77,17 @@ const PRUNE_SHARDS_DEFAULT_COOLDOWN_PERIOD: Duration = Duration::from_secs(120);
 
 /// Minimum period between two rebuild plan operations.
 const REBUILD_PLAN_COOLDOWN_PERIOD: Duration = Duration::from_secs(2);
+
+/// Grace period before rebuilding plan after a node leaves. This allows nodes
+/// to come back quickly during rolling upgrades without causing unnecessary
+/// rebalances.
+static NODE_DEPARTURE_GRACE_PERIOD: Lazy<Duration> = Lazy::new(|| {
+    if cfg!(any(test, feature = "testsuite")) {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(get_from_env("QW_NODE_DEPARTURE_GRACE_PERIOD", 90, false))
+    }
+});
 
 #[derive(Debug)]
 struct ControlPlanLoop;
@@ -1053,10 +1065,22 @@ impl Handler<IndexerJoined> for ControlPlane {
         message: IndexerJoined,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
-        info!(
-            "indexer `{}` joined the cluster: rebalancing shards and rebuilding indexing plan",
-            message.0.node_id()
-        );
+        let node_id = message.0.node_id();
+        let prending_departure_cancelled = self
+            .indexing_scheduler
+            .cancel_pending_departure(node_id, None);
+        if prending_departure_cancelled {
+            info!(
+                "indexer `{}` rejoined the cluster within grace period: rebalancing shards and \
+                 rebuilding indexing plan",
+                node_id
+            );
+        } else {
+            info!(
+                "indexer `{}` joined the cluster: rebalancing shards and rebuilding indexing plan",
+                node_id
+            );
+        }
         // TODO: Update shard table.
         if let Err(metastore_error) = self
             .ingest_controller
@@ -1074,6 +1098,14 @@ impl Handler<IndexerJoined> for ControlPlane {
 #[derive(Debug)]
 struct IndexerLeft(ClusterNode);
 
+/// A scheduled check to confirm whether the indexer came back or not within the
+/// grace period.
+#[derive(Debug, Clone)]
+struct ConfirmIndexerDeparture {
+    node_id: NodeId,
+    departure_time: Instant,
+}
+
 #[async_trait]
 impl Handler<IndexerLeft> for ControlPlane {
     type Reply = ();
@@ -1083,10 +1115,55 @@ impl Handler<IndexerLeft> for ControlPlane {
         message: IndexerLeft,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
+        let node_id = message.0.node_id();
+        let departure_time = Instant::now();
+
         info!(
-            "indexer `{}` left the cluster: rebalancing shards and rebuilding indexing plan",
-            message.0.node_id()
+            node_id = %node_id,
+            grace_period_secs= NODE_DEPARTURE_GRACE_PERIOD.as_secs(),
+            "indexer left the cluster, delaying plan rebuilds until after grace period",
         );
+
+        self.indexing_scheduler
+            .track_pending_departure(node_id, departure_time);
+
+        // Schedule a check after the grace period
+        ctx.schedule_self_msg(
+            *NODE_DEPARTURE_GRACE_PERIOD,
+            ConfirmIndexerDeparture {
+                node_id: node_id.to_owned(),
+                departure_time,
+            },
+        );
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<ConfirmIndexerDeparture> for ControlPlane {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        message: ConfirmIndexerDeparture,
+        ctx: &ActorContext<Self>,
+    ) -> Result<Self::Reply, ActorExitStatus> {
+        // If there was a pending departure to cancel here, it means the grace period expired.
+        let grace_period_expired = self
+            .indexing_scheduler
+            .cancel_pending_departure(&message.node_id, Some(message.departure_time));
+
+        if !grace_period_expired {
+            // node rejoined, nothing to do
+            return Ok(());
+        }
+
+        info!(
+            "indexer {} didn't rejoin within grace period: rebuilding plan and rebalancing shards",
+            message.node_id
+        );
+
         // TODO: Update shard table.
         if let Err(metastore_error) = self
             .ingest_controller
@@ -1095,7 +1172,7 @@ impl Handler<IndexerLeft> for ControlPlane {
         {
             return convert_metastore_error::<()>(metastore_error).map(|_| ());
         }
-        self.indexing_scheduler.rebuild_plan(&self.model);
+        let _rebuild_plan_waiter = self.rebuild_plan_debounced(ctx);
         Ok(())
     }
 }

@@ -20,12 +20,14 @@ use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use itertools::Itertools;
+use once_cell::sync::Lazy;
 use oneshot;
 use quickwit_actors::{ActorExitStatus, Mailbox};
+use quickwit_common::get_from_env;
 use quickwit_config::KafkaSourceParams;
 use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
 use quickwit_proto::metastore::SourceType;
-use quickwit_proto::types::{IndexUid, Position};
+use quickwit_proto::types::{IndexUid, PipelineUid, Position};
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::{
     BaseConsumer, CommitMode, Consumer, ConsumerContext, DefaultConsumerContext, Rebalance,
@@ -242,6 +244,7 @@ impl KafkaSource {
         let (client_config, consumer, group_id) = create_consumer(
             source_runtime.index_uid(),
             source_runtime.source_id(),
+            source_runtime.pipeline_uid(),
             source_params,
             events_tx.clone(),
         )?;
@@ -656,7 +659,8 @@ pub(super) async fn check_connectivity(params: KafkaSourceParams) -> anyhow::Res
 fn create_consumer(
     index_uid: &IndexUid,
     source_id: &str,
-    params: KafkaSourceParams,
+    pipeline_id: PipelineUid,
+    mut params: KafkaSourceParams,
     events_tx: mpsc::Sender<KafkaEvent>,
 ) -> anyhow::Result<(ClientConfig, RdKafkaConsumer, GroupId)> {
     // Group ID is limited to 255 characters.
@@ -665,6 +669,12 @@ fn create_consumer(
         _ => format!("quickwit-{index_uid}-{source_id}"),
     };
     group_id.truncate(255);
+
+    if params.client_params.get("session.timeout.ms").is_none() {
+        static DEFAULT_SESSION_TIMEOUT_MS: Lazy<usize> =
+            Lazy::new(|| get_from_env("QW_KAFKA_DEFAULT_SESSION_TIMEOUT_MS", 120_000, false));
+        params.client_params["session.timeout.ms"] = json!(*DEFAULT_SESSION_TIMEOUT_MS);
+    }
 
     let mut client_config = parse_client_params(params.client_params)?;
 
@@ -676,6 +686,12 @@ fn create_consumer(
             params.enable_backfill_mode.to_string(),
         )
         .set("group.id", &group_id)
+        // Enables static group membership. Static group members are able to leave
+        // and rejoin a group within the configured session.timeout.ms without
+        // prompting a group rebalance. This should be used in combination with
+        // a larger session.timeout.ms to avoid group rebalances caused by
+        // transient unavailability (e.g. process restarts).
+        .set("group.instance.id", pipeline_id.to_string())
         .set_log_level(log_level)
         .create_with_context(RdKafkaContext {
             topic: params.topic,
@@ -763,7 +779,7 @@ fn message_payload_to_doc(message: &BorrowedMessage) -> Option<Bytes> {
 mod kafka_broker_tests {
     use std::num::NonZeroUsize;
 
-    use quickwit_actors::{ActorContext, Universe};
+    use quickwit_actors::{ActorContext, ActorHandle, Universe};
     use quickwit_common::rand::append_random_suffix;
     use quickwit_config::{SourceConfig, SourceInputFormat, SourceParams};
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
@@ -909,6 +925,45 @@ mod kafka_broker_tests {
         }
         merged_batch.docs.sort();
         Ok(merged_batch)
+    }
+
+    async fn observe_partititions(source_handle: &ActorHandle<SourceActor>) -> Vec<i32> {
+        let obs = source_handle.observe().await;
+        let mut partitions: Vec<i32> = obs
+            .get("assigned_partitions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_i64().map(|i| i as i32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        partitions.sort();
+        partitions
+    }
+
+    async fn wait_for_partition_assignment(
+        source_handle: &ActorHandle<SourceActor>,
+        expected_partitions: usize,
+        timeout: Duration,
+    ) -> Vec<i32> {
+        let start = tokio::time::Instant::now();
+        loop {
+            let current_partitions = observe_partititions(source_handle).await;
+
+            if current_partitions.len() == expected_partitions {
+                return current_partitions;
+            }
+
+            if start.elapsed() > timeout {
+                panic!(
+                    "Timeout waiting for {} partitions. Current: {:?}",
+                    expected_partitions, current_partitions
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     #[tokio::test]
@@ -1482,6 +1537,202 @@ mod kafka_broker_tests {
             });
             assert_eq!(exit_state, expected_state);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kafka_source_static_membership() -> anyhow::Result<()> {
+        let universe = Universe::with_accelerated_time();
+        let admin_client = create_admin_client();
+        let topic = append_random_suffix("test-kafka-source-static-membership--topic");
+        let timeout = Duration::from_secs(20);
+        create_topic(&admin_client, &topic, 9).await?;
+
+        let source_loader = quickwit_supported_sources();
+        let metastore = metastore_for_test();
+        let index_id = append_random_suffix("test-kafka-source-static-membership--index");
+        let source_id = "test-kafka-source-static-membership--source".to_string();
+
+        // Create base source config - same source for all instances
+        // KafkaSource will automatically set group.instance.id based on pipeline_id
+        let base_source_config = SourceConfig {
+            source_id: source_id.clone(),
+            num_pipelines: NonZeroUsize::MIN,
+            enabled: true,
+            source_params: SourceParams::Kafka(KafkaSourceParams {
+                topic: topic.clone(),
+                client_log_level: None,
+                client_params: json!({
+                    // use earliest to avoid race conditions between rebalance
+                    // and message production
+                    "auto.offset.reset": "earliest",
+                    "bootstrap.servers": "localhost:9092",
+                    "broker.address.family": "v4",
+                    "group.id": "test-static-group",
+                    "session.timeout.ms": "30000",
+                }),
+                enable_backfill_mode: false,
+            }),
+            transform_config: None,
+            input_format: SourceInputFormat::Json,
+        };
+
+        // Setup index with empty checkpoint
+        let index_uid = setup_index(metastore.clone(), &index_id, &base_source_config, &[]).await;
+
+        // Start 3 instances with different pipeline_uids
+        let source_runtime_1 =
+            SourceRuntimeBuilder::new(index_uid.clone(), base_source_config.clone())
+                .with_metastore(metastore.clone())
+                .with_pipeline_uid(PipelineUid::for_test(1u128))
+                .build();
+        let source_1 = source_loader.load_source(source_runtime_1).await?;
+        let (doc_processor_mailbox_1, _doc_processor_inbox_1) = universe.create_test_mailbox();
+        let source_actor_1 = SourceActor {
+            source: source_1,
+            doc_processor_mailbox: doc_processor_mailbox_1.clone(),
+        };
+        let (_source_mailbox_1, source_handle_1) = universe.spawn_builder().spawn(source_actor_1);
+
+        let source_runtime_2 =
+            SourceRuntimeBuilder::new(index_uid.clone(), base_source_config.clone())
+                .with_metastore(metastore.clone())
+                .with_pipeline_uid(PipelineUid::for_test(2u128))
+                .build();
+        let source_2 = source_loader.load_source(source_runtime_2).await?;
+        let (doc_processor_mailbox_2, _doc_processor_inbox_2) = universe.create_test_mailbox();
+        let source_actor_2 = SourceActor {
+            source: source_2,
+            doc_processor_mailbox: doc_processor_mailbox_2.clone(),
+        };
+        let (_source_mailbox_2, source_handle_2) = universe.spawn_builder().spawn(source_actor_2);
+
+        let source_runtime_3 =
+            SourceRuntimeBuilder::new(index_uid.clone(), base_source_config.clone())
+                .with_metastore(metastore.clone())
+                .with_pipeline_uid(PipelineUid::for_test(3u128))
+                .build();
+        let source_3 = source_loader.load_source(source_runtime_3).await?;
+        let (doc_processor_mailbox_3, doc_processor_inbox_3) = universe.create_test_mailbox();
+        let source_actor_3 = SourceActor {
+            source: source_3,
+            doc_processor_mailbox: doc_processor_mailbox_3.clone(),
+        };
+        let (_source_mailbox_3, source_handle_3) = universe.spawn_builder().spawn(source_actor_3);
+
+        // Wait for all 3 instances to have 3 partitions assigned
+        let partitions_source_1 = wait_for_partition_assignment(&source_handle_1, 3, timeout).await;
+        let partitions_source_2 = wait_for_partition_assignment(&source_handle_2, 3, timeout).await;
+        let partitions_source_3 = wait_for_partition_assignment(&source_handle_3, 3, timeout).await;
+        for partition_id in 0..9 {
+            populate_topic(
+                &topic,
+                10,
+                &key_fn,
+                &|message_id| format!("Message P{}-M{:02}", partition_id, message_id),
+                Some(partition_id),
+                None,
+            )
+            .await?;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Kill instances 1 and 2 simultaneously
+        let (exit_status_1, _exit_state_1) = source_handle_1.kill().await;
+        let (exit_status_2, _exit_state_2) = source_handle_2.kill().await;
+        assert!(matches!(exit_status_1, ActorExitStatus::Killed));
+        assert!(matches!(exit_status_2, ActorExitStatus::Killed));
+
+        // Wait less than session timeout before restarting
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Restart instances 1 and 2 with same pipeline_uids
+        let source_runtime_1_restart =
+            SourceRuntimeBuilder::new(index_uid.clone(), base_source_config.clone())
+                .with_metastore(metastore.clone())
+                .with_pipeline_uid(PipelineUid::for_test(1u128))
+                .build();
+        let source_1_restart = source_loader.load_source(source_runtime_1_restart).await?;
+        let (doc_processor_mailbox_1_restart, _doc_processor_inbox_1_restart) =
+            universe.create_test_mailbox();
+        let source_actor_1_restart = SourceActor {
+            source: source_1_restart,
+            doc_processor_mailbox: doc_processor_mailbox_1_restart.clone(),
+        };
+        let (_source_mailbox_1_restart, source_handle_1_restart) =
+            universe.spawn_builder().spawn(source_actor_1_restart);
+
+        let source_runtime_2_restart =
+            SourceRuntimeBuilder::new(index_uid.clone(), base_source_config.clone())
+                .with_metastore(metastore.clone())
+                .with_pipeline_uid(PipelineUid::for_test(2u128))
+                .build();
+        let source_2_restart = source_loader.load_source(source_runtime_2_restart).await?;
+        let (doc_processor_mailbox_2_restart, _doc_processor_inbox_2_restart) =
+            universe.create_test_mailbox();
+        let source_actor_2_restart = SourceActor {
+            source: source_2_restart,
+            doc_processor_mailbox: doc_processor_mailbox_2_restart.clone(),
+        };
+        let (_source_mailbox_2_restart, source_handle_2_restart) =
+            universe.spawn_builder().spawn(source_actor_2_restart);
+
+        // Wait for restarted instances to have 3 partitions assigned
+        let partitions_source_1_restart =
+            wait_for_partition_assignment(&source_handle_1_restart, 3, timeout).await;
+        let partitions_source_2_restart =
+            wait_for_partition_assignment(&source_handle_2_restart, 3, timeout).await;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Kill all 3 pripelines
+        let (exit_status_1_restart, _exit_state_1_restart) = source_handle_1_restart.kill().await;
+        let (exit_status_2_restart, _exit_state_2_restart) = source_handle_2_restart.kill().await;
+        let (exit_status_3, _exit_state_3) = source_handle_3.kill().await;
+        assert!(matches!(exit_status_1_restart, ActorExitStatus::Killed));
+        assert!(matches!(exit_status_2_restart, ActorExitStatus::Killed));
+        assert!(matches!(exit_status_3, ActorExitStatus::Killed));
+
+        // Verify instances 1 and 2 got the same partitions back with static membership
+        assert_eq!(
+            partitions_source_1, partitions_source_1_restart,
+            "Pipeline 1 should reclaim the same partitions with static membership"
+        );
+        assert_eq!(
+            partitions_source_2, partitions_source_2_restart,
+            "Pipeline 2 should reclaim the same partitions with static membership"
+        );
+        let messages_3: Vec<RawDocBatch> = doc_processor_inbox_3.drain_for_test_typed();
+        let message_partitions_source_3 = messages_3
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .checkpoint_delta
+                    .iter()
+                    .filter_map(|(partition_id, _)| partition_id.as_i64())
+            })
+            .map(|pid| pid as i32)
+            .unique()
+            .sorted()
+            .collect_vec();
+        assert_eq!(
+            message_partitions_source_3, partitions_source_3,
+            "the pipeline that was not restarted should have processed messages from its \
+             originally assigned partitions only"
+        );
+
+        // Verify all 9 partitions are covered
+        let mut all_partitions = partitions_source_1.clone();
+        all_partitions.extend(&partitions_source_2);
+        all_partitions.extend(&partitions_source_3);
+        all_partitions.sort();
+        all_partitions.dedup();
+        assert_eq!(
+            all_partitions,
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+            "All 9 partitions should be assigned"
+        );
+
         Ok(())
     }
 
