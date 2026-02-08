@@ -16,6 +16,7 @@ mod change_tracker;
 mod scheduling;
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
@@ -30,7 +31,7 @@ use quickwit_proto::indexing::{
     ApplyIndexingPlanRequest, CpuCapacity, IndexingService, IndexingTask, PIPELINE_FULL_CAPACITY,
     PIPELINE_THROUGHPUT,
 };
-use quickwit_proto::types::NodeId;
+use quickwit_proto::types::{NodeId, NodeIdRef};
 use scheduling::{SourceToSchedule, SourceToScheduleType};
 use serde::Serialize;
 use tracing::{debug, info, warn};
@@ -108,6 +109,8 @@ pub struct IndexingScheduler {
     indexer_pool: IndexerPool,
     state: IndexingSchedulerState,
     pub(crate) next_rebuild_tracker: RebuildNotifier,
+    // Track pending indexer departures to implement grace period.
+    pending_indexer_departures: HashMap<NodeId, Instant>,
 }
 
 impl fmt::Debug for IndexingScheduler {
@@ -284,6 +287,7 @@ impl IndexingScheduler {
             indexer_pool,
             state: IndexingSchedulerState::default(),
             next_rebuild_tracker: RebuildNotifier::default(),
+            pending_indexer_departures: HashMap::new(),
         }
     }
 
@@ -294,9 +298,26 @@ impl IndexingScheduler {
     // Should be called whenever a change in the list of index/shard
     // has happened.
     //
+    // If there are pending indexer departures (nodes in grace period), the
+    // rebuild is skipped to avoid reassigning pipelines from nodes that might
+    // rejoin during rolling upgrades.
+    //
     // Prefer not calling this method directly, and instead call
     // `ControlPlane::rebuild_indexing_plan_debounced`.
     pub(crate) fn rebuild_plan(&mut self, model: &ControlPlaneModel) {
+        if !self.pending_indexer_departures.is_empty() {
+            let indexers_in_grace_period: Vec<&str> = self
+                .pending_indexer_departures
+                .keys()
+                .map(|node_id| node_id.as_str())
+                .collect();
+            info!(
+                indexers_in_grace_period=?PrettySample::new(&indexers_in_grace_period, 3),
+                "skipping plan rebuild during grace period",
+            );
+            return;
+        }
+
         crate::metrics::CONTROL_PLANE_METRICS.schedule_total.inc();
 
         let notify_on_drop = self.next_rebuild_tracker.start_rebuild();
@@ -322,6 +343,12 @@ impl IndexingScheduler {
             }
             return;
         };
+
+        if self.state.last_applied_physical_plan.is_none() {
+            // TODO ideally we want to delay by a couple milliseconds in case
+            // the pool is currently getting filled by the chitchat grpc catchup
+            self.recover_running_plan(&indexers);
+        }
 
         let shard_locations = model.shard_locations();
         let new_physical_plan = build_physical_indexing_plan(
@@ -433,6 +460,66 @@ impl IndexingScheduler {
         self.state.num_applied_physical_indexing_plan += 1;
         self.state.last_applied_plan_timestamp = Some(Instant::now());
         self.state.last_applied_physical_plan = Some(new_physical_plan);
+    }
+
+    /// Restores the last applied plan from the indexing tasks currently running
+    /// on the cluster
+    fn recover_running_plan(&mut self, indexers: &[IndexerNodeInfo]) {
+        let indexer_ids: Vec<String> = indexers
+            .iter()
+            .map(|indexer| indexer.node_id.to_string())
+            .collect();
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&indexer_ids);
+        let mut has_recovered_indexing_tasks = false;
+        for indexer in indexers {
+            for task in &indexer.indexing_tasks {
+                has_recovered_indexing_tasks = true;
+                plan.add_indexing_task(indexer.node_id.as_str(), task.clone());
+            }
+        }
+        if has_recovered_indexing_tasks {
+            self.state.last_applied_physical_plan = Some(plan);
+            info!(
+                "indexing tasks recovered from {} running indexers",
+                indexers.len()
+            );
+        } else {
+            info!("no indexing task to recover from indexers");
+        }
+    }
+
+    /// Cancels any pending departure for this node, optionally checking whether
+    /// the departure time matches.
+    ///
+    /// This is expected to happen either when an indexer joins back or if the
+    /// grace period expires.
+    ///
+    /// Returns true if a pending departure was cancelled, false otherwise.
+    pub(crate) fn cancel_pending_departure(
+        &mut self,
+        node_id: &NodeIdRef,
+        departure_time_check: Option<Instant>,
+    ) -> bool {
+        let should_remove = if let Some(departure_time) = departure_time_check {
+            self.pending_indexer_departures
+                .get(node_id)
+                // make sure the indexer hasn't rejoined and releft in the meantime
+                .map(|t| *t == departure_time)
+                .unwrap_or(false)
+        } else {
+            true
+        };
+
+        if should_remove {
+            self.pending_indexer_departures.remove(node_id).is_some()
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn track_pending_departure(&mut self, node_id: &NodeIdRef, departure_time: Instant) {
+        self.pending_indexer_departures
+            .insert(node_id.to_owned(), departure_time);
     }
 }
 

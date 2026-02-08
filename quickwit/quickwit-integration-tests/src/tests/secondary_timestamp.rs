@@ -13,14 +13,13 @@
 // limitations under the License.
 
 use quickwit_config::ConfigFormat;
-use quickwit_config::service::QuickwitService;
 use quickwit_metastore::SplitState;
 use quickwit_rest_client::rest_client::CommitType;
 use quickwit_serve::{ListSplitsQueryParams, SearchRequestQueryString};
 use serde_json::json;
 
 use crate::ingest_json;
-use crate::test_utils::{ClusterSandboxBuilder, ingest};
+use crate::test_utils::{ClusterSandboxBuilder, STANDALONE_NODE_NAME, ingest};
 
 #[tokio::test]
 async fn test_secondary_timestamp_happy_path() {
@@ -56,14 +55,14 @@ async fn test_secondary_timestamp_happy_path() {
             "#
     );
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config.clone(), ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "first record", "event_time": 1735689600, "ingestion_time": 1735776000}),
         CommitType::Auto,
@@ -72,7 +71,7 @@ async fn test_secondary_timestamp_happy_path() {
     .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "second record", "event_time": 1735689601, "ingestion_time": 1735776001}),
         CommitType::Auto,
@@ -86,7 +85,7 @@ async fn test_secondary_timestamp_happy_path() {
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "third record", "event_time": 1735689602, "ingestion_time": 1735776002}),
         CommitType::Auto,
@@ -95,7 +94,7 @@ async fn test_secondary_timestamp_happy_path() {
     .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "fourth record", "event_time": 1735689603, "ingestion_time": 1735776003}),
         CommitType::Auto,
@@ -111,7 +110,7 @@ async fn test_secondary_timestamp_happy_path() {
     sandbox.assert_hit_count(index_id, "body:record", 4).await;
 
     let merged_split = sandbox
-        .rest_client(QuickwitService::Metastore)
+        .rest_client(STANDALONE_NODE_NAME)
         .splits(index_id)
         .list(ListSplitsQueryParams {
             split_states: Some(vec![SplitState::Published]),
@@ -134,7 +133,7 @@ async fn test_secondary_timestamp_happy_path() {
 
     // Delete the index to avoid potential hanging on shutdown
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .delete(index_id, false)
         .await
@@ -176,14 +175,14 @@ async fn test_secondary_timestamp_update() {
             "#
     );
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config.clone(), ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "first record", "event_time": 1735689600, "ingestion_time": 1735776000}),
         CommitType::Auto,
@@ -192,7 +191,7 @@ async fn test_secondary_timestamp_update() {
     .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "second record", "event_time": 1735689601, "ingestion_time": 1735776001}),
         CommitType::Auto,
@@ -234,7 +233,7 @@ async fn test_secondary_timestamp_update() {
             "#
     );
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .update(
             index_id,
@@ -246,7 +245,7 @@ async fn test_secondary_timestamp_update() {
         .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "third record", "event_time": 1735689602, "ingestion_time": 1735776002}),
         CommitType::Auto,
@@ -255,7 +254,7 @@ async fn test_secondary_timestamp_update() {
     .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client(STANDALONE_NODE_NAME),
         index_id,
         ingest_json!({"body": "fourth record", "event_time": 1735689603, "ingestion_time": 1735776003}),
         CommitType::Auto,
@@ -272,7 +271,7 @@ async fn test_secondary_timestamp_update() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let mut splits = sandbox
-        .rest_client(QuickwitService::Metastore)
+        .rest_client(STANDALONE_NODE_NAME)
         .splits(index_id)
         .list(ListSplitsQueryParams {
             split_states: Some(vec![SplitState::Published]),
@@ -299,7 +298,7 @@ async fn test_secondary_timestamp_update() {
     ); // 2025-01-02
 
     let response = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .search(
             index_id,
             SearchRequestQueryString {
@@ -313,7 +312,7 @@ async fn test_secondary_timestamp_update() {
     assert_eq!(response.hits.len(), 4);
 
     let response = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .search(
             index_id,
             SearchRequestQueryString {
@@ -327,7 +326,7 @@ async fn test_secondary_timestamp_update() {
     assert_eq!(response.hits.len(), 2);
 
     let response = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .search(
             index_id,
             SearchRequestQueryString {
@@ -342,7 +341,7 @@ async fn test_secondary_timestamp_update() {
 
     // Delete the index to avoid potential hanging on shutdown
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .delete(index_id, false)
         .await
