@@ -585,6 +585,7 @@ mod tests {
         source_config: SourceConfig,
         metastore_opt: Option<MetastoreServiceClient>,
         queues_dir_path_opt: Option<PathBuf>,
+        pipeline_uid_opt: Option<PipelineUid>,
     }
 
     impl SourceRuntimeBuilder {
@@ -594,6 +595,7 @@ mod tests {
                 source_config,
                 metastore_opt: None,
                 queues_dir_path_opt: None,
+                pipeline_uid_opt: None,
             }
         }
 
@@ -607,12 +609,16 @@ mod tests {
                 .queues_dir_path_opt
                 .unwrap_or_else(|| PathBuf::from("./queues"));
 
+            let pipeline_uid = self
+                .pipeline_uid_opt
+                .unwrap_or_else(|| PipelineUid::for_test(0u128));
+
             SourceRuntime {
                 pipeline_id: IndexingPipelineId {
                     node_id: NodeId::from("test-node"),
                     index_uid: self.index_uid,
                     source_id: self.source_config.source_id.clone(),
-                    pipeline_uid: PipelineUid::for_test(0u128),
+                    pipeline_uid,
                 },
                 metastore,
                 ingester_pool: IngesterPool::default(),
@@ -643,6 +649,12 @@ mod tests {
 
         pub fn with_queues_dir(mut self, queues_dir_path: impl Into<PathBuf>) -> Self {
             self.queues_dir_path_opt = Some(queues_dir_path.into());
+            self
+        }
+
+        #[cfg(feature = "kafka-broker-tests")]
+        pub fn with_pipeline_uid(mut self, pipeline_uid: PipelineUid) -> Self {
+            self.pipeline_uid_opt = Some(pipeline_uid);
             self
         }
 

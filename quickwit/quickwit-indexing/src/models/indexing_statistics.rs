@@ -17,12 +17,12 @@ use std::sync::atomic::Ordering;
 
 use quickwit_proto::indexing::PipelineMetrics;
 use quickwit_proto::types::ShardId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::actors::{DocProcessorCounters, IndexerCounters, PublisherCounters, UploaderCounters};
 
 /// A Struct that holds all statistical data about indexing
-#[derive(Clone, Debug, Default, Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct IndexingStatistics {
     /// Number of document processed (valid or not)
     pub num_docs: u64,

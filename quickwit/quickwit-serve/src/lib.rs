@@ -121,6 +121,7 @@ use warp::{Filter, Rejection};
 
 pub use crate::build_info::{BuildInfo, RuntimeInfo};
 pub use crate::index_api::{ListSplitsQueryParams, ListSplitsResponse};
+pub use crate::indexing_api::{IndexingPipelineResponse, IndexingPipelinesResponse};
 pub use crate::ingest_api::{RestIngestResponse, RestParseFailure};
 pub use crate::metrics::SERVE_METRICS;
 use crate::rate_modulator::RateModulator;

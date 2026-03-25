@@ -187,6 +187,7 @@ impl ClusterSandboxBuilder {
         ResolvedClusterConfig {
             temp_dir: self.temp_dir,
             node_configs: resolved_node_configs,
+            common_sandbox_configs: common_configs,
             tcp_listener_resolver,
         }
     }
@@ -211,6 +212,7 @@ impl ClusterSandboxBuilder {
 pub struct ResolvedClusterConfig {
     temp_dir: TempDir,
     pub node_configs: Vec<NodeConfig>,
+    common_sandbox_configs: SandboxCommonConfigs,
     tcp_listener_resolver: TestTcpListenerResolver,
 }
 
@@ -221,7 +223,6 @@ impl ResolvedClusterConfig {
         let runtimes_config = RuntimesConfig::light_for_tests();
         let storage_resolver = StorageResolver::unconfigured();
         let metastore_resolver = MetastoreResolver::unconfigured();
-        let cluster_size = self.node_configs.len();
         let mut nodes = Vec::with_capacity(self.node_configs.len());
         for node_config in self.node_configs {
             let mut shutdown_handle = NodeShutdownHandle::new();
@@ -259,10 +260,13 @@ impl ResolvedClusterConfig {
 
         let sandbox = ClusterSandbox {
             nodes,
+            common_sandbox_configs: self.common_sandbox_configs,
+            storage_resolver,
+            metastore_resolver,
             _temp_dir: self.temp_dir,
         };
         sandbox
-            .wait_for_cluster_num_ready_nodes(cluster_size)
+            .wait_for_cluster_num_ready_nodes(sandbox.nodes.len())
             .await
             .unwrap();
         sandbox
@@ -302,6 +306,9 @@ pub(crate) async fn ingest(
 /// or REST clients to test it.
 pub struct ClusterSandbox {
     nodes: Vec<ClusterNode>,
+    common_sandbox_configs: SandboxCommonConfigs,
+    storage_resolver: StorageResolver,
+    metastore_resolver: MetastoreResolver,
     _temp_dir: TempDir,
 }
 
@@ -623,5 +630,92 @@ impl ClusterSandbox {
     ) -> Result<Vec<HashMap<String, ActorExitStatus>>, anyhow::Error> {
         let all_node_names: Vec<String> = self.nodes.iter().map(|n| n.node_name.clone()).collect();
         self.shutdown_nodes(all_node_names).await
+    }
+
+    /// Adds a new node to the existing cluster
+    pub async fn add_node(
+        &mut self,
+        node_name: impl Into<String>,
+        services: impl IntoIterator<Item = QuickwitService>,
+    ) -> anyhow::Result<()> {
+        let node_name = node_name.into();
+        let services: HashSet<QuickwitService> = HashSet::from_iter(services);
+
+        // Collect peer seeds from existing nodes
+        let peer_seeds: Vec<String> = self
+            .nodes
+            .iter()
+            .map(|node| node.config.gossip_advertise_addr.to_string())
+            .collect();
+
+        // Create TCP listeners for the new node
+        let socket: SocketAddr = ([127, 0, 0, 1], 0u16).into();
+        let rest_tcp_listener = TcpListener::bind(socket).await?;
+        let grpc_tcp_listener = TcpListener::bind(socket).await?;
+
+        let rest_port = rest_tcp_listener.local_addr()?.port();
+        let grpc_port = grpc_tcp_listener.local_addr()?.port();
+
+        let tcp_listener_resolver = TestTcpListenerResolver::default();
+        tcp_listener_resolver.add_listener(rest_tcp_listener).await;
+        tcp_listener_resolver.add_listener(grpc_tcp_listener).await;
+
+        // Build the node configuration using common configs
+        let sandbox_node_config = SandboxNodeConfig {
+            node_name: node_name.clone(),
+            services: services.clone(),
+            enable_otlp: false,
+        };
+        let mut config = assemble_node_config(
+            &self.common_sandbox_configs,
+            sandbox_node_config,
+            rest_port,
+            grpc_port,
+        );
+        config.peer_seeds = peer_seeds;
+
+        // Start the node
+        let runtimes_config = RuntimesConfig::light_for_tests();
+        let mut shutdown_handle = NodeShutdownHandle::new();
+        let shutdown_signal = shutdown_handle.shutdown_signal();
+
+        let join_handle = tokio::spawn({
+            let node_config = config.clone();
+            let node_id = node_config.node_id.clone();
+            let node_services = node_config.enabled_services.clone();
+            let metastore_resolver = self.metastore_resolver.clone();
+            let storage_resolver = self.storage_resolver.clone();
+
+            async move {
+                let result = serve_quickwit(
+                    node_config,
+                    runtimes_config,
+                    metastore_resolver,
+                    storage_resolver,
+                    tcp_listener_resolver,
+                    shutdown_signal,
+                    quickwit_serve::do_nothing_env_filter_reload_fn(),
+                )
+                .await?;
+                debug!("{node_id} stopped successfully ({:?})", node_services);
+                Result::<_, anyhow::Error>::Ok(result)
+            }
+        });
+
+        shutdown_handle.set_node_join_handle(join_handle);
+
+        // Add the node to the cluster
+        self.nodes.push(ClusterNode {
+            node_name: node_name.clone(),
+            config,
+            shutdown_handle,
+        });
+
+        // Wait for the newly added node to become ready
+        // Give extra time for gossip propagation and metastore connectivity
+        self.wait_for_cluster_num_ready_nodes(self.nodes.len())
+            .await?;
+
+        Ok(())
     }
 }
