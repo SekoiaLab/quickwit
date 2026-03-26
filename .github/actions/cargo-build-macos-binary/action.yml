@@ -34,7 +34,7 @@ runs:
       shell: bash
       run: curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain none -y
     - name: Add target ${{ inputs.target }}
-      run: rustup target add ${INPUTS_TARGET}
+      run: rustup target add "${INPUTS_TARGET}"
       shell: bash
       working-directory: ./quickwit
       env:
@@ -55,8 +55,8 @@ runs:
         QW_COMMIT_TAGS: ${{ env.QW_COMMIT_TAGS }}
     - name: Bundle archive
       run: |
-        make archive BINARY_FILE=quickwit/target/${INPUTS_TARGET}/release/quickwit \
-          BINARY_VERSION=${INPUTS_VERSION} ARCHIVE_NAME=${ASSET_FULL_NAME}
+        make archive "BINARY_FILE=quickwit/target/${INPUTS_TARGET}/release/quickwit" \
+          "BINARY_VERSION=${INPUTS_VERSION}" "ARCHIVE_NAME=${ASSET_FULL_NAME}"
       shell: bash
       env:
         INPUTS_TARGET: ${{ inputs.target }}
