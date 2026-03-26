@@ -16,12 +16,15 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use quickwit_common::binary_heap::{SortKeyMapper, TopK};
+use quickwit_common::numeric_types::num_proj::{
+    ProjectedNumber, f64_to_i64, f64_to_u64, i64_to_f64, i64_to_u64, u64_to_f64, u64_to_i64,
+};
 use quickwit_doc_mapper::{FastFieldWarmupInfo, WarmupInfo};
 use quickwit_proto::search::{
     LeafSearchResponse, PartialHit, ResourceStats, SearchRequest, SortByValue, SortOrder,
-    SortValue, SplitSearchError,
+    SortValue, SplitSearchError, TypeSortKey,
 };
 use quickwit_proto::types::SplitId;
 use serde::Deserialize;
@@ -29,13 +32,14 @@ use tantivy::aggregation::agg_req::{Aggregations, get_fast_field_names};
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::aggregation::{AggContextParams, AggregationLimitsGuard, AggregationSegmentCollector};
 use tantivy::collector::{Collector, SegmentCollector};
-use tantivy::columnar::{ColumnType, MonotonicallyMappableToU64};
+use tantivy::columnar::{ColumnType, MonotonicallyMappableToU64, StrColumn, TermOrdHit};
 use tantivy::fastfield::Column;
 use tantivy::tokenizer::TokenizerManager;
-use tantivy::{DateTime, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
+use tantivy::{DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 use crate::find_trace_ids_collector::{FindTraceIdsCollector, FindTraceIdsSegmentCollector, Span};
-use crate::top_k_collector::{QuickwitSegmentTopKCollector, specialized_top_k_segment_collector};
+use crate::top_k_collector::QuickwitSegmentTopKCollector;
+use crate::top_k_computer::MinValue;
 use crate::{GlobalDocAddress, merge_resource_stats, merge_resource_stats_it};
 
 #[derive(Clone, Debug)]
@@ -51,30 +55,7 @@ pub(crate) enum SortByComponent {
         order: SortOrder,
     },
 }
-impl From<SortByComponent> for SortByPair {
-    fn from(value: SortByComponent) -> Self {
-        Self {
-            first: value,
-            second: None,
-        }
-    }
-}
-#[derive(Clone)]
-pub(crate) struct SortByPair {
-    first: SortByComponent,
-    second: Option<SortByComponent>,
-}
-impl SortByPair {
-    pub fn sort_orders(&self) -> (SortOrder, SortOrder) {
-        (
-            self.first.sort_order(),
-            self.second
-                .as_ref()
-                .map(|sort_by| sort_by.sort_order())
-                .unwrap_or(SortOrder::Desc),
-        )
-    }
-}
+
 impl SortByComponent {
     fn to_sorting_field_extractor_component(
         &self,
@@ -83,19 +64,43 @@ impl SortByComponent {
         match self {
             SortByComponent::DocId { .. } => Ok(SortingFieldExtractorComponent::DocId),
             SortByComponent::FastField { field_name, .. } => {
-                let sort_column_opt: Option<(Column<u64>, ColumnType)> =
-                    segment_reader.fast_fields().u64_lenient(field_name)?;
-                let (sort_column, column_type) = sort_column_opt.unwrap_or_else(|| {
-                    (
-                        Column::build_empty_column(segment_reader.max_doc()),
-                        ColumnType::U64,
-                    )
-                });
-                let sort_field_type = SortFieldType::try_from(column_type)?;
-                Ok(SortingFieldExtractorComponent::FastField {
-                    sort_column,
-                    sort_field_type,
-                })
+                let allowed_column_types = [
+                    ColumnType::I64,
+                    ColumnType::U64,
+                    ColumnType::F64,
+                    ColumnType::Str,
+                    ColumnType::DateTime,
+                    ColumnType::Bool,
+                    // ColumnType::IpAddr Unsupported
+                    // ColumnType::Bytes Unsupported
+                ];
+                let fast_fields = segment_reader.fast_fields();
+                let mut sort_columns = fast_fields
+                    .u64_lenient_for_type_all(Some(&allowed_column_types), field_name)?
+                    .into_iter()
+                    .map(|(col, col_typ)| match col_typ {
+                        ColumnType::U64 => Ok((col, SortFieldType::U64)),
+                        ColumnType::I64 => Ok((col, SortFieldType::I64)),
+                        ColumnType::F64 => Ok((col, SortFieldType::F64)),
+                        ColumnType::DateTime => Ok((col, SortFieldType::DateTime)),
+                        ColumnType::Bool => Ok((col, SortFieldType::Bool)),
+                        ColumnType::Str => Ok((
+                            col,
+                            SortFieldType::String(
+                                fast_fields
+                                    .str(field_name)?
+                                    .expect("field with str column type should have str column"),
+                            ),
+                        )),
+                        _ => panic!("unsupported"),
+                    })
+                    .collect::<tantivy::Result<Vec<_>>>()?;
+
+                sort_columns.sort_by_key(|(_, col_typ)| col_typ.type_sort_key());
+
+                // TODO we could skip the columns that are before the search after
+
+                Ok(SortingFieldExtractorComponent::FastField { sort_columns })
             }
             SortByComponent::Score { .. } => Ok(SortingFieldExtractorComponent::Score),
         }
@@ -125,13 +130,44 @@ impl SortByComponent {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
+pub(crate) struct SortByPair {
+    first: SortByComponent,
+    second: Option<SortByComponent>,
+}
+impl SortByPair {
+    pub fn sort_orders(&self) -> (SortOrder, SortOrder) {
+        (
+            self.first.sort_order(),
+            self.second
+                .as_ref()
+                .map(|sort_by| sort_by.sort_order())
+                .unwrap_or(SortOrder::Desc),
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum SortFieldType {
     U64,
     I64,
     F64,
     DateTime,
     Bool,
+    String(StrColumn),
+}
+
+impl SortFieldType {
+    fn type_sort_key(&self) -> TypeSortKey {
+        match self {
+            SortFieldType::U64 => TypeSortKey::Numeric,
+            SortFieldType::I64 => TypeSortKey::Numeric,
+            SortFieldType::F64 => TypeSortKey::Numeric,
+            SortFieldType::DateTime => TypeSortKey::DateTime,
+            SortFieldType::Bool => TypeSortKey::Boolean,
+            SortFieldType::String(_) => TypeSortKey::Str,
+        }
+    }
 }
 
 /// The `SortingFieldExtractor` is used to extract a score, which can either be a true score,
@@ -140,28 +176,121 @@ pub(crate) enum SortingFieldExtractorComponent {
     /// If undefined, we simply sort by DocIds.
     DocId,
     FastField {
-        sort_column: Column<u64>,
-        sort_field_type: SortFieldType,
+        /// Sort columns are sorted in the same order as types (TypeSortKey)
+        sort_columns: Vec<(Column<u64>, SortFieldType)>,
     },
     Score,
 }
 
-impl SortingFieldExtractorComponent {
-    pub fn is_score(&self) -> bool {
-        matches!(self, SortingFieldExtractorComponent::Score)
-    }
-    pub fn is_fast_field(&self) -> bool {
-        matches!(self, SortingFieldExtractorComponent::FastField { .. })
-    }
-    /// Loads the fast field values for the given doc_ids in its u64 representation. The returned
-    /// u64 representation maintains the ordering of the original value.
+#[derive(Copy, Clone)]
+struct InternalValueRepr(u8, u64);
+
+impl InternalValueRepr {
     #[inline]
-    pub fn extract_typed_sort_values_block(&self, doc_ids: &[DocId], values: &mut [Option<u64>]) {
-        // In the collect block case we don't have scores to extract
-        if let SortingFieldExtractorComponent::FastField { sort_column, .. } = self {
-            let values = &mut values[..doc_ids.len()];
-            sort_column.first_vals(doc_ids, values);
+    fn new(value: u64, accessor_idx: u8, order: SortOrder) -> Self {
+        // For Asc, smaller values should win: invert so smaller maps to larger repr
+        match order {
+            SortOrder::Asc => Self(!(accessor_idx * 2 + 3), !value),
+            SortOrder::Desc => Self(accessor_idx * 2 + 3, value),
         }
+    }
+    /// A sentinel value that can be instantiated as search after boundary to indicate
+    /// that all documents should be kept.
+    fn new_keep_column(accessor_idx: u8, order: SortOrder) -> Self {
+        match order {
+            SortOrder::Asc => Self(!(accessor_idx * 2 + 2), 0),
+            SortOrder::Desc => Self(accessor_idx * 2 + 4, 0),
+        }
+    }
+    #[inline]
+    fn new_missing() -> Self {
+        // Missing always last in topk, so use the smallest possible value
+        // (besides the skip_all value)
+        Self(1, 0)
+    }
+    /// A sentinel value that can be instantiated as search after boundary to indicate
+    /// that all documents should be skipped for the given column.
+    fn new_skip_column(accessor_idx: u8, order: SortOrder) -> Self {
+        match order {
+            SortOrder::Asc => Self(!(accessor_idx * 2 + 4), 0),
+            SortOrder::Desc => Self(accessor_idx * 2 + 2, 0),
+        }
+    }
+    /// A sentinel value that can be instantiated as search after boundary to indicate
+    /// that all documents should be skipped.
+    fn new_skip_all_but_missing() -> Self {
+        Self(2, 0)
+    }
+    #[inline]
+    fn decode(self, order: SortOrder) -> Option<(u8, u64)> {
+        if self.0 == 1 {
+            return None;
+        }
+        debug_assert_eq!(
+            match order {
+                SortOrder::Asc => !self.0,
+                SortOrder::Desc => self.0,
+            } % 2,
+            1,
+            "sentinel indexes are not meant to be decoded"
+        );
+        match order {
+            SortOrder::Asc => Some(((!self.0 - 3) / 2, !self.1)),
+            SortOrder::Desc => Some(((self.0 - 3) / 2, self.1)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+pub(crate) struct InternalSortValueRepr(u8, u64, u8, u64, u8, u32);
+
+impl InternalSortValueRepr {
+    #[inline]
+    fn new(
+        sort_1: InternalValueRepr,
+        sort_2: InternalValueRepr,
+        doc_id: DocId,
+        doc_id_sort: SortOrder,
+    ) -> Self {
+        // For Asc, smaller values should win: invert so smaller maps to larger repr
+        match doc_id_sort {
+            SortOrder::Asc => Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 1, !doc_id),
+            SortOrder::Desc => Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 1, doc_id),
+        }
+    }
+    fn new_keep_doc_ids(sort_1: InternalValueRepr, sort_2: InternalValueRepr) -> Self {
+        Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 2, 0)
+    }
+    fn new_skip_doc_ids(sort_1: InternalValueRepr, sort_2: InternalValueRepr) -> Self {
+        Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 0, 0)
+    }
+    #[inline]
+    fn sort_1(self) -> InternalValueRepr {
+        InternalValueRepr(self.0, self.1)
+    }
+    #[inline]
+    fn sort_2(self) -> InternalValueRepr {
+        InternalValueRepr(self.2, self.3)
+    }
+    #[inline]
+    fn doc_id(self, order: SortOrder) -> DocId {
+        debug_assert_eq!(self.4, 1, "doc id sentinel is not meant to be decoded");
+        match order {
+            SortOrder::Asc => !self.5,
+            SortOrder::Desc => self.5,
+        }
+    }
+}
+
+impl MinValue for InternalSortValueRepr {
+    fn min_value() -> Self {
+        Self(0, 0, 0, 0, 0, 0)
+    }
+}
+
+impl SortingFieldExtractorComponent {
+    pub fn is_doc_id(&self) -> bool {
+        matches!(self, SortingFieldExtractorComponent::DocId)
     }
 
     /// Returns the sort value for the given element in its u64 representation. The returned u64
@@ -170,287 +299,359 @@ impl SortingFieldExtractorComponent {
     /// The function returns None if the sort key is a fast field, for which we have no value
     /// for the given doc_id, or we sort by DocId.
     #[inline]
-    fn extract_typed_sort_value_opt(&self, doc_id: DocId, score: Score) -> Option<u64> {
-        match self {
-            // Tie breaks are not handled here, but in SegmentPartialHit
-            SortingFieldExtractorComponent::DocId => None,
-            SortingFieldExtractorComponent::FastField { sort_column, .. } => {
-                sort_column.first(doc_id)
-            }
-            SortingFieldExtractorComponent::Score => Some((score as f64).to_u64()),
-        }
-    }
-
-    #[inline]
-    /// Converts u64 fast field values to its correct type.
-    /// The conversion is delayed for performance reasons.
-    ///
-    /// This is used to convert `search_after` sort value to a u64 representation that will respect
-    /// the same order as the `SortValue` representation.
-    pub fn convert_u64_ff_val_to_sort_value(&self, sort_value: u64) -> SortValue {
-        let map_fast_field_to_value = |fast_field_value, field_type| match field_type {
-            SortFieldType::U64 => SortValue::U64(fast_field_value),
-            SortFieldType::I64 => SortValue::I64(i64::from_u64(fast_field_value)),
-            SortFieldType::F64 => SortValue::F64(f64::from_u64(fast_field_value)),
-            SortFieldType::DateTime => SortValue::I64(i64::from_u64(fast_field_value)),
-            SortFieldType::Bool => SortValue::Boolean(fast_field_value != 0u64),
-        };
-        match self {
-            SortingFieldExtractorComponent::DocId => SortValue::U64(sort_value),
-            SortingFieldExtractorComponent::FastField {
-                sort_field_type, ..
-            } => map_fast_field_to_value(sort_value, *sort_field_type),
-            SortingFieldExtractorComponent::Score => SortValue::F64(f64::from_u64(sort_value)),
-        }
-    }
-    /// Converts fast field values into their u64 fast field representation.
-    ///
-    /// Returns None if value is out of bounds of target value.
-    /// None means that the search_after will be disabled and everything matches.
-    ///
-    /// What's currently missing is to signal that _nothing_ matches to generate an optimized
-    /// query. For now we just choose the max value of the target type.
-    #[inline]
-    pub fn convert_to_u64_ff_val(
+    fn project_to_internal_sort_value(
         &self,
-        sort_value: SortValue,
-        sort_order: SortOrder,
-    ) -> Option<u64> {
+        doc_id: DocId,
+        score: Score,
+        order: SortOrder,
+    ) -> InternalValueRepr {
         match self {
-            SortingFieldExtractorComponent::DocId => match sort_value {
-                SortValue::U64(val) => Some(val),
-                _ => panic!("Internal error: Got non-U64 sort value for DocId."),
-            },
-            SortingFieldExtractorComponent::FastField {
-                sort_field_type, ..
-            } => {
-                // We need to convert a (potential user provided) value in the correct u64
-                // representation of the fast field.
-                // This requires this weird conversion of first casting into the target type
-                // (if possible) and then to its u64 presentation.
-                //
-                // For the conversion into the target type it's important to know if the target
-                // type does not cover the whole range of the source type. In that case we need to
-                // add additional conversion checks, to see if it matches everything
-                // or nothing. (Which also depends on the sort order).
-                // Below are the visual representations of the value ranges of the different types.
-                // Note: DateTime is equal to I64 and omitted.
-                //
-                //     Bool value range (0, 1):
-                //                        <->
-                //
-                //     I64 value range (signed 64-bit integer):
-                //     <------------------------------------>
-                //     -2^63                             2^63-1
-                //     U64 value range (unsigned 64-bit integer):
-                //                        <------------------------------------>
-                //                        0                                  2^64-1
-                // F64 value range (64-bit floating point, conceptual, not to scale):
-                // <-------------------------------------------------------------------->
-                // Very negative numbers                                       Very positive numbers
-                //
-                // Those conversions have limited target type value space:
-                // - [X] U64 -> I64
-                // - [X] F64 -> I64
-                // - [X] I64 -> U64
-                // - [X] F64 -> U64
-                //
-                // - [X] F64 -> Bool
-                // - [X] I64 -> Bool
-                // - [X] U64 -> Bool
-                //
-                let val = match (sort_value, sort_field_type) {
-                    // Same field type, no conversion needed.
-                    (SortValue::U64(val), SortFieldType::U64) => val,
-                    (SortValue::F64(val), SortFieldType::F64) => val.to_u64(),
-                    (SortValue::Boolean(val), SortFieldType::Bool) => val.to_u64(),
-                    (SortValue::I64(val), SortFieldType::I64) => val.to_u64(),
-                    (SortValue::U64(mut val), SortFieldType::I64) => {
-                        if sort_order == SortOrder::Desc && val > i64::MAX as u64 {
-                            return None;
-                        }
-                        // Add a limit to avoid overflow.
-                        val = val.min(i64::MAX as u64);
-                        (val as i64).to_u64()
-                    }
-                    (SortValue::U64(val), SortFieldType::F64) => (val as f64).to_u64(),
-                    (SortValue::U64(mut val), SortFieldType::DateTime) => {
-                        // Match everything
-                        if sort_order == SortOrder::Desc && val > i64::MAX as u64 {
-                            return None;
-                        }
-                        // Add a limit to avoid overflow.
-                        val = val.min(i64::MAX as u64);
-                        DateTime::from_timestamp_nanos(val as i64).to_u64()
-                    }
-                    (SortValue::I64(val), SortFieldType::U64) => {
-                        if val < 0 && sort_order == SortOrder::Asc {
-                            return None;
-                        }
-                        if val < 0 && sort_order == SortOrder::Desc {
-                            u64::MIN // matches nothing as search_after is not inclusive
-                        } else {
-                            val as u64
-                        }
-                    }
-                    (SortValue::I64(val), SortFieldType::F64) => (val as f64).to_u64(),
-                    (SortValue::I64(val), SortFieldType::DateTime) => {
-                        DateTime::from_timestamp_nanos(val).to_u64()
-                    }
-                    (SortValue::F64(val), SortFieldType::U64) => {
-                        let all_values_ahead1 =
-                            val < u64::MIN as f64 && sort_order == SortOrder::Asc;
-                        let all_values_ahead2 =
-                            val > u64::MAX as f64 && sort_order == SortOrder::Desc;
-                        if all_values_ahead1 || all_values_ahead2 {
-                            return None;
-                        }
-                        // f64 cast already handles under/overflow and clamps the value
-                        (val as u64).to_u64()
-                    }
-                    (SortValue::F64(val), SortFieldType::I64)
-                    | (SortValue::F64(val), SortFieldType::DateTime) => {
-                        let all_values_ahead1 =
-                            val < i64::MIN as f64 && sort_order == SortOrder::Asc;
-                        let all_values_ahead2 =
-                            val > i64::MAX as f64 && sort_order == SortOrder::Desc;
-                        if all_values_ahead1 || all_values_ahead2 {
-                            return None;
-                        }
-                        // f64 cast already handles under/overflow and clamps the value
-                        let val_i64 = val as i64;
-
-                        if *sort_field_type == SortFieldType::DateTime {
-                            DateTime::from_timestamp_nanos(val_i64).to_u64()
-                        } else {
-                            val_i64.to_u64()
-                        }
-                    }
-                    // Not sure when we hit this, it's probably are very rare case.
-                    (SortValue::Boolean(val), SortFieldType::U64) => val as u64,
-                    (SortValue::Boolean(val), SortFieldType::F64) => (val as u64 as f64).to_u64(),
-                    (SortValue::Boolean(val), SortFieldType::I64) => (val as i64).to_u64(),
-                    (SortValue::Boolean(val), SortFieldType::DateTime) => {
-                        DateTime::from_timestamp_nanos(val as i64).to_u64()
-                    }
-                    (SortValue::U64(mut val), SortFieldType::Bool) => {
-                        let all_values_ahead1 = val > 1 && sort_order == SortOrder::Desc;
-                        if all_values_ahead1 {
-                            return None;
-                        }
-                        // clamp value for comparison
-                        val = val.clamp(0, 1);
-                        (val == 1).to_u64()
-                    }
-                    (SortValue::I64(mut val), SortFieldType::Bool) => {
-                        let all_values_ahead1 = val > 1 && sort_order == SortOrder::Desc;
-                        let all_values_ahead2 = val < 0 && sort_order == SortOrder::Asc;
-                        if all_values_ahead1 || all_values_ahead2 {
-                            return None;
-                        }
-                        // clamp value for comparison
-                        val = val.clamp(0, 1);
-                        (val == 1).to_u64()
-                    }
-                    (SortValue::F64(mut val), SortFieldType::Bool) => {
-                        let all_values_ahead1 = val > 1.0 && sort_order == SortOrder::Desc;
-                        let all_values_ahead2 = val < 0.0 && sort_order == SortOrder::Asc;
-                        if all_values_ahead1 || all_values_ahead2 {
-                            return None;
-                        }
-                        val = val.clamp(0.0, 1.0);
-                        (val >= 0.5).to_u64() // Is this correct?
-                    }
-                };
-                Some(val)
+            SortingFieldExtractorComponent::DocId => {
+                // Doc id is handled at the compound sort value level
+                InternalValueRepr::new_missing()
             }
-            SortingFieldExtractorComponent::Score => match sort_value {
-                SortValue::F64(val) => Some(val.to_u64()),
-                _ => panic!("Internal error: Got non-F64 sort value for Score."),
-            },
+            SortingFieldExtractorComponent::FastField { sort_columns, .. } => {
+                for (idx, (sort_column, _)) in sort_columns.iter().enumerate() {
+                    if let Some(value) = sort_column.first(doc_id) {
+                        return InternalValueRepr::new(value, idx as u8, order);
+                    }
+                }
+                InternalValueRepr::new_missing()
+            }
+            SortingFieldExtractorComponent::Score => {
+                InternalValueRepr::new((score as f64).to_u64(), 0, order)
+            }
+        }
+    }
+
+    fn project_from_internal_sort_value(
+        &self,
+        internal_repr: InternalValueRepr,
+        order: SortOrder,
+    ) -> tantivy::Result<Option<SortByValue>> {
+        let Some((col_idx, val_as_u64)) = internal_repr.decode(order) else {
+            return Ok(None);
+        };
+        let sort_value = match self {
+            SortingFieldExtractorComponent::DocId => SortValue::U64(val_as_u64),
+            SortingFieldExtractorComponent::FastField { sort_columns, .. } => {
+                let (_, field_type) = &sort_columns[col_idx as usize];
+                match field_type {
+                    SortFieldType::U64 => SortValue::U64(val_as_u64),
+                    SortFieldType::I64 => SortValue::I64(i64::from_u64(val_as_u64)),
+                    SortFieldType::F64 => SortValue::F64(f64::from_u64(val_as_u64)),
+                    SortFieldType::DateTime => SortValue::I64(i64::from_u64(val_as_u64)),
+                    SortFieldType::Bool => SortValue::Boolean(val_as_u64 != 0u64),
+                    SortFieldType::String(str_column) => {
+                        let term_dict = str_column.dictionary();
+                        let mut buffer = Vec::new();
+                        term_dict.ord_to_term(val_as_u64, &mut buffer)?;
+                        SortValue::Str(
+                            String::from_utf8(buffer.to_vec())
+                                .expect("could not convert to String"),
+                        )
+                    }
+                }
+            }
+            SortingFieldExtractorComponent::Score => SortValue::F64(f64::from_u64(val_as_u64)),
+        };
+        Ok(Some(SortByValue {
+            sort_value: Some(sort_value),
+        }))
+    }
+
+    fn project_to_internal_search_after(
+        &self,
+        sort_by_value: &SortByValue,
+        sort_order: SortOrder,
+    ) -> tantivy::Result<InternalValueRepr> {
+        let SortByValue {
+            sort_value: sort_value_opt,
+        } = sort_by_value;
+        match (self, sort_value_opt) {
+            (SortingFieldExtractorComponent::DocId, Some(SortValue::U64(val))) => {
+                Ok(InternalValueRepr::new(*val, 0, sort_order))
+            }
+            (SortingFieldExtractorComponent::DocId, _) => {
+                Err(tantivy::TantivyError::InvalidArgument(
+                    "got non-U64 sort value for doc ID".to_string(),
+                ))
+            }
+            (SortingFieldExtractorComponent::FastField { .. }, None) => {
+                Ok(InternalValueRepr::new_missing())
+            }
+            (SortingFieldExtractorComponent::FastField { sort_columns, .. }, Some(sort_value)) => {
+                project_search_after_sort_value(sort_columns, sort_value, sort_order)
+            }
+            (SortingFieldExtractorComponent::Score, Some(SortValue::F64(val))) => {
+                Ok(InternalValueRepr::new(val.to_u64(), 0, sort_order))
+            }
+            (SortingFieldExtractorComponent::Score, _) => {
+                Err(tantivy::TantivyError::InvalidArgument(
+                    "got non-F64 sort value for score".to_string(),
+                ))
+            }
         }
     }
 }
 
-impl From<SortingFieldExtractorComponent> for SortingFieldExtractorPair {
-    fn from(value: SortingFieldExtractorComponent) -> Self {
-        Self {
-            first: value,
-            second: None,
+fn projected_number_internal_repr<T: MonotonicallyMappableToU64>(
+    projected: ProjectedNumber<T>,
+    order: SortOrder,
+    accessor_idx: u8,
+) -> InternalValueRepr {
+    match (projected, order) {
+        (ProjectedNumber::Exact(val), _) => {
+            InternalValueRepr::new(val.to_u64(), accessor_idx, order)
+        }
+        (ProjectedNumber::AfterLast, SortOrder::Asc) => {
+            InternalValueRepr::new_skip_column(accessor_idx, order)
+        }
+        (ProjectedNumber::AfterLast, SortOrder::Desc) => {
+            InternalValueRepr::new_keep_column(accessor_idx, order)
+        }
+        (ProjectedNumber::Next(val), SortOrder::Asc) => {
+            let val_u64 = val.to_u64();
+            if val_u64 == 0 {
+                InternalValueRepr::new_keep_column(accessor_idx, order)
+            } else {
+                InternalValueRepr::new(val_u64 - 1, accessor_idx, order)
+            }
+        }
+        (ProjectedNumber::Next(val), SortOrder::Desc) => {
+            let val_u64 = val.to_u64();
+            if val_u64 == 0 {
+                InternalValueRepr::new_skip_column(accessor_idx, order)
+            } else {
+                InternalValueRepr::new(val_u64, accessor_idx, order)
+            }
         }
     }
+}
+
+fn project_search_after_sort_value(
+    sort_columns: &[(Column<u64>, SortFieldType)],
+    sort_value: &SortValue,
+    sort_order: SortOrder,
+) -> tantivy::Result<InternalValueRepr> {
+    let col_iter = match sort_order {
+        SortOrder::Asc => Either::Left(sort_columns.iter().enumerate()),
+        SortOrder::Desc => Either::Right(sort_columns.iter().enumerate().rev()),
+    };
+    for (idx, sort_column) in col_iter {
+        let internal_repr = match (&sort_column.1, sort_value) {
+            // project to u64 column
+            (SortFieldType::U64, SortValue::U64(val)) => {
+                InternalValueRepr::new(*val, idx as u8, sort_order)
+            }
+            (SortFieldType::U64, SortValue::F64(val)) => {
+                projected_number_internal_repr(f64_to_u64(*val), sort_order, idx as u8)
+            }
+            (SortFieldType::U64, SortValue::I64(val)) => {
+                projected_number_internal_repr(i64_to_u64(*val), sort_order, idx as u8)
+            }
+            // project to i64 column
+            (SortFieldType::I64, SortValue::I64(val)) => {
+                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order)
+            }
+            (SortFieldType::I64, SortValue::F64(val)) => {
+                projected_number_internal_repr(f64_to_i64(*val), sort_order, idx as u8)
+            }
+            (SortFieldType::I64, SortValue::U64(val)) => {
+                projected_number_internal_repr(u64_to_i64(*val), sort_order, idx as u8)
+            }
+            // project to f64 column
+            (SortFieldType::F64, SortValue::F64(val)) => {
+                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order)
+            }
+            (SortFieldType::F64, SortValue::I64(val)) => {
+                projected_number_internal_repr(i64_to_f64(*val), sort_order, idx as u8)
+            }
+            (SortFieldType::F64, SortValue::U64(val)) => {
+                projected_number_internal_repr(u64_to_f64(*val), sort_order, idx as u8)
+            }
+            // other types
+            (SortFieldType::DateTime, SortValue::Datetime(val)) => {
+                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order)
+            }
+            (SortFieldType::Bool, SortValue::Boolean(val)) => {
+                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order)
+            }
+            (SortFieldType::String(str_column), SortValue::Str(val)) => {
+                let term_dict = str_column.dictionary();
+                let hit = term_dict.term_ord_or_next(val.as_str().as_bytes())?;
+                match (hit, sort_order) {
+                    (TermOrdHit::Exact(ord), _) => {
+                        InternalValueRepr::new(ord, idx as u8, sort_order)
+                    }
+                    (TermOrdHit::Next(ord), SortOrder::Desc) => {
+                        InternalValueRepr::new(ord, idx as u8, sort_order)
+                    }
+                    (TermOrdHit::Next(0), SortOrder::Asc) => {
+                        InternalValueRepr::new_keep_column(idx as u8, sort_order)
+                    }
+                    (TermOrdHit::Next(ord), SortOrder::Asc) => {
+                        InternalValueRepr::new(ord - 1, idx as u8, sort_order)
+                    }
+                }
+            }
+            (sort_field_type, sort_value) => {
+                let column_key = sort_field_type.type_sort_key();
+                let value_key = sort_value.type_sort_key();
+                let column_comes_after = match sort_order {
+                    SortOrder::Desc => column_key < value_key,
+                    SortOrder::Asc => column_key > value_key,
+                };
+                if column_comes_after {
+                    InternalValueRepr::new_keep_column(idx as u8, sort_order)
+                } else {
+                    continue;
+                }
+            }
+        };
+        return Ok(internal_repr);
+    }
+    Ok(InternalValueRepr::new_skip_all_but_missing())
 }
 
 pub(crate) struct SortingFieldExtractorPair {
     pub first: SortingFieldExtractorComponent,
     pub second: Option<SortingFieldExtractorComponent>,
+    pub first_order: SortOrder,
+    pub second_order: SortOrder,
 }
 
 impl SortingFieldExtractorPair {
-    pub fn is_score(&self) -> bool {
-        self.first.is_score()
-            || self
-                .second
-                .as_ref()
-                .map(|second| second.is_score())
-                .unwrap_or(false)
-    }
-    /// Returns the list of sort values for the given element
-    ///
-    /// See also [`SortingFieldExtractorComponent::extract_typed_sort_values_block`] for more
-    /// information.
-    #[inline]
-    pub(crate) fn extract_typed_sort_values(
-        &self,
-        doc_ids: &[DocId],
-        values1: &mut [Option<u64>],
-        values2: &mut [Option<u64>],
-    ) {
-        self.first
-            .extract_typed_sort_values_block(doc_ids, &mut values1[..doc_ids.len()]);
-        if let Some(second) = self.second.as_ref() {
-            second.extract_typed_sort_values_block(doc_ids, &mut values2[..doc_ids.len()]);
+    fn doc_id_sort_order(&self) -> SortOrder {
+        if self.first.is_doc_id() {
+            self.first_order
+        } else if let Some(second) = &self.second
+            && second.is_doc_id()
+        {
+            self.second_order
+        } else {
+            // TODO this is the current behavior which is weird. QW docs for the
+            // native search API advertise that the sort order by default is
+            // reverse(doc_id). In ES _shard_doc is supposed to be always ascending.
+            self.first_order
         }
     }
+
+    pub(crate) fn search_after_from_partial_hit(
+        &self,
+        split_id: &SplitId,
+        segment_ord: SegmentOrdinal,
+        partial_hit: &PartialHit,
+    ) -> tantivy::Result<InternalSortValueRepr> {
+        let sort_1 = if let Some(sort_by_value) = &partial_hit.sort_value {
+            self.first
+                .project_to_internal_search_after(sort_by_value, self.first_order)?
+        } else {
+            InternalValueRepr::new_missing()
+        };
+        let sort_2 = if let Some(sort_by_value) = &partial_hit.sort_value2 {
+            self.second
+                .as_ref()
+                .ok_or_else(|| {
+                    TantivyError::InvalidArgument(
+                        "search after has 2 values but there is only 1 sort dimension".to_string(),
+                    )
+                })?
+                .project_to_internal_search_after(sort_by_value, self.second_order)?
+        } else {
+            InternalValueRepr::new_missing()
+        };
+
+        let internal_repr = if partial_hit.split_id.is_empty() {
+            // When split_id is empty, the search_after is a pure sort-value
+            // boundary (no doc position), any doc with the same sort value must be
+            // excluded otherwise we risk iterating over an over through the same
+            // documents.
+            InternalSortValueRepr::new_skip_doc_ids(sort_1, sort_2)
+        } else {
+            let split_cmp = split_id
+                .as_str()
+                .cmp(partial_hit.split_id.as_str())
+                .then(segment_ord.cmp(&partial_hit.segment_ord));
+            match (split_cmp, self.doc_id_sort_order()) {
+                (Ordering::Less, SortOrder::Asc) | (Ordering::Greater, SortOrder::Desc) => {
+                    InternalSortValueRepr::new_skip_doc_ids(sort_1, sort_2)
+                }
+                (Ordering::Less, SortOrder::Desc) | (Ordering::Greater, SortOrder::Asc) => {
+                    InternalSortValueRepr::new_keep_doc_ids(sort_1, sort_2)
+                }
+                (Ordering::Equal, doc_id_order) => {
+                    InternalSortValueRepr::new(sort_1, sort_2, partial_hit.doc_id, doc_id_order)
+                }
+            }
+        };
+        Ok(internal_repr)
+    }
+
+    pub(crate) fn internal_to_partial_hit(
+        &self,
+        split_id: &SplitId,
+        segment_ord: SegmentOrdinal,
+        internal_repr: InternalSortValueRepr,
+    ) -> tantivy::Result<PartialHit> {
+        let sort_1 = self
+            .first
+            .project_from_internal_sort_value(internal_repr.sort_1(), self.first_order)?;
+        let sort_2 = self
+            .second
+            .as_ref()
+            .map(|second| {
+                second.project_from_internal_sort_value(internal_repr.sort_2(), self.second_order)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(PartialHit {
+            sort_value: sort_1,
+            sort_value2: sort_2,
+            doc_id: internal_repr.doc_id(self.doc_id_sort_order()),
+            split_id: split_id.clone(),
+            segment_ord,
+        })
+    }
+
     /// Returns the list of sort values for the given element
     ///
     /// See also [`SortingFieldExtractorComponent::extract_typed_sort_value_opt`] for more
     /// information.
     #[inline]
-    pub(crate) fn extract_typed_sort_value(
+    pub(crate) fn project_to_internal_sort_value(
         &self,
         doc_id: DocId,
         score: Score,
-    ) -> (Option<u64>, Option<u64>) {
-        let first = self.first.extract_typed_sort_value_opt(doc_id, score);
+    ) -> InternalSortValueRepr {
+        let first = self
+            .first
+            .project_to_internal_sort_value(doc_id, score, self.first_order);
         let second = self
             .second
             .as_ref()
-            .and_then(|second| second.extract_typed_sort_value_opt(doc_id, score));
-        (first, second)
+            .map(|second| second.project_to_internal_sort_value(doc_id, score, self.second_order))
+            .unwrap_or_else(|| InternalValueRepr::new_missing());
+        InternalSortValueRepr::new(first, second, doc_id, self.doc_id_sort_order())
     }
 }
 
-impl TryFrom<ColumnType> for SortFieldType {
-    type Error = tantivy::TantivyError;
+#[allow(clippy::large_enum_variant)]
+enum AggregationSegmentCollectors {
+    FindTraceIdsSegmentCollector(Box<FindTraceIdsSegmentCollector>),
+    TantivyAggregationSegmentCollector(AggregationSegmentCollector),
+}
 
-    fn try_from(column_type: ColumnType) -> tantivy::Result<Self> {
-        match column_type {
-            ColumnType::U64 => Ok(SortFieldType::U64),
-            ColumnType::I64 => Ok(SortFieldType::I64),
-            ColumnType::F64 => Ok(SortFieldType::F64),
-            ColumnType::DateTime => Ok(SortFieldType::DateTime),
-            ColumnType::Bool => Ok(SortFieldType::Bool),
-            _ => Err(TantivyError::InvalidArgument(format!(
-                "Unsupported sort field type `{column_type:?}`."
-            ))),
-        }
-    }
+/// Quickwit collector working at the scale of the segment.
+pub struct QuickwitSegmentCollector {
+    segment_top_k_collector: Option<QuickwitSegmentTopKCollector>,
+    aggregation: Option<AggregationSegmentCollectors>,
+    num_hits: u64,
 }
 
 /// Takes a user-defined sorting criteria and resolves it to a
 /// segment specific `SortingFieldExtractorPair`.
-fn get_score_extractor(
+fn get_sorting_field_extractors(
     sort_by: &SortByPair,
     segment_reader: &SegmentReader,
 ) -> tantivy::Result<SortingFieldExtractorPair> {
@@ -463,62 +664,14 @@ fn get_score_extractor(
             .as_ref()
             .map(|first| first.to_sorting_field_extractor_component(segment_reader))
             .transpose()?,
+        first_order: sort_by.first.sort_order(),
+        second_order: sort_by
+            .second
+            .as_ref()
+            .map(|second| second.sort_order())
+            // value irrelevant?
+            .unwrap_or(SortOrder::Desc),
     })
-}
-
-#[allow(clippy::large_enum_variant)]
-enum AggregationSegmentCollectors {
-    FindTraceIdsSegmentCollector(Box<FindTraceIdsSegmentCollector>),
-    TantivyAggregationSegmentCollector(AggregationSegmentCollector),
-}
-
-/// Quickwit collector working at the scale of the segment.
-pub struct QuickwitSegmentCollector {
-    segment_top_k_collector: Option<Box<dyn QuickwitSegmentTopKCollector>>,
-    aggregation: Option<AggregationSegmentCollectors>,
-    num_hits: u64,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct SegmentPartialHit {
-    /// Normalized to u64, the typed value can be reconstructed with
-    /// SortingFieldExtractorComponent.
-    pub sort_value: Option<u64>,
-    pub sort_value2: Option<u64>,
-    pub doc_id: DocId,
-}
-
-impl SegmentPartialHit {
-    pub fn into_partial_hit(
-        self,
-        split_id: SplitId,
-        segment_ord: SegmentOrdinal,
-        first: &SortingFieldExtractorComponent,
-        second: &Option<SortingFieldExtractorComponent>,
-    ) -> PartialHit {
-        PartialHit {
-            sort_value: self
-                .sort_value
-                .map(|sort_value| first.convert_u64_ff_val_to_sort_value(sort_value))
-                .map(|sort_value| SortByValue {
-                    sort_value: Some(sort_value),
-                }),
-            sort_value2: self
-                .sort_value2
-                .map(|sort_value| {
-                    second
-                        .as_ref()
-                        .expect("Internal error: Got sort_value2, but no sort extractor")
-                        .convert_u64_ff_val_to_sort_value(sort_value)
-                })
-                .map(|sort_value| SortByValue {
-                    sort_value: Some(sort_value),
-                }),
-            doc_id: self.doc_id,
-            split_id,
-            segment_ord,
-        }
-    }
 }
 
 impl SegmentCollector for QuickwitSegmentCollector {
@@ -564,7 +717,7 @@ impl SegmentCollector for QuickwitSegmentCollector {
     fn harvest(self) -> Self::Fruit {
         let mut partial_hits: Vec<PartialHit> = Vec::new();
         if let Some(segment_top_k_collector) = self.segment_top_k_collector {
-            partial_hits = segment_top_k_collector.get_top_k();
+            partial_hits = segment_top_k_collector.get_top_k()?;
         }
 
         let intermediate_aggregation_result = match self.aggregation {
@@ -791,22 +944,30 @@ impl Collector for QuickwitCollector {
             ),
             None => None,
         };
-        let score_extractor = get_score_extractor(&self.sort_by, segment_reader)?;
-        let (order1, order2) = self.sort_by.sort_orders();
 
         let segment_top_k_collector = if leaf_max_hits == 0 {
             None
         } else {
-            let coll: Box<dyn QuickwitSegmentTopKCollector> = specialized_top_k_segment_collector(
+            let score_extractor = get_sorting_field_extractors(&self.sort_by, segment_reader)?;
+            let search_after_opt = self
+                .search_after
+                .as_ref()
+                .map(|search_after| {
+                    score_extractor.search_after_from_partial_hit(
+                        &self.split_id,
+                        segment_ord,
+                        search_after,
+                    )
+                })
+                .transpose()?;
+            let collector = QuickwitSegmentTopKCollector::new(
                 self.split_id.clone(),
+                segment_ord,
                 score_extractor,
                 leaf_max_hits,
-                segment_ord,
-                self.search_after.clone(),
-                order1,
-                order2,
+                search_after_opt,
             );
-            Some(coll)
+            Some(collector)
         };
 
         Ok(QuickwitSegmentCollector {
@@ -1007,14 +1168,20 @@ pub(crate) fn sort_by_from_request(search_request: &SearchRequest) -> SortByPair
 
     let num_sort_fields = search_request.sort_fields.len();
     if num_sort_fields == 0 {
-        SortByComponent::DocId {
-            order: SortOrder::Desc,
+        SortByPair {
+            first: SortByComponent::DocId {
+                order: SortOrder::Desc,
+            },
+            second: None,
         }
-        .into()
     } else if num_sort_fields == 1 {
         let sort_field = &search_request.sort_fields[0];
         let order = SortOrder::try_from(sort_field.sort_order).unwrap_or(SortOrder::Desc);
-        to_sort_by_component(&sort_field.field_name, order).into()
+        let first = to_sort_by_component(&sort_field.field_name, order);
+        SortByPair {
+            first,
+            second: None,
+        }
     } else if num_sort_fields == 2 {
         let sort_field1 = &search_request.sort_fields[0];
         let order1 = SortOrder::try_from(sort_field1.sort_order).unwrap_or(SortOrder::Desc);
@@ -1079,44 +1246,6 @@ pub(crate) fn make_merge_collector(
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SegmentPartialHitSortingKey {
-    sort_value: Option<u64>,
-    sort_value2: Option<u64>,
-    doc_id: DocId,
-    // TODO This should not be there.
-    sort_order: SortOrder,
-    // TODO This should not be there.
-    sort_order2: SortOrder,
-}
-
-impl Ord for SegmentPartialHitSortingKey {
-    fn cmp(&self, other: &SegmentPartialHitSortingKey) -> Ordering {
-        debug_assert_eq!(
-            self.sort_order, other.sort_order,
-            "comparing two PartialHitSortingKey of different ordering"
-        );
-        debug_assert_eq!(
-            self.sort_order2, other.sort_order2,
-            "comparing two PartialHitSortingKey of different ordering"
-        );
-        let order = self
-            .sort_order
-            .compare_opt(&self.sort_value, &other.sort_value);
-        let order2 = self
-            .sort_order2
-            .compare_opt(&self.sort_value2, &other.sort_value2);
-        let order_addr = self.sort_order.compare(&self.doc_id, &other.doc_id);
-        order.then(order2).then(order_addr)
-    }
-}
-
-impl PartialOrd for SegmentPartialHitSortingKey {
-    fn partial_cmp(&self, other: &SegmentPartialHitSortingKey) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PartialHitSortingKey {
     sort_value: Option<SortValue>,
@@ -1168,22 +1297,9 @@ impl SortKeyMapper<PartialHit> for HitSortingMapper {
     type Key = PartialHitSortingKey;
     fn get_sort_key(&self, partial_hit: &PartialHit) -> PartialHitSortingKey {
         PartialHitSortingKey {
-            sort_value: partial_hit.sort_value.and_then(|v| v.sort_value),
-            sort_value2: partial_hit.sort_value2.and_then(|v| v.sort_value),
+            sort_value: partial_hit.sort_value.clone().and_then(|v| v.sort_value),
+            sort_value2: partial_hit.sort_value2.clone().and_then(|v| v.sort_value),
             address: GlobalDocAddress::from_partial_hit(partial_hit),
-            sort_order: self.order1,
-            sort_order2: self.order2,
-        }
-    }
-}
-
-impl SortKeyMapper<SegmentPartialHit> for HitSortingMapper {
-    type Key = SegmentPartialHitSortingKey;
-    fn get_sort_key(&self, partial_hit: &SegmentPartialHit) -> SegmentPartialHitSortingKey {
-        SegmentPartialHitSortingKey {
-            sort_value: partial_hit.sort_value,
-            sort_value2: partial_hit.sort_value2,
-            doc_id: partial_hit.doc_id,
             sort_order: self.order1,
             sort_order2: self.order2,
         }
@@ -1306,9 +1422,11 @@ mod tests {
     use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
     use tantivy::collector::Collector;
 
-    use super::{IncrementalCollector, make_merge_collector};
-    use crate::QuickwitAggregations;
-    use crate::collector::{merge_intermediate_aggregation_result, top_k_partial_hits};
+    use super::{
+        IncrementalCollector, QuickwitAggregations, make_merge_collector,
+        merge_intermediate_aggregation_result, top_k_partial_hits,
+    };
+    use crate::collector::{InternalSortValueRepr, InternalValueRepr};
 
     #[test]
     fn test_merge_partial_hits_no_tie() {
@@ -1419,40 +1537,28 @@ mod tests {
         }
     }
 
-    fn make_index() -> tantivy::Index {
+    /// Build a tantivy index from a JSON dataset. Each element must be a JSON
+    /// object whose keys match field names in the pre-determined schema.
+    fn make_index(dataset: &[serde_json::Value]) -> tantivy::Index {
         use tantivy::Index;
         use tantivy::indexer::UserOperation;
-        use tantivy::schema::{NumericOptions, Schema};
-
-        let dataset = sort_dataset();
+        use tantivy::schema::{FAST, NumericOptions, Schema};
 
         let mut schema_builder = Schema::builder();
         let opts = NumericOptions::default().set_fast();
-
-        schema_builder.add_u64_field("sort1", opts.clone());
-        schema_builder.add_u64_field("sort2", opts);
+        schema_builder.add_u64_field("sort_u64_1", opts.clone());
+        schema_builder.add_u64_field("sort_u64_2", opts);
+        schema_builder.add_json_field("kv", FAST);
         let schema = schema_builder.build();
 
-        let field1 = schema.get_field("sort1").unwrap();
-        let field2 = schema.get_field("sort2").unwrap();
-
-        let index = Index::create_in_ram(schema);
+        let index = Index::create_in_ram(schema.clone());
         let mut index_writer = index.writer(50_000_000).unwrap();
 
         index_writer
             .run(
                 dataset
-                    .into_iter()
-                    .map(|(val1, val2)| {
-                        let mut doc = TantivyDocument::new();
-                        if let Some(val1) = val1 {
-                            doc.add_u64(field1, val1);
-                        }
-                        if let Some(val2) = val2 {
-                            doc.add_u64(field2, val2);
-                        }
-                        doc
-                    })
+                    .iter()
+                    .map(|obj| TantivyDocument::parse_json(&schema, &obj.to_string()).unwrap())
                     .map(UserOperation::Add),
             )
             .unwrap();
@@ -1462,8 +1568,22 @@ mod tests {
     }
 
     #[test]
-    fn test_single_split_sorting() {
-        let index = make_index();
+    fn test_single_split_sorting_single_type() {
+        let raw_dataset = sort_dataset();
+        let json_dataset: Vec<serde_json::Value> = raw_dataset
+            .iter()
+            .map(|(v1, v2)| {
+                let mut obj = serde_json::Map::new();
+                if let Some(v) = v1 {
+                    obj.insert("sort_u64_1".to_string(), (*v).into());
+                }
+                if let Some(v) = v2 {
+                    obj.insert("sort_u64_2".to_string(), (*v).into());
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        let index = make_index(&json_dataset);
 
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
@@ -1471,7 +1591,7 @@ mod tests {
         // tuple of DocId and sort value
         type Doc = (usize, (Option<u64>, Option<u64>));
 
-        let mut dataset: Vec<Doc> = sort_dataset().into_iter().enumerate().collect();
+        let mut dataset: Vec<Doc> = raw_dataset.into_iter().enumerate().collect();
 
         let reverse_int = |val: &Option<u64>| val.as_ref().map(|val| u64::MAX - val);
         let cmp_doc_id_desc = |a: &Doc, b: &Doc| b.0.cmp(&a.0);
@@ -1531,25 +1651,27 @@ mod tests {
             assert_eq!(data, data_copy);
         }
 
+        // The implicit doc_id tiebreaker is always ascending, matching Elasticsearch's
+        // behavior where _shard_doc is always ascending regardless of primary sort direction.
         #[allow(clippy::type_complexity)]
         let sort_orders: Vec<(_, Box<dyn Fn(&Doc, &Doc) -> Ordering>)> = vec![
             ("", Box::new(cmp_doc_id_desc)),
             (
-                "sort1",
+                "sort_u64_1",
                 Box::new(|a, b| cmp_1_desc(a, b).then(cmp_doc_id_desc(a, b))),
             ),
             (
-                "-sort1",
+                "-sort_u64_1",
                 Box::new(|a, b| cmp_1_asc(a, b).then(cmp_doc_id_asc(a, b))),
             ),
             (
-                "sort1,sort2",
+                "sort_u64_1,sort_u64_2",
                 Box::new(|a, b| {
                     cmp_1_desc(a, b).then(cmp_2_desc(a, b).then(cmp_doc_id_desc(a, b)))
                 }),
             ),
             (
-                "-sort1,sort2",
+                "-sort_u64_1,sort_u64_2",
                 Box::new(|a, b| {
                     cmp_1_asc(a, b)
                         .then(cmp_2_desc(a, b))
@@ -1557,11 +1679,11 @@ mod tests {
                 }),
             ),
             (
-                "sort1,-sort2",
+                "sort_u64_1,-sort_u64_2",
                 Box::new(|a, b| cmp_1_desc(a, b).then(cmp_2_asc(a, b).then(cmp_doc_id_desc(a, b)))),
             ),
             (
-                "-sort1,-sort2",
+                "-sort_u64_1,-sort_u64_2",
                 Box::new(|a, b| {
                     cmp_1_asc(a, b)
                         .then(cmp_2_asc(a, b))
@@ -1603,8 +1725,8 @@ mod tests {
                                 format!(
                                     "{} {:?} {:?}",
                                     hit.doc_id,
-                                    hit.sort_value.and_then(|el| el.sort_value).clone(),
-                                    hit.sort_value2.and_then(|el| el.sort_value).clone()
+                                    hit.sort_value.clone().and_then(|el| el.sort_value),
+                                    hit.sort_value2.clone().and_then(|el| el.sort_value)
                                 )
                             })
                             .collect::<Vec<_>>();
@@ -1618,8 +1740,22 @@ mod tests {
     }
 
     #[test]
-    fn test_search_after() {
-        let index = make_index();
+    fn test_search_after_single_type() {
+        let raw_dataset = sort_dataset();
+        let json_dataset: Vec<serde_json::Value> = raw_dataset
+            .iter()
+            .map(|(v1, v2)| {
+                let mut obj = serde_json::Map::new();
+                if let Some(v) = v1 {
+                    obj.insert("sort_u64_1".to_string(), (*v).into());
+                }
+                if let Some(v) = v2 {
+                    obj.insert("sort_u64_2".to_string(), (*v).into());
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        let index = make_index(&json_dataset);
 
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
@@ -1627,7 +1763,7 @@ mod tests {
         // tuple of DocId and sort value
         type Doc = (usize, (Option<u64>, Option<u64>));
 
-        let mut dataset: Vec<Doc> = sort_dataset().into_iter().enumerate().collect();
+        let mut dataset: Vec<Doc> = raw_dataset.into_iter().enumerate().collect();
 
         let reverse_int = |val: &Option<u64>| val.as_ref().map(|val| u64::MAX - val);
         let cmp_doc_id_desc = |a: &Doc, b: &Doc| b.0.cmp(&a.0);
@@ -1657,12 +1793,12 @@ mod tests {
                 max_hits: 1000,
                 sort_fields: vec![
                     SortField {
-                        field_name: "sort1".to_string(),
+                        field_name: "sort_u64_1".to_string(),
                         sort_order: SortOrder::Desc.into(),
                         sort_datetime_format: None,
                     },
                     SortField {
-                        field_name: "sort2".to_string(),
+                        field_name: "sort_u64_2".to_string(),
                         sort_order: SortOrder::Asc.into(),
                         sort_datetime_format: None,
                     },
@@ -1751,7 +1887,271 @@ mod tests {
         }
     }
 
-    fn merge_collector_equal_results(
+    #[test]
+    fn test_single_split_search_after_multitype() {
+        let dataset: Vec<serde_json::Value> = vec![
+            serde_json::json!({"kv": {"sort": false}}),    // doc 0
+            serde_json::json!({"kv": {"sort": true}}),     // doc 1
+            serde_json::json!({"kv": {"sort": "apple"}}),  // doc 2
+            serde_json::json!({"kv": {"sort": "banana"}}), // doc 3
+            serde_json::json!({"kv": {"sort": 1}}),        // doc 4
+            serde_json::json!({"kv": {"sort": 5}}),        // doc 5
+            serde_json::json!({}),                         // doc 6: missing
+        ];
+
+        let index = make_index(&dataset);
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        // Desc: booleans (true first) > strings (lex desc) > numbers (largest first) > missing
+        let desc_order: &[u32] = &[1, 0, 3, 2, 5, 4, 6];
+        // Asc:  numbers (smallest first) > strings (lex asc) > booleans (false first) > missing
+        let asc_order: &[u32] = &[4, 5, 2, 3, 0, 1, 6];
+
+        for (sort_str, expected_order) in [("kv.sort", desc_order), ("-kv.sort", asc_order)] {
+            // Step 1: full search to collect PartialHits carrying the correct typed SortValues.
+            let full_request = make_request(dataset.len() as u64, sort_str);
+            let collector = super::make_collector_for_split(
+                "fake_split_id".to_string(),
+                &full_request,
+                Default::default(),
+            )
+            .unwrap();
+            let full_res = searcher
+                .search(&tantivy::query::AllQuery, &collector)
+                .unwrap();
+            assert_eq!(full_res.partial_hits.len(), dataset.len());
+            for (expected_doc_id, got) in expected_order.iter().zip(full_res.partial_hits.iter()) {
+                assert_eq!(
+                    *expected_doc_id, got.doc_id,
+                    "sort order mismatch for \"{sort_str}\""
+                );
+            }
+
+            // Step 2: use each PartialHit as a search_after fence and verify the returned tail.
+            for (i, search_after) in full_res.partial_hits.iter().enumerate() {
+                let request = SearchRequest {
+                    max_hits: 1000,
+                    sort_fields: full_request.sort_fields.clone(),
+                    search_after: Some(search_after.clone()),
+                    ..SearchRequest::default()
+                };
+                let collector = super::make_collector_for_split(
+                    "fake_split_id".to_string(),
+                    &request,
+                    Default::default(),
+                )
+                .unwrap();
+                let res = searcher
+                    .search(&tantivy::query::AllQuery, &collector)
+                    .unwrap();
+                // num_hits counts every doc regardless of search_after.
+                assert_eq!(
+                    res.num_hits,
+                    dataset.len() as u64,
+                    "num_hits mismatch for \"{sort_str}\" search_after position {i}"
+                );
+                assert_eq!(
+                    res.partial_hits.len(),
+                    dataset.len() - i - 1,
+                    "result count mismatch for \"{sort_str}\" search_after position {i}"
+                );
+                for (expected_doc_id, got) in
+                    expected_order[i + 1..].iter().zip(res.partial_hits.iter())
+                {
+                    assert_eq!(
+                        *expected_doc_id, got.doc_id,
+                        "doc order mismatch for \"{sort_str}\" search_after position {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_single_split_search_after_exogeneous_type() {
+        let dataset: Vec<serde_json::Value> = vec![
+            serde_json::json!({"kv": {"sort": false}}),    // doc 0
+            serde_json::json!({"kv": {"sort": true}}),     // doc 1
+            serde_json::json!({"kv": {"sort": "apple"}}),  // doc 2
+            serde_json::json!({"kv": {"sort": "banana"}}), // doc 3
+        ];
+
+        let index = make_index(&dataset);
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        let search_after = SortValue::I64(-10);
+
+        // Desc: booleans (true first) > strings (lex desc) > numbers (search after) > missing
+        let desc_order: &[u32] = &[];
+        // Asc:  numbers (search after) > strings (lex asc) > booleans (false first) > missing
+        let asc_order: &[u32] = &[2, 3, 0, 1];
+
+        for (sort_str, expected_order) in [("kv.sort", desc_order), ("-kv.sort", asc_order)] {
+            // Step 1: full search to collect PartialHits carrying the correct typed SortValues.
+            let full_request = make_request(dataset.len() as u64, sort_str);
+
+            let request = SearchRequest {
+                max_hits: 1000,
+                sort_fields: full_request.sort_fields.clone(),
+                search_after: Some(PartialHit {
+                    sort_value: Some(search_after.clone().into()),
+                    sort_value2: None,
+                    ..Default::default()
+                }),
+                ..SearchRequest::default()
+            };
+            let collector = super::make_collector_for_split(
+                "fake_split_id".to_string(),
+                &request,
+                Default::default(),
+            )
+            .unwrap();
+
+            let res = searcher
+                .search(&tantivy::query::AllQuery, &collector)
+                .unwrap();
+            // num_hits counts every doc regardless of search_after.
+            assert_eq!(
+                res.num_hits,
+                dataset.len() as u64,
+                "num_hits mismatch for \"{sort_str}\""
+            );
+            assert_eq!(
+                res.partial_hits.len(),
+                expected_order.len(),
+                "result count mismatch for \"{sort_str}\""
+            );
+            for (expected_doc_id, got) in expected_order.iter().zip(res.partial_hits.iter()) {
+                assert_eq!(
+                    *expected_doc_id, got.doc_id,
+                    "doc order mismatch for \"{sort_str}\""
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_single_split_search_after_missing() {
+        let dataset: Vec<serde_json::Value> = vec![
+            serde_json::json!({"kv": {"sort": false}}),    // doc 0
+            serde_json::json!({"kv": {"sort": true}}),     // doc 1
+            serde_json::json!({"kv": {"sort": "apple"}}),  // doc 2
+            serde_json::json!({"kv": {"sort": "banana"}}), // doc 3
+            serde_json::json!({}),                         // doc 4: missing
+        ];
+
+        let index = make_index(&dataset);
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        for sort_str in ["kv.sort", "-kv.sort"] {
+            // Step 1: full search to collect PartialHits carrying the correct typed SortValues.
+            let full_request = make_request(dataset.len() as u64, sort_str);
+
+            let request = SearchRequest {
+                max_hits: 1000,
+                sort_fields: full_request.sort_fields.clone(),
+                search_after: Some(PartialHit {
+                    sort_value: Some(SortByValue { sort_value: None }),
+                    sort_value2: None,
+                    ..Default::default()
+                }),
+                ..SearchRequest::default()
+            };
+            let collector = super::make_collector_for_split(
+                "fake_split_id".to_string(),
+                &request,
+                Default::default(),
+            )
+            .unwrap();
+
+            let res = searcher
+                .search(&tantivy::query::AllQuery, &collector)
+                .unwrap();
+            // num_hits counts every doc regardless of search_after.
+            assert_eq!(
+                res.num_hits,
+                dataset.len() as u64,
+                "num_hits mismatch for \"{sort_str}\""
+            );
+            assert_eq!(
+                res.partial_hits.len(),
+                0,
+                "result count mismatch for \"{sort_str}\""
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_split_search_after_exogeneous_type_with_null() {
+        let dataset: Vec<serde_json::Value> = vec![
+            serde_json::json!({"kv": {"sort": false}}),    // doc 0
+            serde_json::json!({"kv": {"sort": true}}),     // doc 1
+            serde_json::json!({"kv": {"sort": "apple"}}),  // doc 2
+            serde_json::json!({"kv": {"sort": "banana"}}), // doc 3
+            serde_json::json!({}),                         // doc 4: missing
+        ];
+
+        let index = make_index(&dataset);
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        let search_after = SortValue::I64(-10);
+
+        // Desc: booleans (true first) > strings (lex desc) > numbers (search after) > missing
+        let desc_order: &[u32] = &[4];
+        // Asc:  numbers (search after) > strings (lex asc) > booleans (false first) > missing
+        let asc_order: &[u32] = &[2, 3, 0, 1, 4];
+
+        for (sort_str, expected_order) in [("kv.sort", desc_order), ("-kv.sort", asc_order)] {
+            // Step 1: full search to collect PartialHits carrying the correct typed SortValues.
+            let full_request = make_request(dataset.len() as u64, sort_str);
+
+            let request = SearchRequest {
+                max_hits: 1000,
+                sort_fields: full_request.sort_fields.clone(),
+                search_after: Some(PartialHit {
+                    sort_value: Some(search_after.clone().into()),
+                    sort_value2: None,
+                    ..Default::default()
+                }),
+                ..SearchRequest::default()
+            };
+            let collector = super::make_collector_for_split(
+                "fake_split_id".to_string(),
+                &request,
+                Default::default(),
+            )
+            .unwrap();
+
+            let res = searcher
+                .search(&tantivy::query::AllQuery, &collector)
+                .unwrap();
+            // num_hits counts every doc regardless of search_after.
+            assert_eq!(
+                res.num_hits,
+                dataset.len() as u64,
+                "num_hits mismatch for \"{sort_str}\""
+            );
+            assert_eq!(
+                res.partial_hits.len(),
+                expected_order.len(),
+                "result count mismatch for \"{sort_str}\""
+            );
+            for (expected_doc_id, got) in expected_order.iter().zip(res.partial_hits.iter()) {
+                assert_eq!(
+                    *expected_doc_id, got.doc_id,
+                    "doc order mismatch for \"{sort_str}\""
+                );
+            }
+        }
+    }
+
+    /// Merge intermediate results, asserting that both the regular and
+    /// incremental merge produce the same output.
+    fn merge_on_both_collectors(
         request: &SearchRequest,
         results: Vec<LeafSearchResponse>,
     ) -> LeafSearchResponse {
@@ -1773,7 +2173,7 @@ mod tests {
 
     #[test]
     fn test_merge_collectors() {
-        let result = merge_collector_equal_results(
+        let result = merge_on_both_collectors(
             &SearchRequest {
                 start_offset: 0,
                 max_hits: 2,
@@ -1821,7 +2221,7 @@ mod tests {
             }
         );
 
-        let result = merge_collector_equal_results(
+        let result = merge_on_both_collectors(
             &SearchRequest {
                 start_offset: 0,
                 max_hits: 2,
@@ -1913,7 +2313,7 @@ mod tests {
         );
 
         // same request, but we reverse sort order
-        let result = merge_collector_equal_results(
+        let result = merge_on_both_collectors(
             &SearchRequest {
                 start_offset: 0,
                 max_hits: 2,
@@ -2031,5 +2431,188 @@ mod tests {
                 .unwrap();
         let _merged: IntermediateAggregationResults = postcard::from_bytes(&serialized).unwrap();
         // Hopefully `_merged` is empty but the API does not allow us to assert that.
+    }
+
+    #[test]
+    fn test_internal_sort_value_repr_ordering_values() {
+        // Primary sort (Desc v1=10) dominates over secondary (Desc v2=100) and doc_id.
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            0,
+            SortOrder::Desc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(5, 0, SortOrder::Desc),
+            InternalValueRepr::new(100, 0, SortOrder::Desc),
+            999,
+            SortOrder::Desc,
+        );
+        assert!(lhs > rhs, "primary sort must dominate, desc");
+
+        // Same values but Asc, the order is reversed
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Asc),
+            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            0,
+            SortOrder::Desc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(5, 0, SortOrder::Asc),
+            InternalValueRepr::new(100, 0, SortOrder::Desc),
+            999,
+            SortOrder::Desc,
+        );
+        assert!(lhs < rhs, "primary sort must dominate, asc");
+
+        // Secondary sort (Desc v2) breaks a tie on the primary field.
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            0,
+            SortOrder::Desc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::new(5, 0, SortOrder::Desc),
+            0,
+            SortOrder::Desc,
+        );
+        assert!(lhs > rhs, "secondary sort must break primary tie, desc");
+
+        // Same values but Asc, the order is reversed.
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::new(10, 0, SortOrder::Asc),
+            0,
+            SortOrder::Desc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::new(5, 0, SortOrder::Asc),
+            0,
+            SortOrder::Desc,
+        );
+        assert!(lhs < rhs, "secondary sort must break primary tie, asc");
+
+        // Doc-id Desc tiebreaker: higher doc_id wins.
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::new_missing(),
+            10,
+            SortOrder::Desc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::new_missing(),
+            5,
+            SortOrder::Desc,
+        );
+        assert!(lhs > rhs, "Desc: higher doc_id must win tiebreaker");
+
+        // Doc-id Asc tiebreaker: lower doc_id wins.
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::new_missing(),
+            5,
+            SortOrder::Asc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::new_missing(),
+            10,
+            SortOrder::Asc,
+        );
+        assert!(lhs > rhs, "Asc: lower doc_id must win tiebreaker");
+
+        // Missing values are always smaller
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new_missing(),
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            10,
+            SortOrder::Desc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(5, 0, SortOrder::Desc),
+            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            0,
+            SortOrder::Desc,
+        );
+        assert!(lhs < rhs, "missing values are always smaller, desc");
+
+        // Same but Asc, missing is still smaller.
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new_missing(),
+            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            10,
+            SortOrder::Desc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(5, 0, SortOrder::Asc),
+            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            0,
+            SortOrder::Desc,
+        );
+        assert!(lhs < rhs, "missing values are always smaller, asc");
+    }
+
+    #[test]
+    fn test_internal_sort_value_repr_ordering_sentinels() {
+        // Doc-id sentinel ordering: skip_doc_ids < normal_doc_id < keep_doc_ids.
+        let s1 = InternalValueRepr::new(10, 0, SortOrder::Desc);
+        let s2 = InternalValueRepr::new_missing();
+        let skip_docs = InternalSortValueRepr::new_skip_doc_ids(s1, s2);
+        let keep_docs = InternalSortValueRepr::new_keep_doc_ids(s1, s2);
+        let normal_doc_desc = InternalSortValueRepr::new(s1, s2, 0, SortOrder::Desc);
+        let normal_doc_asc = InternalSortValueRepr::new(s1, s2, 0, SortOrder::Asc);
+        assert!(
+            skip_docs < normal_doc_desc,
+            "skip_doc_ids must be below normal"
+        );
+        assert!(
+            normal_doc_desc < keep_docs,
+            "normal must be below keep_doc_ids"
+        );
+        assert!(
+            skip_docs < normal_doc_asc,
+            "skip_doc_ids must be below normal"
+        );
+        assert!(
+            normal_doc_asc < keep_docs,
+            "normal must be below keep_doc_ids"
+        );
+    }
+
+    #[test]
+    fn test_internal_sort_value_repr_ordering_types() {
+        // Primary accessor ordering dominates all the rest
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(5, 1, SortOrder::Desc),
+            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            0,
+            SortOrder::Desc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(15, 0, SortOrder::Desc),
+            InternalValueRepr::new(100, 0, SortOrder::Desc),
+            999,
+            SortOrder::Desc,
+        );
+        assert!(lhs > rhs, "primary type sort must dominate, desc");
+
+        // Same values but Asc, the order is reversed
+        let lhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(5, 1, SortOrder::Asc),
+            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            0,
+            SortOrder::Desc,
+        );
+        let rhs = InternalSortValueRepr::new(
+            InternalValueRepr::new(15, 0, SortOrder::Asc),
+            InternalValueRepr::new(100, 0, SortOrder::Desc),
+            999,
+            SortOrder::Desc,
+        );
+        assert!(lhs < rhs, "primary type sort must dominate, asc");
     }
 }

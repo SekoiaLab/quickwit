@@ -442,12 +442,16 @@ fn validate_sort_by_fields_and_search_after(
     // TODO: we could validate if the search after sort value types of consistent with the sort
     // field types.
     if let Some(sort_by_value) = search_after_partial_hit.sort_value.as_ref() {
-        sort_by_value.sort_value.context("sort value must be set")?;
+        sort_by_value
+            .sort_value
+            .as_ref()
+            .context("sort value must be set")?;
         search_after_sort_value_count += 1;
     }
     if let Some(sort_by_value_2) = search_after_partial_hit.sort_value2.as_ref() {
         sort_by_value_2
             .sort_value
+            .as_ref()
             .context("sort value must be set")?;
         search_after_sort_value_count += 1;
     }
