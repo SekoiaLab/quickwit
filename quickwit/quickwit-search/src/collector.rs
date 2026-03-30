@@ -340,7 +340,7 @@ impl SortingFieldExtractorComponent {
                     SortFieldType::U64 => SortValue::U64(val_as_u64),
                     SortFieldType::I64 => SortValue::I64(i64::from_u64(val_as_u64)),
                     SortFieldType::F64 => SortValue::F64(f64::from_u64(val_as_u64)),
-                    SortFieldType::DateTime => SortValue::I64(i64::from_u64(val_as_u64)),
+                    SortFieldType::DateTime => SortValue::Datetime(i64::from_u64(val_as_u64)),
                     SortFieldType::Bool => SortValue::Boolean(val_as_u64 != 0u64),
                     SortFieldType::String(str_column) => {
                         let term_dict = str_column.dictionary();
@@ -631,7 +631,7 @@ impl SortingFieldExtractorPair {
             .second
             .as_ref()
             .map(|second| second.project_to_internal_sort_value(doc_id, score, self.second_order))
-            .unwrap_or_else(|| InternalValueRepr::new_missing());
+            .unwrap_or_else(InternalValueRepr::new_missing);
         InternalSortValueRepr::new(first, second, doc_id, self.doc_id_sort_order())
     }
 }
@@ -820,7 +820,7 @@ impl QuickwitIncrementalAggregations {
                     let timestamp = last_elem.span_timestamp.into_timestamp_nanos();
                     return Some(PartialHit {
                         sort_value: Some(SortByValue {
-                            sort_value: Some(SortValue::I64(timestamp)),
+                            sort_value: Some(SortValue::Datetime(timestamp)),
                         }),
                         sort_value2: None,
                         split_id: SplitId::new(),

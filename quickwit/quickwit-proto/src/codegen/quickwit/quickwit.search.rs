@@ -197,7 +197,7 @@ pub struct SortField {
     pub sort_order: i32,
     /// Optional sort value format for datetime field only.
     /// If none, the default output format for datetime field is
-    /// unix_timestamp_nanos.
+    /// unix_timestamp_millis.
     #[prost(enumeration = "SortDatetimeFormat", optional, tag = "3")]
     pub sort_datetime_format: ::core::option::Option<i32>,
 }

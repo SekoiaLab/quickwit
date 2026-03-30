@@ -187,11 +187,12 @@ It is also possible to not supply an order and rely on the default order using t
 }
 ```
 
-If no format is provided for timestamps, timestamps are returned with milliseconds precision.
-
-If you need nanosecond precision, you can use the `epoch_nanos_int` format. Beware this means the resulting
-JSON may contain high numbers for which there is loss of precision when using languages where all numbers are
-floats, such as JavaScript.
+Fields explicitely specified as `datetime` in the doc mapping also support an
+output format. If no format is provided, timestamps are returned with
+milliseconds precision. If you need nanosecond precision, you can use the
+`epoch_nanos_int` format. Beware this means the resulting JSON may contain high
+numbers for which there is loss of precision when using languages where all
+numbers are floats, such as JavaScript.
 
 ```json
 {

@@ -490,11 +490,6 @@ fn validate_sort_by_field_type(
     has_timestamp_format: bool,
 ) -> crate::Result<()> {
     let field_name = sort_by_field_entry.name();
-    if matches!(sort_by_field_entry.field_type(), FieldType::Str(_)) {
-        return Err(SearchError::InvalidArgument(format!(
-            "sort by field on type text is currently not supported `{field_name}`"
-        )));
-    }
     if !sort_by_field_entry.is_fast() {
         return Err(SearchError::InvalidArgument(format!(
             "sort by field must be a fast field, please add the fast property to your field \
@@ -957,7 +952,7 @@ fn build_hit_with_position(
     if let Some(sort_by_value) = sort_value_opt
         && let Some(output_datetime_format) = &sort_field_1_datetime_format_opt
     {
-        convert_sort_datetime_value(sort_by_value, *output_datetime_format)?;
+        convert_sort_datetime_value_from_nanos(sort_by_value, *output_datetime_format)?;
     }
     let sort_value_2_opt = partial_hit_ref
         .sort_value2
@@ -966,7 +961,7 @@ fn build_hit_with_position(
     if let Some(sort_by_value) = sort_value_2_opt
         && let Some(output_datetime_format) = &sort_field_2_datetime_format_opt
     {
-        convert_sort_datetime_value(sort_by_value, *output_datetime_format)?;
+        convert_sort_datetime_value_from_nanos(sort_by_value, *output_datetime_format)?;
     }
     let position = *hit_order.get(&key).expect("hit order must be present");
     let index_id = split_id_to_index_id_map
@@ -1493,79 +1488,57 @@ fn convert_search_after_datetime_values(
     Ok(())
 }
 
-/// Convert sort values from input datetime format into nanoseconds.
-/// The conversion is done only for U64 and I64 sort values, an error is returned for other types.
+/// Converts a numerical sort value from the given input datetime format into a `Datetime` sort
+/// value (nanoseconds, tantivy's internal datetime representation).
+/// Only `U64` and `I64` sort values are accepted; an error is returned for other types.
 fn convert_sort_datetime_value_into_nanos(
     sort_value: &mut SortValue,
     input_format: SortDatetimeFormat,
 ) -> crate::Result<()> {
-    match sort_value {
-        SortValue::U64(value) => match input_format {
-            SortDatetimeFormat::UnixTimestampMillis => {
-                *value = value.checked_mul(1_000_000).ok_or_else(|| {
-                    SearchError::Internal(format!(
-                        "sort value defined in milliseconds is too large and cannot be converted \
-                         into nanoseconds: {value}"
-                    ))
-                })?;
-            }
-            SortDatetimeFormat::UnixTimestampNanos => {
-                // Nothing to do as the internal format is nanos.
-            }
-        },
-        SortValue::I64(value) => match input_format {
-            SortDatetimeFormat::UnixTimestampMillis => {
-                *value = value.checked_mul(1_000_000).ok_or_else(|| {
-                    SearchError::Internal(format!(
-                        "sort value defined in milliseconds is too large and cannot be converted \
-                         into nanoseconds: {value}"
-                    ))
-                })?;
-            }
-            SortDatetimeFormat::UnixTimestampNanos => {
-                // Nothing to do as the internal format is nanos.
-            }
-        },
+    // Normalise to i64, even though in theory the sort value should be parsed as i64 anyway.
+    let raw: i64 = match sort_value {
+        SortValue::U64(value) => i64::try_from(*value).map_err(|_| {
+            SearchError::Internal(format!(
+                "sort value is too large to be represented as a datetime: {value}"
+            ))
+        })?,
+        SortValue::I64(value) => *value,
         _ => {
             return Err(SearchError::Internal(format!(
-                "datetime conversion are only support for u64 and i64 sort values, not \
+                "datetime conversion is only supported for u64 and i64 sort values, not \
                  `{sort_value:?}`"
             )));
         }
-    }
+    };
+    let nanos: i64 = match input_format {
+        SortDatetimeFormat::UnixTimestampMillis => raw.checked_mul(1_000_000).ok_or_else(|| {
+            SearchError::Internal(format!(
+                "sort value defined in milliseconds is too large to be a timestamp: {raw}"
+            ))
+        })?,
+        SortDatetimeFormat::UnixTimestampNanos => raw,
+    };
+    *sort_value = SortValue::Datetime(nanos);
     Ok(())
 }
 
-/// Convert sort values from nanoseconds to the requested output format.
-/// The conversion is done only for U64 and I64 sort values, an error is returned for other types.
-fn convert_sort_datetime_value(
+/// Converts a `Datetime` sort value (nanoseconds, tantivy's internal representation) into the
+/// requested output format, replacing the value in place.
+///
+/// Only the `Datetime` variant is accepted; an error is returned for other types.
+fn convert_sort_datetime_value_from_nanos(
     sort_value: &mut SortValue,
     output_format: SortDatetimeFormat,
 ) -> crate::Result<()> {
-    match sort_value {
-        SortValue::U64(value) => match output_format {
-            SortDatetimeFormat::UnixTimestampMillis => {
-                *value /= 1_000_000;
-            }
-            SortDatetimeFormat::UnixTimestampNanos => {
-                // Nothing todo as the internal format is in nanos.
-            }
-        },
-        SortValue::I64(value) => match output_format {
-            SortDatetimeFormat::UnixTimestampMillis => {
-                *value /= 1_000_000;
-            }
-            SortDatetimeFormat::UnixTimestampNanos => {
-                // Nothing todo as the internal format is in nanos.
-            }
-        },
-        _ => {
-            return Err(SearchError::Internal(format!(
-                "datetime conversion are only support for u64 and i64 sort values, not \
-                 `{sort_value:?}`"
-            )));
-        }
-    }
+    let SortValue::Datetime(nanos) = sort_value else {
+        return Err(SearchError::Internal(format!(
+            "datetime conversion is only supported for datetime sort values, not `{sort_value:?}`"
+        )));
+    };
+    *sort_value = match output_format {
+        SortDatetimeFormat::UnixTimestampMillis => SortValue::I64(*nanos / 1_000_000),
+        SortDatetimeFormat::UnixTimestampNanos => SortValue::I64(*nanos),
+    };
     Ok(())
 }
 
@@ -2184,25 +2157,63 @@ mod tests {
 
     #[test]
     fn test_convert_sort_datetime_value() {
-        let mut sort_value = SortValue::U64(1617000000000000000);
-        convert_sort_datetime_value(&mut sort_value, SortDatetimeFormat::UnixTimestampMillis)
-            .unwrap();
-        assert_eq!(sort_value, SortValue::U64(1617000000000));
-        let mut sort_value = SortValue::I64(1617000000000000000);
-        convert_sort_datetime_value(&mut sort_value, SortDatetimeFormat::UnixTimestampMillis)
-            .unwrap();
+        // millis output
+        let mut sort_value = SortValue::Datetime(1617000000000000000);
+        convert_sort_datetime_value_from_nanos(
+            &mut sort_value,
+            SortDatetimeFormat::UnixTimestampMillis,
+        )
+        .unwrap();
         assert_eq!(sort_value, SortValue::I64(1617000000000));
 
-        // conversion with float values should fail.
+        // nanos output
+        let mut sort_value = SortValue::Datetime(1617000000000000000);
+        convert_sort_datetime_value_from_nanos(
+            &mut sort_value,
+            SortDatetimeFormat::UnixTimestampNanos,
+        )
+        .unwrap();
+        assert_eq!(sort_value, SortValue::I64(1617000000000000000));
+
+        // non-datetime values should fail.
         let mut sort_value = SortValue::F64(1617000000000000000.0);
-        let error =
-            convert_sort_datetime_value(&mut sort_value, SortDatetimeFormat::UnixTimestampMillis)
-                .unwrap_err();
+        let error = convert_sort_datetime_value_from_nanos(
+            &mut sort_value,
+            SortDatetimeFormat::UnixTimestampMillis,
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "internal error: `datetime conversion are only support for u64 and i64 sort values, \
-             not `F64(1.617e18)``"
+            "internal error: `datetime conversion is only supported for datetime sort values, not \
+             `F64(1.617e18)``"
         );
+    }
+
+    #[test]
+    fn test_sort_datetime_value_roundtrip() {
+        use quickwit_proto::search::SortByValue;
+        let nanos: i64 = 1617000000000000000;
+
+        for format in [
+            SortDatetimeFormat::UnixTimestampMillis,
+            SortDatetimeFormat::UnixTimestampNanos,
+        ] {
+            let mut sort_value = SortValue::Datetime(nanos);
+            convert_sort_datetime_value_from_nanos(&mut sort_value, format).unwrap();
+
+            let json = SortByValue::from(sort_value).into_json();
+
+            let sort_by_value = SortByValue::try_from_json(json).unwrap();
+            let mut sort_value = sort_by_value.sort_value.unwrap();
+
+            convert_sort_datetime_value_into_nanos(&mut sort_value, format).unwrap();
+
+            assert_eq!(
+                sort_value,
+                SortValue::Datetime(nanos),
+                "roundtrip failed for format {format:?}"
+            );
+        }
     }
 
     #[test]
@@ -2213,39 +2224,29 @@ mod tests {
             SortDatetimeFormat::UnixTimestampMillis,
         )
         .unwrap();
-        assert_eq!(sort_value, SortValue::U64(1617000000000000000));
+        assert_eq!(sort_value, SortValue::Datetime(1617000000000000000));
         let mut sort_value = SortValue::I64(1617000000000);
         convert_sort_datetime_value_into_nanos(
             &mut sort_value,
             SortDatetimeFormat::UnixTimestampMillis,
         )
         .unwrap();
-        assert_eq!(sort_value, SortValue::I64(1617000000000000000));
+        assert_eq!(sort_value, SortValue::Datetime(1617000000000000000));
 
         // conversion with a too large millisecond value should fail.
         let mut sort_value = SortValue::I64(1617000000000000);
-        let error = convert_sort_datetime_value_into_nanos(
+        convert_sort_datetime_value_into_nanos(
             &mut sort_value,
             SortDatetimeFormat::UnixTimestampMillis,
         )
         .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "internal error: `sort value defined in milliseconds is too large and cannot be \
-             converted into nanoseconds: 1617000000000000`"
-        );
         // conversion with float values should fail.
         let mut sort_value = SortValue::F64(1617000000000000.0);
-        let error = convert_sort_datetime_value_into_nanos(
+        convert_sort_datetime_value_into_nanos(
             &mut sort_value,
             SortDatetimeFormat::UnixTimestampMillis,
         )
         .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "internal error: `datetime conversion are only support for u64 and i64 sort values, \
-             not `F64(1617000000000000.0)``"
-        );
     }
 
     #[test]
@@ -2416,7 +2417,7 @@ mod tests {
         let timestamp_field = schema_builder.add_date_field("timestamp", FAST);
         let id_field = schema_builder.add_u64_field("id", FAST);
         let no_fast_field = schema_builder.add_u64_field("no_fast", STORED);
-        let text_field = schema_builder.add_text_field("text", STORED);
+        let text_field = schema_builder.add_text_field("text", FAST);
         let schema = schema_builder.build();
         {
             let sort_by_field_entry = schema.get_field_entry(timestamp_field);
@@ -2444,11 +2445,7 @@ mod tests {
         }
         {
             let sort_by_field_entry = schema.get_field_entry(text_field);
-            let error = validate_sort_by_field_type(sort_by_field_entry, true).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "Invalid argument: sort by field on type text is currently not supported `text`"
-            );
+            validate_sort_by_field_type(sort_by_field_entry, false).unwrap();
         }
     }
 
@@ -2992,9 +2989,9 @@ mod tests {
             query_ast: qast_json_helper("test", &["body"]),
             max_hits: 10,
             sort_fields: vec![SortField {
-                field_name: "response_date".to_string(),
+                field_name: "response_time".to_string(),
                 sort_order: SortOrder::Asc.into(),
-                sort_datetime_format: Some(SortDatetimeFormat::UnixTimestampNanos as i32),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3174,9 +3171,9 @@ mod tests {
             query_ast: qast_json_helper("test", &["body"]),
             max_hits: 10,
             sort_fields: vec![SortField {
-                field_name: "response_date".to_string(),
+                field_name: "response_time".to_string(),
                 sort_order: SortOrder::Desc.into(),
-                sort_datetime_format: Some(SortDatetimeFormat::UnixTimestampNanos as i32),
+                ..Default::default()
             }],
             ..Default::default()
         };

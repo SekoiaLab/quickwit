@@ -264,7 +264,7 @@ message SortField {
   SortOrder sort_order = 2;
   // Optional sort value format for datetime field only.
   // If none, the default output format for datetime field is
-  // unix_timestamp_nanos.
+  // unix_timestamp_millis.
   optional SortDatetimeFormat sort_datetime_format = 3;
 }
 

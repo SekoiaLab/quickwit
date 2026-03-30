@@ -142,6 +142,7 @@ impl Ord for SortValue {
             (SortValue::Boolean(left), SortValue::Boolean(right)) => left.cmp(right),
             (SortValue::Str(left), SortValue::Str(right)) => left.cmp(right),
             (SortValue::F64(left), SortValue::F64(right)) => left.total_cmp(right),
+            (SortValue::Datetime(left), SortValue::Datetime(right)) => left.cmp(right),
             // Different numeric types but can still be compared.
             (SortValue::U64(left), SortValue::F64(right)) => {
                 num_cmp::cmp_u64_f64(*left, *right).expect("unexpected float comparison")

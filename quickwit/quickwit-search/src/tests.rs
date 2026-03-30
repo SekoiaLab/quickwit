@@ -22,8 +22,8 @@ use quickwit_doc_mapper::tag_pruning::extract_tags_from_query;
 use quickwit_indexing::TestSandbox;
 use quickwit_opentelemetry::otlp::TraceId;
 use quickwit_proto::search::{
-    LeafListTermsResponse, ListTermsRequest, SearchRequest, SortByValue, SortField, SortOrder,
-    SortValue,
+    LeafListTermsResponse, ListTermsRequest, PartialHit, SearchRequest, SortByValue,
+    SortDatetimeFormat, SortField, SortOrder, SortValue,
 };
 use quickwit_query::query_ast::{
     QueryAst, qast_helper, qast_json_helper, query_ast_from_user_text,
@@ -371,7 +371,8 @@ async fn test_single_node_filtering() -> anyhow::Result<()> {
         test_sandbox.metastore(),
         test_sandbox.storage_resolver(),
     )
-    .await?;
+    .await
+    .unwrap();
     assert_eq!(single_node_response.num_hits, 10);
     assert_eq!(single_node_response.hits.len(), 10);
     assert!(&single_node_response.hits[0].json.contains("t:19"));
@@ -395,7 +396,8 @@ async fn test_single_node_filtering() -> anyhow::Result<()> {
         test_sandbox.metastore(),
         test_sandbox.storage_resolver(),
     )
-    .await?;
+    .await
+    .unwrap();
     assert_eq!(single_node_response.num_hits, 19);
     assert_eq!(single_node_response.hits.len(), 19);
     assert!(&single_node_response.hits[0].json.contains("t:19"));
@@ -890,7 +892,7 @@ async fn test_sort_by_2_field() {
 }
 
 #[tokio::test]
-async fn test_single_node_invalid_sorting_with_query() {
+async fn test_sort_by_text() {
     let index_id = "single-node-invalid-sorting";
     let doc_mapping_yaml = r#"
             field_mappings:
@@ -906,7 +908,7 @@ async fn test_single_node_invalid_sorting_with_query() {
 
     let mut docs = Vec::new();
     for i in 0..30 {
-        let description = format!("city info-{}", i + 1);
+        let description = format!("city info-{:02}", i + 1);
         docs.push(json!({"description": description, "ts": i+1, "temperature": i+32}));
     }
     test_sandbox.add_documents(docs).await.unwrap();
@@ -927,13 +929,19 @@ async fn test_single_node_invalid_sorting_with_query() {
         test_sandbox.metastore(),
         test_sandbox.storage_resolver(),
     )
-    .await;
-    assert!(single_node_response.is_err());
-    let error_msg = single_node_response.unwrap_err().to_string();
-    assert_eq!(
-        error_msg,
-        "Invalid argument: sort by field on type text is currently not supported `description`"
-    );
+    .await
+    .unwrap();
+
+    assert_eq!(single_node_response.num_hits, 30);
+    assert_eq!(single_node_response.hits.len(), 15);
+    assert!(single_node_response.hits.windows(2).all(|hits| {
+        let hit0: JsonValue = serde_json::from_str(&hits[0].json).unwrap();
+        let hit1: JsonValue = serde_json::from_str(&hits[1].json).unwrap();
+        hit0["description"].as_str().unwrap() >= hit1["description"].as_str().unwrap()
+    }));
+    assert!(single_node_response.hits[0].json.contains("city info-30"));
+    assert!(single_node_response.hits[14].json.contains("city info-16"));
+
     test_sandbox.assert_quit().await;
 }
 
@@ -2157,6 +2165,112 @@ async fn test_single_node_soft_delete_count_only_term_query() -> anyhow::Result<
     .await?;
     assert_eq!(result.num_hits, 2);
     assert!(result.hits.is_empty());
+
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+/// Tests that when sorting by a datetime field with `sort_datetime_format` set to millis:
+/// 1. The sort values returned in `partial_hit` are in milliseconds (not nanoseconds).
+/// 2. Those values can be fed back as `search_after` to retrieve the next page correctly.
+#[tokio::test]
+async fn test_sort_by_datetime_format_millis_and_search_after() -> anyhow::Result<()> {
+    let index_id = "sort-datetime-millis-search-after";
+    let doc_mapping_yaml = r#"
+            field_mappings:
+              - name: ts
+                type: datetime
+                fast: true
+              - name: body
+                type: text
+            timestamp_field: ts
+        "#;
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"]).await?;
+
+    // Index 10 documents with timestamps 100_000_000_000 .. 100_000_009_000 ms since epoch.
+    let base_secs: i64 = 100_000_000;
+    let docs: Vec<_> = (0..10)
+        .map(|i| json!({"ts": base_secs + i, "body": format!("doc {i}")}))
+        .collect();
+    test_sandbox.add_documents(docs).await?;
+
+    let sort_field = SortField {
+        field_name: "ts".to_string(),
+        sort_order: SortOrder::Desc as i32,
+        sort_datetime_format: Some(SortDatetimeFormat::UnixTimestampMillis as i32),
+    };
+
+    // Page 1: top 5 hits sorted by ts desc with millis output
+    let page1 = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("*", &["body"]),
+            max_hits: 5,
+            sort_fields: vec![sort_field.clone()],
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+
+    assert_eq!(page1.num_hits, 10);
+    assert_eq!(page1.hits.len(), 5);
+
+    // Verify sort values are in milliseconds (not nanoseconds)
+    let expected_millis: Vec<i64> = (5..10).rev().map(|i| (base_secs + i) * 1_000).collect();
+    let actual_millis: Vec<i64> = page1
+        .hits
+        .iter()
+        .map(|hit| {
+            let partial_hit = hit.partial_hit.as_ref().unwrap();
+            match &partial_hit.sort_value.as_ref().unwrap().sort_value {
+                Some(SortValue::I64(ms)) => *ms,
+                other => panic!("expected I64 sort value in millis, got {other:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(actual_millis, expected_millis);
+
+    // Page 2: use the last hit's sort value as search_after
+    let last_hit = page1.hits.last().unwrap().partial_hit.as_ref().unwrap();
+    let search_after = PartialHit {
+        sort_value: last_hit.sort_value.clone(),
+        sort_value2: None,
+        split_id: String::new(),
+        segment_ord: 0,
+        doc_id: 0,
+    };
+
+    let page2 = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("*", &["body"]),
+            max_hits: 5,
+            sort_fields: vec![sort_field],
+            search_after: Some(search_after),
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+
+    assert_eq!(page2.hits.len(), 5);
+    // Page 2 should contain docs with timestamps base_secs+4 down to base_secs+0 in millis
+    let expected_millis_page2: Vec<i64> = (0..5).rev().map(|i| (base_secs + i) * 1_000).collect();
+    let actual_millis_page2: Vec<i64> = page2
+        .hits
+        .iter()
+        .map(|hit| {
+            let partial_hit = hit.partial_hit.as_ref().unwrap();
+            match &partial_hit.sort_value.as_ref().unwrap().sort_value {
+                Some(SortValue::I64(ms)) => *ms,
+                other => panic!("expected I64 sort value in millis, got {other:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(actual_millis_page2, expected_millis_page2);
 
     test_sandbox.assert_quit().await;
     Ok(())
