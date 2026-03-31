@@ -50,11 +50,19 @@ impl QuickwitSegmentTopKCollector {
     }
 
     pub(crate) fn collect_top_k_block(&mut self, docs: &[DocId]) {
-        // TODO: handle batch
-        for doc_id in docs {
-            self.collect_top_k(*doc_id, 0.0);
-        }
+        let search_after_opt = self.search_after_opt;
+        let top_k_hits = &mut self.top_k_hits;
+        self.hit_fetcher
+            .project_to_internal_sort_value_block(docs, |repr| {
+                if let Some(search_after) = search_after_opt
+                    && repr.cmp(&search_after) != Ordering::Less
+                {
+                    return;
+                }
+                top_k_hits.push(repr);
+            });
     }
+
     pub(crate) fn collect_top_k(&mut self, doc_id: DocId, score: Score) {
         let internal_repr = self
             .hit_fetcher
@@ -66,6 +74,7 @@ impl QuickwitSegmentTopKCollector {
         }
         self.top_k_hits.push(internal_repr);
     }
+
     pub(crate) fn get_top_k(&self) -> tantivy::Result<Vec<PartialHit>> {
         self.top_k_hits
             .clone()

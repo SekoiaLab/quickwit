@@ -35,7 +35,9 @@ use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::columnar::{ColumnType, MonotonicallyMappableToU64, StrColumn, TermOrdHit};
 use tantivy::fastfield::Column;
 use tantivy::tokenizer::TokenizerManager;
-use tantivy::{DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
+use tantivy::{
+    COLLECT_BLOCK_BUFFER_LEN, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError,
+};
 
 use crate::find_trace_ids_collector::{FindTraceIdsCollector, FindTraceIdsSegmentCollector, Span};
 use crate::sort_repr::{InternalSortValueRepr, InternalValueRepr};
@@ -100,7 +102,10 @@ impl SortByComponent {
 
                 // TODO we could skip the columns that are before the search after
 
-                Ok(SortingFieldExtractorComponent::FastField { sort_columns })
+                Ok(SortingFieldExtractorComponent::FastField(FFExtract {
+                    sort_columns,
+                    col_scratch: Box::new([None; COLLECT_BLOCK_BUFFER_LEN]),
+                }))
             }
             SortByComponent::Score { .. } => Ok(SortingFieldExtractorComponent::Score),
         }
@@ -170,21 +175,55 @@ impl SortFieldType {
     }
 }
 
+struct FFExtract {
+    /// Sort columns are sorted in the same order as types (TypeSortKey)
+    sort_columns: Vec<(Column<u64>, SortFieldType)>,
+    col_scratch: Box<[Option<u64>; COLLECT_BLOCK_BUFFER_LEN]>,
+}
+
+impl FFExtract {
+    fn fill_batch(&mut self, docs: &[DocId], order: SortOrder, out: &mut [InternalValueRepr]) {
+        let n = docs.len();
+        // TODO: zeroing only required for Multivalued as first_vals doesn't
+        // seem to do. It we might skip it
+        self.col_scratch[..n].fill(None);
+        self.sort_columns[0]
+            .0
+            .first_vals(docs, &mut self.col_scratch[..n]);
+        for (repr, val_opt) in out[..n].iter_mut().zip(self.col_scratch[..n].iter()) {
+            *repr = match val_opt {
+                Some(val) => InternalValueRepr::new(*val, 0, order),
+                None => InternalValueRepr::new_missing(),
+            };
+        }
+    }
+}
+
 /// The `SortingFieldExtractor` is used to extract a score, which can either be a true score,
 /// a value from a fast field, or nothing (sort by DocId).
-pub(crate) enum SortingFieldExtractorComponent {
+enum SortingFieldExtractorComponent {
     /// If undefined, we simply sort by DocIds.
     DocId,
-    FastField {
-        /// Sort columns are sorted in the same order as types (TypeSortKey)
-        sort_columns: Vec<(Column<u64>, SortFieldType)>,
-    },
+    FastField(FFExtract),
     Score,
 }
 
 impl SortingFieldExtractorComponent {
     pub fn is_doc_id(&self) -> bool {
         matches!(self, SortingFieldExtractorComponent::DocId)
+    }
+
+    /// Currently batch extraction only has a fast path for full columns. That
+    /// can only happen if there is only one column for the fast field.
+    fn extractor_for_batch_if_worthwhile(&mut self) -> Option<&mut FFExtract> {
+        match self {
+            SortingFieldExtractorComponent::FastField(extractor)
+                if extractor.sort_columns.len() == 1 =>
+            {
+                Some(extractor)
+            }
+            _ => None,
+        }
     }
 
     /// Returns the sort value for the given element in its u64 representation. The returned u64
@@ -204,7 +243,7 @@ impl SortingFieldExtractorComponent {
                 // Doc id is handled at the compound sort value level
                 InternalValueRepr::new_missing()
             }
-            SortingFieldExtractorComponent::FastField { sort_columns, .. } => {
+            SortingFieldExtractorComponent::FastField(FFExtract { sort_columns, .. }) => {
                 for (idx, (sort_column, _)) in sort_columns.iter().enumerate() {
                     if let Some(value) = sort_column.first(doc_id) {
                         return InternalValueRepr::new(value, idx as u8, order);
@@ -228,7 +267,7 @@ impl SortingFieldExtractorComponent {
         };
         let sort_value = match self {
             SortingFieldExtractorComponent::DocId => SortValue::U64(val_as_u64),
-            SortingFieldExtractorComponent::FastField { sort_columns, .. } => {
+            SortingFieldExtractorComponent::FastField(FFExtract { sort_columns, .. }) => {
                 let (_, field_type) = &sort_columns[col_idx as usize];
                 match field_type {
                     SortFieldType::U64 => SortValue::U64(val_as_u64),
@@ -274,9 +313,10 @@ impl SortingFieldExtractorComponent {
             (SortingFieldExtractorComponent::FastField { .. }, None) => {
                 Ok(InternalValueRepr::new_missing())
             }
-            (SortingFieldExtractorComponent::FastField { sort_columns, .. }, Some(sort_value)) => {
-                project_search_after_sort_value(sort_columns, sort_value, sort_order)
-            }
+            (
+                SortingFieldExtractorComponent::FastField(FFExtract { sort_columns, .. }),
+                Some(sort_value),
+            ) => project_search_after_sort_value(sort_columns, sort_value, sort_order),
             (SortingFieldExtractorComponent::Score, Some(SortValue::F64(val))) => {
                 Ok(InternalValueRepr::new(val.to_u64(), 0, sort_order))
             }
@@ -431,10 +471,12 @@ fn project_search_after_sort_value(
 }
 
 pub(crate) struct SortingFieldExtractorPair {
-    pub first: SortingFieldExtractorComponent,
-    pub second: Option<SortingFieldExtractorComponent>,
-    pub first_order: SortOrder,
-    pub second_order: SortOrder,
+    first: SortingFieldExtractorComponent,
+    second: Option<SortingFieldExtractorComponent>,
+    first_order: SortOrder,
+    second_order: SortOrder,
+    sort1_scratch: Box<[InternalValueRepr; COLLECT_BLOCK_BUFFER_LEN]>,
+    sort2_scratch: Box<[InternalValueRepr; COLLECT_BLOCK_BUFFER_LEN]>,
 }
 
 impl SortingFieldExtractorPair {
@@ -550,6 +592,90 @@ impl SortingFieldExtractorPair {
             .unwrap_or_else(InternalValueRepr::new_missing);
         InternalSortValueRepr::new(first, second, doc_id, self.doc_id_sort_order())
     }
+
+    pub(crate) fn project_to_internal_sort_value_block(
+        &mut self,
+        docs: &[DocId],
+        mut f: impl FnMut(InternalSortValueRepr),
+    ) {
+        let doc_id_order = self.doc_id_sort_order();
+        let first_order = self.first_order;
+        let second_order = self.second_order;
+
+        let n = docs.len();
+
+        let SortingFieldExtractorPair {
+            first,
+            second,
+            sort1_scratch,
+            sort2_scratch,
+            ..
+        } = self;
+
+        let first_extractor_opt = first.extractor_for_batch_if_worthwhile();
+        let second_extractor_opt = second
+            .as_mut()
+            .and_then(|s| s.extractor_for_batch_if_worthwhile());
+        match (first_extractor_opt, second_extractor_opt) {
+            (Some(fst_batch_extr), Some(sec_batch_extr)) => {
+                fst_batch_extr.fill_batch(docs, first_order, &mut sort1_scratch[..n]);
+                sec_batch_extr.fill_batch(docs, second_order, &mut sort2_scratch[..n]);
+                for i in 0..n {
+                    f(InternalSortValueRepr::new(
+                        sort1_scratch[i],
+                        sort2_scratch[i],
+                        docs[i],
+                        doc_id_order,
+                    ));
+                }
+            }
+            (Some(fst_batch_extr), None) => {
+                for i in 0..n {
+                    fst_batch_extr.fill_batch(docs, first_order, &mut sort1_scratch[..n]);
+                    let sort2 = second
+                        .as_ref()
+                        .map(|s| s.project_to_internal_sort_value(docs[i], 0.0, second_order))
+                        .unwrap_or_else(InternalValueRepr::new_missing);
+                    f(InternalSortValueRepr::new(
+                        sort1_scratch[i],
+                        sort2,
+                        docs[i],
+                        doc_id_order,
+                    ));
+                }
+            }
+            (None, Some(sec_batch_extr)) => {
+                sec_batch_extr.fill_batch(docs, second_order, &mut sort2_scratch[..n]);
+                for i in 0..n {
+                    let sort1 = first.project_to_internal_sort_value(docs[i], 0.0, first_order);
+                    f(InternalSortValueRepr::new(
+                        sort1,
+                        sort2_scratch[i],
+                        docs[i],
+                        doc_id_order,
+                    ));
+                }
+            }
+            (None, None) => {
+                for &doc_id in docs {
+                    let first = self
+                        .first
+                        .project_to_internal_sort_value(doc_id, 0.0, first_order);
+                    let second = self
+                        .second
+                        .as_ref()
+                        .map(|s| s.project_to_internal_sort_value(doc_id, 0.0, second_order))
+                        .unwrap_or_else(InternalValueRepr::new_missing);
+                    f(InternalSortValueRepr::new(
+                        first,
+                        second,
+                        doc_id,
+                        doc_id_order,
+                    ));
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -587,6 +713,8 @@ fn get_sorting_field_extractors(
             .map(|second| second.sort_order())
             // value irrelevant?
             .unwrap_or(SortOrder::Desc),
+        sort1_scratch: Box::new([InternalValueRepr::new_missing(); COLLECT_BLOCK_BUFFER_LEN]),
+        sort2_scratch: Box::new([InternalValueRepr::new_missing(); COLLECT_BLOCK_BUFFER_LEN]),
     })
 }
 
