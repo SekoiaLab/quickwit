@@ -18,7 +18,8 @@ use quickwit_proto::search::PartialHit;
 use quickwit_proto::types::SplitId;
 use tantivy::{DocId, Score, SegmentOrdinal};
 
-use crate::collector::{InternalSortValueRepr, SortingFieldExtractorPair};
+use crate::collector::SortingFieldExtractorPair;
+use crate::sort_repr::InternalSortValueRepr;
 use crate::top_k_computer::TopKComputer;
 
 pub struct QuickwitSegmentTopKCollector {

@@ -36,6 +36,7 @@ mod search_job_placer;
 mod search_response_rest;
 mod service;
 mod soft_delete_query;
+mod sort_repr;
 pub(crate) mod top_k_collector;
 mod top_k_computer;
 
