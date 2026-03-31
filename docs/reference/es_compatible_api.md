@@ -238,6 +238,34 @@ You can pass the `sort` value of the last hit in a subsequent request where othe
 
 This allows you to paginate your results.
 
+
+#### Note regarding multi-type pagination
+
+The JSON representation used for the sort values provides the following primitive types:
+- numerical
+- bool
+- string
+
+Tantivy uses the following types:
+- i64 / u64 / f64 (only one of these can be present in a split)
+- datetime
+- string
+- bool
+- ip (not supported in sort yet)
+- bytes (not supported in sort yet)
+
+The problem is that with dynamic types, multiple of column types can be present for a given field within a single split. Moreover, with doc mapping updates, any combination can be present accross split.
+
+Elasticsearch can represent date field sort values in various formats. In Quickwit, only integer formats are supported (millisecond or nanosecond). Either way, the fact that datetime can live along with another type inside a split yields un-reliable pagination:
+- Because there isn't a simple and efficient common representation in the fast field u64 space, it's hard to represent datetime within the numerical (i64/u64/f64) order.
+- To paginate separately accross numerical and datetime types a strongly typed represention of the json sort key would be necessary.
+
+The current implementation does the following:
+- If the mapping is explicitely set to datetime and was always set as such, pagination works as expected.
+- If the mapping evolved to datetime, the paginations fails for splits that contain numerical values (i64, u64, f64 columns).
+- If the mapping is a json/dynamic field, the pagination fails for splits that contains a datetime columns.
+
+
 ### `_msearch` &nbsp; Multi search API
 
 ```

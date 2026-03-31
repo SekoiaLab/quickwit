@@ -495,9 +495,31 @@ fn project_search_after_sort_value(
                     }
                 }
             }
+            // unsupported mixed types
+            //
+            // TODO: we need a strongly typed pagination API to support JSON
+            // fields with datetime and schema evolutions
+            (
+                SortFieldType::I64 | SortFieldType::U64 | SortFieldType::F64,
+                SortValue::Datetime(_),
+            ) => {
+                return Err(TantivyError::SchemaError(
+                    "search after not supported for schema updates to datetime".to_string(),
+                ));
+            }
+            (
+                SortFieldType::DateTime,
+                SortValue::I64(_) | SortValue::U64(_) | SortValue::F64(_),
+            ) => {
+                return Err(TantivyError::SchemaError(
+                    "search after not supported on multi-typed fields with datetime".to_string(),
+                ));
+            }
+            // supported mixed types
             (sort_field_type, sort_value) => {
                 let column_key = sort_field_type.type_sort_key();
                 let value_key = sort_value.type_sort_key();
+                debug_assert_ne!(column_key, value_key);
                 let column_comes_after = match sort_order {
                     SortOrder::Desc => column_key < value_key,
                     SortOrder::Asc => column_key > value_key,

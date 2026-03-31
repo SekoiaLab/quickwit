@@ -161,12 +161,18 @@ pub struct IndexMetasForLeafSearch {
 
 pub(crate) type IndexesMetasForLeafSearch = HashMap<IndexUid, IndexMetasForLeafSearch>;
 
+/// Maps to `true` if the field mapping of all indexes is `datetime` for the
+/// given sort field. Contains an entry for every sort field. Does not ensure
+/// that the field is indeed a datetime in all splits (doc mapping might
+/// have been updated).
+type SortFieldsIsDatetime = HashMap<String, bool>;
+
 #[derive(Debug)]
 struct RequestMetadata {
     timestamp_field_opt: Option<String>,
     query_ast_resolved: QueryAst,
     indexes_meta_for_leaf_search: IndexesMetasForLeafSearch,
-    sort_fields_is_datetime: HashMap<String, bool>,
+    sort_fields_is_datetime: SortFieldsIsDatetime,
 }
 
 /// Validates request against each index's doc mapper and ensures that:
@@ -189,11 +195,10 @@ fn validate_request_and_build_metadata(
     )?;
     let query_ast: QueryAst = serde_json::from_str(&search_request.query_ast)
         .map_err(|err| SearchError::InvalidQuery(err.to_string()))?;
-    let mut indexes_meta_for_leaf_search: HashMap<IndexUid, IndexMetasForLeafSearch> =
-        HashMap::new();
+    let mut indexes_meta_for_leaf_search: IndexesMetasForLeafSearch = HashMap::new();
     let mut query_ast_resolved_opt: Option<QueryAst> = None;
     let mut timestamp_field_opt: Option<String> = None;
-    let mut sort_fields_is_datetime: HashMap<String, bool> = HashMap::new();
+    let mut sort_fields_is_datetime: SortFieldsIsDatetime = HashMap::new();
 
     for index_metadata in indexes_metadata {
         let doc_mapper = build_doc_mapper(
@@ -315,7 +320,7 @@ fn validate_secondary_time(index_metadata: &[IndexMetadata]) -> crate::Result<Op
 fn validate_sort_field_types(
     schema: &Schema,
     sort_fields: &[SortField],
-    sort_field_is_datetime: &mut HashMap<String, bool>,
+    sort_field_is_datetime: &mut SortFieldsIsDatetime,
 ) -> crate::Result<()> {
     for sort_field in sort_fields.iter() {
         if let Some(sort_field_entry) = get_sort_by_field_entry(&sort_field.field_name, schema)? {
@@ -1146,7 +1151,7 @@ async fn refine_and_list_matches(
     search_request: &mut SearchRequest,
     indexes_metadata: Vec<IndexMetadata>,
     query_ast_resolved: QueryAst,
-    sort_fields_is_datetime: HashMap<String, bool>,
+    sort_fields_is_datetime: SortFieldsIsDatetime,
     timestamp_field_opt: Option<String>,
     secondary_timestamp_field_opt: Option<String>,
 ) -> crate::Result<Vec<SplitMetadata>> {
@@ -1448,10 +1453,9 @@ pub async fn search_plan(
 /// Converts search after with datetime format to nanoseconds (representation in tantivy).
 /// If the sort field is a datetime field and no datetime format is set, the default format is
 /// milliseconds.
-/// `sort_fields_are_datetime_opt` must be of the same length as `search_request.sort_fields`.
 fn convert_search_after_datetime_values(
     search_request: &mut SearchRequest,
-    sort_fields_is_datetime: &HashMap<String, bool>,
+    sort_fields_is_datetime: &SortFieldsIsDatetime,
 ) -> crate::Result<()> {
     for sort_field in search_request.sort_fields.iter_mut() {
         if *sort_fields_is_datetime
