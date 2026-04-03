@@ -32,7 +32,9 @@ use tantivy::aggregation::agg_req::{Aggregations, get_fast_field_names};
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::aggregation::{AggContextParams, AggregationLimitsGuard, AggregationSegmentCollector};
 use tantivy::collector::{Collector, SegmentCollector};
-use tantivy::columnar::{ColumnType, MonotonicallyMappableToU64, StrColumn, TermOrdHit};
+use tantivy::columnar::{
+    ColumnIndex, ColumnType, MonotonicallyMappableToU64, StrColumn, TermOrdHit,
+};
 use tantivy::fastfield::Column;
 use tantivy::tokenizer::TokenizerManager;
 use tantivy::{
@@ -189,9 +191,12 @@ impl FFExtract {
         out: &mut [InternalValueRepr<V>],
     ) {
         let n = docs.len();
-        // TODO: zeroing only required for Multivalued as first_vals doesn't
-        // seem to do. It we might skip it
-        self.col_scratch[..n].fill(None);
+        let unique_column = &self.sort_columns[0].0;
+        if let ColumnIndex::Multivalued(_) = unique_column.index {
+            // TODO: first_vals() doesn't enforce zeroing for multivalued
+            // columns. It seems like something that should be fixed in Tantivy?
+            self.col_scratch[..n].fill(None);
+        }
         self.sort_columns[0]
             .0
             .first_vals(docs, &mut self.col_scratch[..n]);

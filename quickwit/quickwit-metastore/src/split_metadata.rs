@@ -121,7 +121,7 @@ pub struct SplitMetadata {
     /// Contains the range of bytes of the footer that needs to be downloaded
     /// in order to open a split.
     ///
-    /// The footer offsexts
+    /// The footer offsets
     /// make it possible to download the footer in a single call to `.get_slice(...)`.
     pub footer_offsets: Range<u64>,
 

@@ -108,15 +108,4 @@ where D: Ord + Copy + Debug
         self.buffer.sort_unstable();
         self.buffer.into_iter().map(|el| el.0).collect()
     }
-
-    /// Returns the top n elements in stored order.
-    /// Useful if you do not need the elements in sorted order,
-    /// for example when merging the results of multiple segments.
-    #[allow(dead_code)]
-    pub fn into_vec(mut self) -> Vec<D> {
-        if self.buffer.len() > self.top_n {
-            self.truncate_top_n();
-        }
-        self.buffer.into_iter().map(|el| el.0).collect()
-    }
 }

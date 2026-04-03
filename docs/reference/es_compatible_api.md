@@ -187,10 +187,10 @@ It is also possible to not supply an order and rely on the default order using t
 }
 ```
 
-Fields explicitely specified as `datetime` in the doc mapping also support an
+Fields explicitly specified as `datetime` in the doc mapping also support an
 output format. If no format is provided, timestamps are returned with
 milliseconds precision. If you need nanosecond precision, you can use the
-`epoch_nanos_int` format. Beware this means the resulting JSON may contain high
+`epoch_nanos_int` format. Beware, this means the resulting JSON may contain high
 numbers for which there is loss of precision when using languages where all
 numbers are floats, such as JavaScript.
 
@@ -241,6 +241,10 @@ This allows you to paginate your results.
 
 #### Note regarding multi-type pagination
 
+Pagination can get tricky on fields that have multiple types. In dynamic fields, multiple column types can be present for a given field within a single split. When using doc mapping updates, any type combination can be present across split.
+
+First, let's take a look at the various type systems we are working with.
+
 The JSON representation used for the sort values provides the following primitive types:
 - numerical
 - bool
@@ -254,16 +258,17 @@ Tantivy uses the following types:
 - ip (not supported in sort yet)
 - bytes (not supported in sort yet)
 
-The problem is that with dynamic types, multiple of column types can be present for a given field within a single split. Moreover, with doc mapping updates, any combination can be present accross split.
-
 Elasticsearch can represent date field sort values in various formats. In Quickwit, only integer formats are supported (millisecond or nanosecond). Either way, the fact that datetime can live along with another type inside a split yields un-reliable pagination:
 - Because there isn't a simple and efficient common representation in the fast field u64 space, it's hard to represent datetime within the numerical (i64/u64/f64) order.
-- To paginate separately accross numerical and datetime types a strongly typed represention of the json sort key would be necessary.
+- To paginate separately across numerical and datetime types a strongly typed representation of the json sort key would be necessary.
 
 The current implementation does the following:
-- If the mapping is explicitely set to datetime and was always set as such, pagination works as expected.
-- If the mapping evolved to datetime, the paginations fails for splits that contain numerical values (i64, u64, f64 columns).
-- If the mapping is a json/dynamic field, the pagination fails for splits that contains a datetime columns.
+- If the mapping is explicitly set to datetime and never changed, pagination works as expected.
+- If the mapping evolved to datetime, paginations fails for splits that contain numerical values (i64, u64, f64 columns).
+- If the mapping is a json/dynamic field, pagination fails for splits that contain a datetime columns. This can happen because on JSON field Tantivy automatically stores RFC3337 date strings in a datetime column.
+- If other types are mixed, the sort will iterate over all values type by type
+  - Asc: numeric -> string -> boolean -> datetime -> null
+  - Desc: datetime -> boolean -> string -> numeric -> null
 
 
 ### `_msearch` &nbsp; Multi search API

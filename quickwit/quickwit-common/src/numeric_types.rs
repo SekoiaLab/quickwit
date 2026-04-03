@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! This module is compied over from tantivy
+//! This module is copied over from Tantivy
 
-/// This modules helps comparing numerical values of different types (i64, u64
+/// This module helps compare numerical values of different types (i64, u64
 /// and f64).
 pub mod num_cmp {
     use std::cmp::Ordering;

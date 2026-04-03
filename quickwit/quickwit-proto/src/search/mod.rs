@@ -17,7 +17,8 @@ use std::fmt;
 use std::io::{self, Read};
 
 use prost::Message;
-use quickwit_common::numeric_types::num_cmp;
+use quickwit_common::numeric_types::num_proj::ProjectedNumber;
+use quickwit_common::numeric_types::{num_cmp, num_proj};
 pub use sort_by_value::SortValue;
 
 include!("../codegen/quickwit/quickwit.search.rs");
@@ -107,18 +108,7 @@ impl SortByValue {
                     return None;
                 }
             }
-            // Strings that can be converted to a number are accepted.
-            // Some clients (like JS clients) can't easily handle large integers
-            // without losing precision, so we accept them as strings.
-            String(value) => {
-                if let Ok(number) = value.parse::<i64>() {
-                    Some(SortValue::I64(number))
-                } else if let Ok(number) = value.parse::<u64>() {
-                    Some(SortValue::U64(number))
-                } else {
-                    Some(SortValue::Str(value))
-                }
-            }
+            String(value) => Some(SortValue::Str(value)),
             Array(_) | Object(_) => return None,
         };
         Some(SortByValue { sort_value })
@@ -208,25 +198,21 @@ impl SortValue {
             SortValue::I64(_) => self.clone(),
             SortValue::Boolean(_) => self.clone(),
             SortValue::Str(_) => self.clone(),
-            SortValue::U64(number) => {
-                if let Ok(number) = (*number).try_into() {
-                    SortValue::I64(number)
-                } else {
-                    self.clone()
-                }
-            }
-            SortValue::F64(number) => {
-                let number = *number;
-                if number.ceil() == number {
-                    // number is not NaN, and is a natural number
-                    if number >= i64::MIN as f64 && number <= i64::MAX as f64 {
-                        return SortValue::I64(number as i64);
-                    } else if number.is_sign_positive() && number <= u64::MAX as f64 {
-                        return SortValue::U64(number as u64);
+            SortValue::U64(number) => match num_proj::u64_to_i64(*number) {
+                ProjectedNumber::Exact(number) => SortValue::I64(number),
+                _ => self.clone(),
+            },
+            SortValue::F64(float) => match num_proj::f64_to_i64(*float) {
+                ProjectedNumber::Exact(number) => SortValue::I64(number),
+                ProjectedNumber::AfterLast => {
+                    if let ProjectedNumber::Exact(number) = num_proj::f64_to_u64(*float) {
+                        SortValue::U64(number)
+                    } else {
+                        self.clone()
                     }
                 }
-                self.clone()
-            }
+                _ => self.clone(),
+            },
             SortValue::Datetime(_) => self.clone(),
         }
     }
@@ -254,6 +240,10 @@ impl PartialHit {
     }
 }
 
+/// Defines the order between types when sorting on a field with multiple types.
+/// Expected order:
+/// - Asc: numeric -> string -> boolean -> datetime
+/// - Desc: datetime -> boolean -> string -> numeric
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TypeSortKey {
     Numeric,
