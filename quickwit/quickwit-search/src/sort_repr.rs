@@ -12,10 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Debug;
+
 use quickwit_proto::search::SortOrder;
 use tantivy::DocId;
 
 use crate::top_k_computer::MinValue;
+
+/// A u64 that can be elided to unit type to save memory.
+pub(crate) trait ElidableU64: Ord + Copy + Debug + MinValue {
+    fn value(self) -> u64;
+    fn from_u64(value: u64) -> Self;
+}
+
+impl MinValue for u64 {
+    fn min_value() -> Self {
+        0
+    }
+}
+
+impl MinValue for () {
+    fn min_value() -> Self {}
+}
+
+impl ElidableU64 for u64 {
+    fn from_u64(value: u64) -> Self {
+        value
+    }
+    fn value(self) -> u64 {
+        self
+    }
+}
+
+impl ElidableU64 for () {
+    fn from_u64(_value: u64) -> Self {}
+    fn value(self) -> u64 {
+        0
+    }
+}
 
 /// Encoded representation of the value, the index of its accessor in the list
 /// of fast field columns and the sort order.
@@ -34,43 +68,43 @@ use crate::top_k_computer::MinValue;
 /// reverse the sort order when building an ascending sort (keeping in mind that
 /// this is fed to a top-k calculator).
 #[derive(Clone, Copy)]
-pub(crate) struct InternalValueRepr(u8, u64);
+pub(crate) struct InternalValueRepr<V: ElidableU64>(u8, V);
 
-impl InternalValueRepr {
+impl<V: ElidableU64> InternalValueRepr<V> {
     #[inline]
     pub fn new(value: u64, accessor_idx: u8, order: SortOrder) -> Self {
         // For Asc, smaller values should win: invert so smaller maps to larger repr
         match order {
-            SortOrder::Asc => Self(!(accessor_idx * 2 + 3), !value),
-            SortOrder::Desc => Self(accessor_idx * 2 + 3, value),
+            SortOrder::Asc => Self(!(accessor_idx * 2 + 3), V::from_u64(!value)),
+            SortOrder::Desc => Self(accessor_idx * 2 + 3, V::from_u64(value)),
         }
     }
     /// A sentinel value that can be instantiated as search after boundary to indicate
     /// that all documents should be kept.
     pub fn new_keep_column(accessor_idx: u8, order: SortOrder) -> Self {
         match order {
-            SortOrder::Asc => Self(!(accessor_idx * 2 + 2), 0),
-            SortOrder::Desc => Self(accessor_idx * 2 + 4, 0),
+            SortOrder::Asc => Self(!(accessor_idx * 2 + 2), V::from_u64(0)),
+            SortOrder::Desc => Self(accessor_idx * 2 + 4, V::from_u64(0)),
         }
     }
     #[inline]
     pub fn new_missing() -> Self {
         // Missing always last in topk, so use the smallest possible value
         // (besides the skip_all value)
-        Self(1, 0)
+        Self(1, V::from_u64(0))
     }
     /// A sentinel value that can be instantiated as search after boundary to indicate
     /// that all documents should be skipped for the given column.
     pub fn new_skip_column(accessor_idx: u8, order: SortOrder) -> Self {
         match order {
-            SortOrder::Asc => Self(!(accessor_idx * 2 + 4), 0),
-            SortOrder::Desc => Self(accessor_idx * 2 + 2, 0),
+            SortOrder::Asc => Self(!(accessor_idx * 2 + 4), V::from_u64(0)),
+            SortOrder::Desc => Self(accessor_idx * 2 + 2, V::from_u64(0)),
         }
     }
     /// A sentinel value that can be instantiated as search after boundary to indicate
     /// that all documents should be skipped.
     pub fn new_skip_all_but_missing() -> Self {
-        Self(2, 0)
+        Self(2, V::from_u64(0))
     }
     #[inline]
     pub fn decode(self, order: SortOrder) -> Option<(u8, u64)> {
@@ -86,25 +120,29 @@ impl InternalValueRepr {
             "sentinel indexes are not meant to be decoded"
         );
         match order {
-            SortOrder::Asc => Some(((!self.0 - 3) / 2, !self.1)),
-            SortOrder::Desc => Some(((self.0 - 3) / 2, self.1)),
+            SortOrder::Asc => Some(((!self.0 - 3) / 2, !V::value(self.1))),
+            SortOrder::Desc => Some(((self.0 - 3) / 2, V::value(self.1))),
         }
     }
 }
 
-/// This is the ordered representation of the sort values. It is the
-/// concatenation of:
+/// Ordered representation of the sort values. It is the concatenation of:
 /// - the first two (u8, u64) pairs contain the internal representation of the sort values
 /// - the second sort value's internal representation
 /// - the doc id, preceeded by a sentinel indicating how it should be used for tie-breaking
+///
+/// ElidableU64 is used instead of u64 for sort values to reduce the size of the
+/// representation when they are not used. The associated sentinels could also
+/// be elided, but in practice they don't have an impact on the tuple's size
+/// because the doc id and its sentinel (u8, u32) gets padded anyway.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
-pub(crate) struct InternalSortValueRepr(u8, u64, u8, u64, u8, u32);
+pub(crate) struct InternalSortValueRepr<V1: ElidableU64, V2: ElidableU64>(u8, V1, u8, V2, u8, u32);
 
-impl InternalSortValueRepr {
+impl<V1: ElidableU64, V2: ElidableU64> InternalSortValueRepr<V1, V2> {
     #[inline]
     pub fn new(
-        sort_1: InternalValueRepr,
-        sort_2: InternalValueRepr,
+        sort_1: InternalValueRepr<V1>,
+        sort_2: InternalValueRepr<V2>,
         doc_id: DocId,
         doc_id_sort: SortOrder,
     ) -> Self {
@@ -114,18 +152,18 @@ impl InternalSortValueRepr {
             SortOrder::Desc => Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 1, doc_id),
         }
     }
-    pub fn new_keep_doc_ids(sort_1: InternalValueRepr, sort_2: InternalValueRepr) -> Self {
+    pub fn new_keep_doc_ids(sort_1: InternalValueRepr<V1>, sort_2: InternalValueRepr<V2>) -> Self {
         Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 2, 0)
     }
-    pub fn new_skip_doc_ids(sort_1: InternalValueRepr, sort_2: InternalValueRepr) -> Self {
+    pub fn new_skip_doc_ids(sort_1: InternalValueRepr<V1>, sort_2: InternalValueRepr<V2>) -> Self {
         Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 0, 0)
     }
     #[inline]
-    pub fn sort_1(self) -> InternalValueRepr {
+    pub fn sort_1(self) -> InternalValueRepr<V1> {
         InternalValueRepr(self.0, self.1)
     }
     #[inline]
-    pub fn sort_2(self) -> InternalValueRepr {
+    pub fn sort_2(self) -> InternalValueRepr<V2> {
         InternalValueRepr(self.2, self.3)
     }
     #[inline]
@@ -136,11 +174,14 @@ impl InternalSortValueRepr {
             SortOrder::Desc => self.5,
         }
     }
+    pub fn is_skip_all(&self) -> bool {
+        *self <= Self(1, V1::min_value(), 1, V2::min_value(), 1, 0)
+    }
 }
 
-impl MinValue for InternalSortValueRepr {
+impl<V1: ElidableU64, V2: ElidableU64> MinValue for InternalSortValueRepr<V1, V2> {
     fn min_value() -> Self {
-        Self(0, 0, 0, 0, 0, 0)
+        Self(0, V1::min_value(), 0, V2::min_value(), 1, 0)
     }
 }
 
@@ -152,14 +193,14 @@ mod tests {
     fn test_internal_sort_value_repr_ordering_values() {
         // Primary sort (Desc v1=10) dominates over secondary (Desc v2=100) and doc_id.
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
-            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(0, 0, SortOrder::Desc),
             0,
             SortOrder::Desc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(5, 0, SortOrder::Desc),
-            InternalValueRepr::new(100, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(5, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(100, 0, SortOrder::Desc),
             999,
             SortOrder::Desc,
         );
@@ -167,14 +208,14 @@ mod tests {
 
         // Same values but Asc, the order is reversed
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Asc),
-            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Asc),
+            InternalValueRepr::<u64>::new(0, 0, SortOrder::Desc),
             0,
             SortOrder::Desc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(5, 0, SortOrder::Asc),
-            InternalValueRepr::new(100, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(5, 0, SortOrder::Asc),
+            InternalValueRepr::<u64>::new(100, 0, SortOrder::Desc),
             999,
             SortOrder::Desc,
         );
@@ -182,14 +223,14 @@ mod tests {
 
         // Secondary sort (Desc v2) breaks a tie on the primary field.
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
             0,
             SortOrder::Desc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
-            InternalValueRepr::new(5, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(5, 0, SortOrder::Desc),
             0,
             SortOrder::Desc,
         );
@@ -197,14 +238,14 @@ mod tests {
 
         // Same values but Asc, the order is reversed.
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
-            InternalValueRepr::new(10, 0, SortOrder::Asc),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Asc),
             0,
             SortOrder::Desc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
-            InternalValueRepr::new(5, 0, SortOrder::Asc),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(5, 0, SortOrder::Asc),
             0,
             SortOrder::Desc,
         );
@@ -212,14 +253,14 @@ mod tests {
 
         // Doc-id Desc tiebreaker: higher doc_id wins.
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
-            InternalValueRepr::new_missing(),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new_missing(),
             10,
             SortOrder::Desc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
-            InternalValueRepr::new_missing(),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new_missing(),
             5,
             SortOrder::Desc,
         );
@@ -227,14 +268,14 @@ mod tests {
 
         // Doc-id Asc tiebreaker: lower doc_id wins.
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
-            InternalValueRepr::new_missing(),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new_missing(),
             5,
             SortOrder::Asc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
-            InternalValueRepr::new_missing(),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new_missing(),
             10,
             SortOrder::Asc,
         );
@@ -242,14 +283,14 @@ mod tests {
 
         // Missing values are always smaller
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new_missing(),
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new_missing(),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
             10,
             SortOrder::Desc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(5, 0, SortOrder::Desc),
-            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(5, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(0, 0, SortOrder::Desc),
             0,
             SortOrder::Desc,
         );
@@ -257,14 +298,14 @@ mod tests {
 
         // Same but Asc, missing is still smaller.
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new_missing(),
-            InternalValueRepr::new(10, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new_missing(),
+            InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc),
             10,
             SortOrder::Desc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(5, 0, SortOrder::Asc),
-            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(5, 0, SortOrder::Asc),
+            InternalValueRepr::<u64>::new(0, 0, SortOrder::Desc),
             0,
             SortOrder::Desc,
         );
@@ -274,8 +315,8 @@ mod tests {
     #[test]
     fn test_internal_sort_value_repr_ordering_sentinels() {
         // Doc-id sentinel ordering: skip_doc_ids < normal_doc_id < keep_doc_ids.
-        let s1 = InternalValueRepr::new(10, 0, SortOrder::Desc);
-        let s2 = InternalValueRepr::new_missing();
+        let s1 = InternalValueRepr::<u64>::new(10, 0, SortOrder::Desc);
+        let s2 = InternalValueRepr::<u64>::new_missing();
         let skip_docs = InternalSortValueRepr::new_skip_doc_ids(s1, s2);
         let keep_docs = InternalSortValueRepr::new_keep_doc_ids(s1, s2);
         let normal_doc_desc = InternalSortValueRepr::new(s1, s2, 0, SortOrder::Desc);
@@ -302,14 +343,14 @@ mod tests {
     fn test_internal_sort_value_repr_ordering_types() {
         // Primary accessor ordering dominates all the rest
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(5, 1, SortOrder::Desc),
-            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(5, 1, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(0, 0, SortOrder::Desc),
             0,
             SortOrder::Desc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(15, 0, SortOrder::Desc),
-            InternalValueRepr::new(100, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(15, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(100, 0, SortOrder::Desc),
             999,
             SortOrder::Desc,
         );
@@ -317,14 +358,14 @@ mod tests {
 
         // Same values but Asc, the order is reversed
         let lhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(5, 1, SortOrder::Asc),
-            InternalValueRepr::new(0, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(5, 1, SortOrder::Asc),
+            InternalValueRepr::<u64>::new(0, 0, SortOrder::Desc),
             0,
             SortOrder::Desc,
         );
         let rhs = InternalSortValueRepr::new(
-            InternalValueRepr::new(15, 0, SortOrder::Asc),
-            InternalValueRepr::new(100, 0, SortOrder::Desc),
+            InternalValueRepr::<u64>::new(15, 0, SortOrder::Asc),
+            InternalValueRepr::<u64>::new(100, 0, SortOrder::Desc),
             999,
             SortOrder::Desc,
         );
@@ -336,9 +377,12 @@ mod tests {
         // Make sure that the memory representation is efficiently packed. For
         // instance refactoring to:
         // ```
-        //   struct InternalSortValueRepr(InternalValueRepr,InternalValueRepr, u64)
+        //   struct InternalSortValueRepr(InternalValueRepr<u64>,InternalValueRepr<u64>,u64)
         // ```
-        // would cause the size to jump to 40 bytes.
-        assert_eq!(std::mem::size_of::<InternalSortValueRepr>(), 24);
+        // would cause InternalSortValueRepr<u64, u64> to jump to 40 bytes.
+
+        assert_eq!(std::mem::size_of::<InternalSortValueRepr<u64, u64>>(), 24);
+        assert_eq!(std::mem::size_of::<InternalSortValueRepr<u64, ()>>(), 16);
+        assert_eq!(std::mem::size_of::<InternalSortValueRepr<(), ()>>(), 8);
     }
 }
