@@ -290,8 +290,7 @@ impl SortingFieldExtractorComponent {
                         let mut buffer = Vec::new();
                         term_dict.ord_to_term(val_as_u64, &mut buffer)?;
                         SortValue::Str(
-                            String::from_utf8(buffer.to_vec())
-                                .expect("could not convert to String"),
+                            String::from_utf8(buffer).expect("could not convert to String"),
                         )
                     }
                 }
@@ -640,8 +639,8 @@ impl<V1: ElidableU64, V2: ElidableU64> SortingFieldExtractorPair<V1, V2> {
                 }
             }
             (Some(fst_batch_extr), None) => {
+                fst_batch_extr.fill_batch(docs, first_order, &mut sort1_scratch[..n]);
                 for i in 0..n {
-                    fst_batch_extr.fill_batch(docs, first_order, &mut sort1_scratch[..n]);
                     let sort2 = second
                         .as_ref()
                         .map(|s| s.project_to_internal_sort_value(docs[i], 0.0, second_order))

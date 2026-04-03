@@ -14,7 +14,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::vec;
 
 use assert_json_diff::{assert_json_eq, assert_json_include};
 use quickwit_config::SearcherConfig;
@@ -2279,7 +2278,7 @@ async fn test_sort_by_datetime_format_millis_and_search_after() -> anyhow::Resul
 
 #[tokio::test]
 async fn test_sort_by_dynamic_with_datetime_page_fails() -> anyhow::Result<()> {
-    let index_id = "sort-datetime-millis-search-after";
+    let index_id = "sort-dynamic-datetime-page-fails";
     let doc_mapping_yaml = r#"
             field_mappings:
               - name: ts
