@@ -258,14 +258,14 @@ Tantivy uses the following types:
 - ip (not supported in sort yet)
 - bytes (not supported in sort yet)
 
-Elasticsearch can represent date field sort values in various formats. In Quickwit, only integer formats are supported (millisecond or nanosecond). Either way, the fact that datetime can live along with another type inside a split yields un-reliable pagination:
+Elasticsearch can represent date field sort values in various formats. In Quickwit, only integer formats are supported (millisecond or nanosecond). Either way, the fact that datetime can live along with another type inside a split yields unreliable pagination:
 - Because there isn't a simple and efficient common representation in the fast field u64 space, it's hard to represent datetime within the numerical (i64/u64/f64) order.
 - To paginate separately across numerical and datetime types a strongly typed representation of the json sort key would be necessary.
 
 The current implementation does the following:
 - If the mapping is explicitly set to datetime and never changed, pagination works as expected.
-- If the mapping evolved to datetime, paginations fails for splits that contain numerical values (i64, u64, f64 columns).
-- If the mapping is a json/dynamic field, pagination fails for splits that contain a datetime columns. This can happen because on JSON field Tantivy automatically stores RFC3337 date strings in a datetime column.
+- If the mapping evolved to datetime, pagination fails for splits that contain numerical values (i64, u64, f64 columns).
+- If the mapping is a json/dynamic field, pagination fails for splits that contain a datetime column. This can happen because on JSON field Tantivy automatically stores RFC3339 date strings in a datetime column.
 - If other types are mixed, the sort will iterate over all values type by type
   - Asc: numeric -> string -> boolean -> datetime -> null
   - Desc: datetime -> boolean -> string -> numeric -> null
