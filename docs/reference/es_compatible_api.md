@@ -269,6 +269,7 @@ The current implementation does the following:
 - If other types are mixed, the sort will iterate over all values type by type
   - Asc: numeric -> string -> boolean -> datetime -> null
   - Desc: datetime -> boolean -> string -> numeric -> null
+- Quickwit used to support specifying numbers as string in the search after value. That isn't possible anymore.
 
 
 ### `_msearch` &nbsp; Multi search API
