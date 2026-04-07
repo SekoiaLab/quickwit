@@ -289,9 +289,12 @@ impl SortingFieldExtractorComponent {
                         let term_dict = str_column.dictionary();
                         let mut buffer = Vec::new();
                         term_dict.ord_to_term(val_as_u64, &mut buffer)?;
-                        SortValue::Str(
-                            String::from_utf8(buffer).expect("could not convert to String"),
-                        )
+                        let string_value = String::from_utf8(buffer).map_err(|_| {
+                            tantivy::TantivyError::InternalError(
+                                "term dictionary contains non-UTF-8 bytes".to_string(),
+                            )
+                        })?;
+                        SortValue::Str(string_value)
                     }
                 }
             }
