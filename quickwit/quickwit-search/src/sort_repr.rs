@@ -23,6 +23,7 @@ use crate::top_k_computer::MinValue;
 pub(crate) trait ElidableU64: Ord + Copy + Debug + MinValue {
     fn value(self) -> u64;
     fn from_u64(value: u64) -> Self;
+    fn is_elided() -> bool;
 }
 
 impl MinValue for u64 {
@@ -42,12 +43,18 @@ impl ElidableU64 for u64 {
     fn value(self) -> u64 {
         self
     }
+    fn is_elided() -> bool {
+        false
+    }
 }
 
 impl ElidableU64 for () {
     fn from_u64(_value: u64) -> Self {}
     fn value(self) -> u64 {
         0
+    }
+    fn is_elided() -> bool {
+        true
     }
 }
 

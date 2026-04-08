@@ -236,11 +236,9 @@ impl SortingFieldExtractorComponent {
         }
     }
 
-    /// Returns the sort value for the given element in its u64 representation. The returned u64
-    /// representation maintains the ordering of the original value.
-    ///
-    /// The function returns None if the sort key is a fast field, for which we have no value
-    /// for the given doc_id, or we sort by DocId.
+    /// Returns the sort value for the given element in its u64 representation.
+    /// The returned u64 representation maintains the ordering of the original
+    /// value.
     #[inline]
     fn project_to_internal_sort_value<V: ElidableU64>(
         &self,
@@ -251,6 +249,7 @@ impl SortingFieldExtractorComponent {
         match self {
             SortingFieldExtractorComponent::DocId => {
                 // Doc id is handled at the compound sort value level
+                debug_assert!(V::is_elided());
                 InternalValueRepr::new_missing()
             }
             SortingFieldExtractorComponent::FastField(FFExtract { sort_columns, .. }) => {
@@ -273,10 +272,12 @@ impl SortingFieldExtractorComponent {
         order: SortOrder,
     ) -> tantivy::Result<Option<SortByValue>> {
         let Some((col_idx, val_as_u64)) = internal_repr.decode(order) else {
-            return Ok(None);
+            return Ok(Some(SortByValue { sort_value: None }));
         };
+        if V::is_elided() {
+            return Ok(None);
+        }
         let sort_value = match self {
-            SortingFieldExtractorComponent::DocId => SortValue::U64(val_as_u64),
             SortingFieldExtractorComponent::FastField(FFExtract { sort_columns, .. }) => {
                 let (_, field_type) = &sort_columns[col_idx as usize];
                 match field_type {
@@ -299,6 +300,11 @@ impl SortingFieldExtractorComponent {
                 }
             }
             SortingFieldExtractorComponent::Score => SortValue::F64(f64::from_u64(val_as_u64)),
+            SortingFieldExtractorComponent::DocId => {
+                return Err(tantivy::TantivyError::InternalError(
+                    "value should be elided on doc id sort".to_string(),
+                ));
+            }
         };
         Ok(Some(SortByValue {
             sort_value: Some(sort_value),
@@ -314,13 +320,10 @@ impl SortingFieldExtractorComponent {
             sort_value: sort_value_opt,
         } = sort_by_value;
         match (self, sort_value_opt) {
-            (SortingFieldExtractorComponent::DocId, Some(SortValue::U64(val))) => {
-                Ok(InternalValueRepr::new(*val, 0, sort_order))
-            }
             (SortingFieldExtractorComponent::DocId, _) => {
-                Err(tantivy::TantivyError::InvalidArgument(
-                    "got non-U64 sort value for doc ID".to_string(),
-                ))
+                // Doc id sorts are handled at the compound sort value level
+                debug_assert!(V::is_elided());
+                Ok(InternalValueRepr::new_missing())
             }
             (SortingFieldExtractorComponent::FastField { .. }, None) => {
                 Ok(InternalValueRepr::new_missing())
@@ -2019,9 +2022,9 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        let res = searcher
-            .search(&tantivy::query::AllQuery, &collector)
-            .unwrap();
+        let Ok(res) = searcher.search(&tantivy::query::AllQuery, &collector) else {
+            panic!("search failed for {label} with search_after {search_after:?}");
+        };
         // num_hits counts every doc regardless of search_after.
         assert_eq!(
             res.num_hits, index_len as u64,
