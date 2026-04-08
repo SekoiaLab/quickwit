@@ -104,10 +104,12 @@ impl SortByComponent {
 
                 // TODO we could skip the columns that are before the search after
 
-                Ok(SortingFieldExtractorComponent::FastField(FFExtract {
-                    sort_columns,
-                    col_scratch: Box::new([None; COLLECT_BLOCK_BUFFER_LEN]),
-                }))
+                Ok(SortingFieldExtractorComponent::FastField(
+                    FastFieldExtractor {
+                        sort_columns,
+                        col_scratch: Box::new([None; COLLECT_BLOCK_BUFFER_LEN]),
+                    },
+                ))
             }
             SortByComponent::Score { .. } => Ok(SortingFieldExtractorComponent::Score),
         }
@@ -177,13 +179,13 @@ impl SortFieldType {
     }
 }
 
-struct FFExtract {
+struct FastFieldExtractor {
     /// Sort columns are sorted in the same order as types (TypeSortKey)
     sort_columns: Vec<(Column<u64>, SortFieldType)>,
     col_scratch: Box<[Option<u64>; COLLECT_BLOCK_BUFFER_LEN]>,
 }
 
-impl FFExtract {
+impl FastFieldExtractor {
     fn fill_batch<V: ElidableU64>(
         &mut self,
         docs: &[DocId],
@@ -214,7 +216,7 @@ impl FFExtract {
 enum SortingFieldExtractorComponent {
     /// If undefined, we simply sort by DocIds.
     DocId,
-    FastField(FFExtract),
+    FastField(FastFieldExtractor),
     Score,
 }
 
@@ -225,7 +227,7 @@ impl SortingFieldExtractorComponent {
 
     /// Currently batch extraction only has a fast path for full columns. That
     /// can only happen if there is only one column for the fast field.
-    fn extractor_for_batch_if_worthwhile(&mut self) -> Option<&mut FFExtract> {
+    fn extractor_for_batch_if_worthwhile(&mut self) -> Option<&mut FastFieldExtractor> {
         match self {
             SortingFieldExtractorComponent::FastField(extractor)
                 if extractor.sort_columns.len() == 1 =>
@@ -252,7 +254,9 @@ impl SortingFieldExtractorComponent {
                 debug_assert!(V::is_elided());
                 InternalValueRepr::new_missing()
             }
-            SortingFieldExtractorComponent::FastField(FFExtract { sort_columns, .. }) => {
+            SortingFieldExtractorComponent::FastField(FastFieldExtractor {
+                sort_columns, ..
+            }) => {
                 for (idx, (sort_column, _)) in sort_columns.iter().enumerate() {
                     if let Some(value) = sort_column.first(doc_id) {
                         return InternalValueRepr::new(value, idx as u8, order);
@@ -278,7 +282,9 @@ impl SortingFieldExtractorComponent {
             return Ok(None);
         }
         let sort_value = match self {
-            SortingFieldExtractorComponent::FastField(FFExtract { sort_columns, .. }) => {
+            SortingFieldExtractorComponent::FastField(FastFieldExtractor {
+                sort_columns, ..
+            }) => {
                 let (_, field_type) = &sort_columns[col_idx as usize];
                 match field_type {
                     SortFieldType::U64 => SortValue::U64(val_as_u64),
@@ -325,11 +331,13 @@ impl SortingFieldExtractorComponent {
                 debug_assert!(V::is_elided());
                 Ok(InternalValueRepr::new_missing())
             }
-            (SortingFieldExtractorComponent::FastField { .. }, None) => {
+            (SortingFieldExtractorComponent::FastField(_), None) => {
                 Ok(InternalValueRepr::new_missing())
             }
             (
-                SortingFieldExtractorComponent::FastField(FFExtract { sort_columns, .. }),
+                SortingFieldExtractorComponent::FastField(FastFieldExtractor {
+                    sort_columns, ..
+                }),
                 Some(sort_value),
             ) => project_search_after_sort_value(sort_columns, sort_value, sort_order),
             (SortingFieldExtractorComponent::Score, Some(SortValue::F64(val))) => {

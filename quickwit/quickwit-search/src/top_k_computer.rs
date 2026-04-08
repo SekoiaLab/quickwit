@@ -79,7 +79,7 @@ where D: Ord + Copy + Debug
         // (this is in the hot path)
         // TODO: Replace with `push_within_capacity` when it's stabilized
         let uninit = self.buffer.spare_capacity_mut();
-        // This cannot panic, because we truncate_median will at least remove one element, since
+        // This cannot panic, because truncate_top_n will at least remove one element, since
         // the min capacity is larger than 2.
         uninit[0].write(Reverse(doc));
         // This is safe because it would panic in the line above

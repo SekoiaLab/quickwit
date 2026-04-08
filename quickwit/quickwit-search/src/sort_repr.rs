@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::fmt::Debug;
+use std::ops::Not;
 
 use quickwit_proto::search::SortOrder;
 use tantivy::DocId;
@@ -77,12 +78,25 @@ impl ElidableU64 for () {
 #[derive(Clone, Copy)]
 pub(crate) struct InternalValueRepr<V: ElidableU64>(u8, V);
 
+/// Inverts the sort order by reversing the bits.
+///
+/// Using the bitwise negation is a cheap way to reverse the order while
+/// maintaining the type (and memory footprint). It is also reversible
+/// (`not(not(value)) == value`) which makes it simply decodable.
+///
+/// This wrapper is just an alias to make the code more readable. Using `!value`
+/// or `value.not()` inline yields the same result.
+#[inline]
+fn reverse<T: Not<Output = T>>(value: T) -> T {
+    value.not()
+}
+
 impl<V: ElidableU64> InternalValueRepr<V> {
     #[inline]
     pub fn new(value: u64, accessor_idx: u8, order: SortOrder) -> Self {
         // For Asc, smaller values should win: invert so smaller maps to larger repr
         match order {
-            SortOrder::Asc => Self(!(accessor_idx * 2 + 3), V::from_u64(!value)),
+            SortOrder::Asc => Self(reverse(accessor_idx * 2 + 3), V::from_u64(reverse(value))),
             SortOrder::Desc => Self(accessor_idx * 2 + 3, V::from_u64(value)),
         }
     }
@@ -90,7 +104,7 @@ impl<V: ElidableU64> InternalValueRepr<V> {
     /// that all documents should be kept.
     pub fn new_keep_column(accessor_idx: u8, order: SortOrder) -> Self {
         match order {
-            SortOrder::Asc => Self(!(accessor_idx * 2 + 2), V::from_u64(0)),
+            SortOrder::Asc => Self(reverse(accessor_idx * 2 + 2), V::from_u64(0)),
             SortOrder::Desc => Self(accessor_idx * 2 + 4, V::from_u64(0)),
         }
     }
@@ -104,7 +118,7 @@ impl<V: ElidableU64> InternalValueRepr<V> {
     /// that all documents should be skipped for the given column.
     pub fn new_skip_column(accessor_idx: u8, order: SortOrder) -> Self {
         match order {
-            SortOrder::Asc => Self(!(accessor_idx * 2 + 4), V::from_u64(0)),
+            SortOrder::Asc => Self(reverse(accessor_idx * 2 + 4), V::from_u64(0)),
             SortOrder::Desc => Self(accessor_idx * 2 + 2, V::from_u64(0)),
         }
     }
@@ -120,14 +134,14 @@ impl<V: ElidableU64> InternalValueRepr<V> {
         }
         debug_assert_eq!(
             match order {
-                SortOrder::Asc => !self.0,
+                SortOrder::Asc => reverse(self.0),
                 SortOrder::Desc => self.0,
             } % 2,
             1,
             "sentinel indexes are not meant to be decoded"
         );
         match order {
-            SortOrder::Asc => Some(((!self.0 - 3) / 2, !V::value(self.1))),
+            SortOrder::Asc => Some(((reverse(self.0) - 3) / 2, reverse(V::value(self.1)))),
             SortOrder::Desc => Some(((self.0 - 3) / 2, V::value(self.1))),
         }
     }
@@ -155,7 +169,7 @@ impl<V1: ElidableU64, V2: ElidableU64> InternalSortValueRepr<V1, V2> {
     ) -> Self {
         // For Asc, smaller values should win: invert so smaller maps to larger repr
         match doc_id_sort {
-            SortOrder::Asc => Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 1, !doc_id),
+            SortOrder::Asc => Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 1, reverse(doc_id)),
             SortOrder::Desc => Self(sort_1.0, sort_1.1, sort_2.0, sort_2.1, 1, doc_id),
         }
     }
@@ -177,7 +191,7 @@ impl<V1: ElidableU64, V2: ElidableU64> InternalSortValueRepr<V1, V2> {
     pub fn doc_id(self, order: SortOrder) -> DocId {
         debug_assert_eq!(self.4, 1, "doc id sentinel is not meant to be decoded");
         match order {
-            SortOrder::Asc => !self.5,
+            SortOrder::Asc => reverse(self.5),
             SortOrder::Desc => self.5,
         }
     }
