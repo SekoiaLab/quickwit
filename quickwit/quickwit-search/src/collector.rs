@@ -275,12 +275,12 @@ impl SortingFieldExtractorComponent {
         internal_repr: InternalValueRepr<V>,
         order: SortOrder,
     ) -> tantivy::Result<Option<SortByValue>> {
-        let Some((col_idx, val_as_u64)) = internal_repr.decode(order) else {
-            return Ok(Some(SortByValue { sort_value: None }));
-        };
         if V::is_elided() {
             return Ok(None);
         }
+        let Some((col_idx, val_as_u64)) = internal_repr.decode(order) else {
+            return Ok(Some(SortByValue { sort_value: None }));
+        };
         let sort_value = match self {
             SortingFieldExtractorComponent::FastField(FastFieldExtractor {
                 sort_columns, ..
@@ -2196,6 +2196,64 @@ mod tests {
                 &format!("\"{sort_str}\""),
             );
         }
+    }
+
+    #[test]
+    fn test_single_split_default_sort() {
+        let dataset: Vec<serde_json::Value> = vec![
+            serde_json::json!({"sort_u64_1": 15}), // doc 0
+            serde_json::json!({"sort_u64_1": 13}), // doc 1
+            serde_json::json!({"sort_u64_1": 10}), // doc 2
+            serde_json::json!({"sort_u64_1": 12}), // doc 3
+            serde_json::json!({"sort_u64_1": 9}),  // doc 4
+        ];
+
+        let index = make_index(&dataset);
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        let request = SearchRequest {
+            max_hits: 3,
+            sort_fields: vec![],
+            search_after: None,
+            ..SearchRequest::default()
+        };
+        let collector = super::make_collector_for_split(
+            "fake_split_id".to_string(),
+            &request,
+            Default::default(),
+        )
+        .unwrap();
+        let res = searcher
+            .search(&tantivy::query::AllQuery, &collector)
+            .unwrap();
+        // assert the exact hits where in other tests we mostly focus on the order
+        assert_eq!(
+            res.partial_hits,
+            vec![
+                PartialHit {
+                    split_id: "fake_split_id".to_string(),
+                    segment_ord: 0,
+                    doc_id: 4,
+                    sort_value: None,
+                    sort_value2: None,
+                },
+                PartialHit {
+                    split_id: "fake_split_id".to_string(),
+                    segment_ord: 0,
+                    doc_id: 3,
+                    sort_value: None,
+                    sort_value2: None,
+                },
+                PartialHit {
+                    split_id: "fake_split_id".to_string(),
+                    segment_ord: 0,
+                    doc_id: 2,
+                    sort_value: None,
+                    sort_value2: None,
+                },
+            ]
+        );
     }
 
     /// Merge intermediate results, asserting that both the regular and
