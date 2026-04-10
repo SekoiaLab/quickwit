@@ -41,6 +41,7 @@ use quickwit_metastore::{CreateIndexRequestExt, CreateIndexResponseExt, IndexMet
 use quickwit_proto::control_plane::{
     AdviseResetShardsRequest, AdviseResetShardsResponse, ControlPlaneError, ControlPlaneResult,
     GetOrCreateOpenShardsRequest, GetOrCreateOpenShardsResponse, GetOrCreateOpenShardsSubrequest,
+    SwapIndexingPipelinesRequest, SwapIndexingPipelinesResponse,
 };
 use quickwit_proto::indexing::ShardPositionsUpdate;
 use quickwit_proto::metastore::{
@@ -950,6 +951,20 @@ impl Handler<AdviseResetShardsRequest> for ControlPlane {
             .ingest_controller
             .advise_reset_shards(request, &self.model);
         Ok(Ok(response))
+    }
+}
+
+#[async_trait]
+impl Handler<SwapIndexingPipelinesRequest> for ControlPlane {
+    type Reply = ControlPlaneResult<SwapIndexingPipelinesResponse>;
+
+    async fn handle(
+        &mut self,
+        request: SwapIndexingPipelinesRequest,
+        _ctx: &ActorContext<Self>,
+    ) -> Result<Self::Reply, ActorExitStatus> {
+        let response = self.indexing_scheduler.swap_pipelines(request);
+        Ok(response)
     }
 }
 

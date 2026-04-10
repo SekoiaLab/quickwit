@@ -28,11 +28,15 @@ use quickwit_common::pretty::PrettySample;
 use quickwit_config::{
     FileSourceParams, SourceParams, disable_ingest_v1, indexing_pipeline_params_fingerprint,
 };
+use quickwit_proto::control_plane::{
+    ControlPlaneResult, SwapIndexingPipelinesEntry, SwapIndexingPipelinesRequest,
+    SwapIndexingPipelinesResponse, SwapIndexingPipelinesResult,
+};
 use quickwit_proto::indexing::{
     ApplyIndexingPlanRequest, CpuCapacity, IndexingService, IndexingTask, PIPELINE_FULL_CAPACITY,
     PIPELINE_THROUGHPUT,
 };
-use quickwit_proto::types::NodeId;
+use quickwit_proto::types::{NodeId, PipelineUid};
 use scheduling::{SourceToSchedule, SourceToScheduleType};
 use serde::Serialize;
 use tracing::{debug, info, warn};
@@ -282,6 +286,17 @@ fn get_sources_to_schedule(model: &ControlPlaneModel) -> Vec<SourceToSchedule> {
     sources
 }
 
+/// Holds the pre-validated tasks to move for a single swap entry.
+/// Tasks are collected from the original plan before any modifications.
+struct ValidSwapOperation {
+    left_node_id: String,
+    left_tasks: Vec<IndexingTask>,
+    right_node_id: String,
+    right_tasks: Vec<IndexingTask>,
+    left_index_id: String,
+    right_index_id: String,
+}
+
 impl IndexingScheduler {
     pub fn new(cluster_id: String, self_node_id: NodeId, indexer_pool: IndexerPool) -> Self {
         IndexingScheduler {
@@ -439,6 +454,239 @@ impl IndexingScheduler {
         self.state.num_applied_physical_indexing_plan += 1;
         self.state.last_applied_plan_timestamp = Some(Instant::now());
         self.state.last_applied_physical_plan = Some(new_physical_plan);
+    }
+
+    /// Swaps indexing pipelines between indexers as requested.
+    ///
+    /// The swap is applied in 3 phases:
+    /// 1. Upfront contradiction check (rejects entire request on failure).
+    /// 2. Per-swap validation against the original (unmodified) plan.
+    /// 3. Atomic application of all valid swaps to a working copy of the plan.
+    pub(crate) fn swap_pipelines(
+        &mut self,
+        request: SwapIndexingPipelinesRequest,
+    ) -> ControlPlaneResult<SwapIndexingPipelinesResponse> {
+        // Phase 0: Check that a plan exists.
+        let Some(original_plan) = &self.state.last_applied_physical_plan else {
+            return Ok(SwapIndexingPipelinesResponse {
+                results: request
+                    .swaps
+                    .iter()
+                    .map(|swap| SwapIndexingPipelinesResult {
+                        swap: Some(swap.clone()),
+                        success: false,
+                        reason: "no indexing plan is currently applied".to_string(),
+                    })
+                    .collect(),
+            });
+        };
+
+        // Phase 1: Upfront contradiction check (rejects entire request on failure).
+        if let Err(error_response) = Self::check_swap_contradictions(&request) {
+            return Ok(error_response);
+        }
+
+        // Phase 2: Validate each swap against the ORIGINAL plan and collect
+        // the tasks to move.
+        let mut swap_results: Vec<SwapIndexingPipelinesResult> =
+            Vec::with_capacity(request.swaps.len());
+        let mut valid_operations: Vec<ValidSwapOperation> = Vec::new();
+
+        for swap in &request.swaps {
+            match Self::validate_single_swap(original_plan, swap) {
+                Ok(operation) => {
+                    valid_operations.push(operation);
+                    swap_results.push(SwapIndexingPipelinesResult {
+                        swap: Some(swap.clone()),
+                        success: true,
+                        reason: String::new(),
+                    });
+                }
+                Err(reason) => {
+                    swap_results.push(SwapIndexingPipelinesResult {
+                        swap: Some(swap.clone()),
+                        success: false,
+                        reason,
+                    });
+                }
+            }
+        }
+
+        // Phase 3: Apply all valid swaps atomically to a working copy.
+        if !valid_operations.is_empty() {
+            let mut new_plan = original_plan.clone();
+            for operation in &valid_operations {
+                Self::apply_swap_operation(&mut new_plan, operation);
+            }
+            let indexers = self.get_indexers_from_indexer_pool();
+            self.apply_physical_indexing_plan(&indexers, new_plan, None);
+        }
+
+        Ok(SwapIndexingPipelinesResponse {
+            results: swap_results,
+        })
+    }
+
+    /// Validates the entire swap request for contradictions.
+    ///
+    /// A contradiction exists when:
+    /// - A swap entry references the same node on both sides.
+    /// - The same (node_id, index_id) pair appears in more than one swap entry.
+    ///
+    /// On contradiction, returns a response with all swaps marked as failed.
+    fn check_swap_contradictions(
+        request: &SwapIndexingPipelinesRequest,
+    ) -> Result<(), SwapIndexingPipelinesResponse> {
+        let mut seen_slots: FnvHashSet<(&str, &str)> = FnvHashSet::default();
+
+        for swap in &request.swaps {
+            // Reject same-node swaps.
+            if swap.left_node_id == swap.right_node_id {
+                let reason = format!(
+                    "request rejected: swap between '{}' (index '{}') and '{}' (index '{}') \
+                     references the same node",
+                    swap.left_node_id, swap.left_index_id, swap.right_node_id, swap.right_index_id,
+                );
+                return Err(SwapIndexingPipelinesResponse {
+                    results: request
+                        .swaps
+                        .iter()
+                        .map(|s| SwapIndexingPipelinesResult {
+                            swap: Some(s.clone()),
+                            success: false,
+                            reason: reason.clone(),
+                        })
+                        .collect(),
+                });
+            }
+
+            let left_slot = (swap.left_node_id.as_str(), swap.left_index_id.as_str());
+            let right_slot = (swap.right_node_id.as_str(), swap.right_index_id.as_str());
+
+            // Check for duplicate slots across entries.
+            let left_inserted = seen_slots.insert(left_slot);
+            let right_inserted = seen_slots.insert(right_slot);
+            if !left_inserted || !right_inserted {
+                // Find which slot was the duplicate for the error message.
+                let conflicting = if !left_inserted {
+                    left_slot
+                } else {
+                    right_slot
+                };
+                let reason = format!(
+                    "request rejected: contradictory swaps — index '{}' on node '{}' is \
+                     referenced by multiple swap entries",
+                    conflicting.1, conflicting.0,
+                );
+                return Err(SwapIndexingPipelinesResponse {
+                    results: request
+                        .swaps
+                        .iter()
+                        .map(|s| SwapIndexingPipelinesResult {
+                            swap: Some(s.clone()),
+                            success: false,
+                            reason: reason.clone(),
+                        })
+                        .collect(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates a single swap entry against the original (unmodified) plan.
+    fn validate_single_swap(
+        plan: &PhysicalIndexingPlan,
+        swap: &SwapIndexingPipelinesEntry,
+    ) -> Result<ValidSwapOperation, String> {
+        // 1. Verify both indexers exist in the plan.
+        let left_tasks = plan.indexer(&swap.left_node_id).ok_or_else(|| {
+            format!(
+                "indexer '{}' not found in the current plan",
+                swap.left_node_id
+            )
+        })?;
+        let right_tasks = plan.indexer(&swap.right_node_id).ok_or_else(|| {
+            format!(
+                "indexer '{}' not found in the current plan",
+                swap.right_node_id
+            )
+        })?;
+
+        // 2. Collect tasks for the specified indexes on their respective indexers.
+        let left_tasks_to_move: Vec<IndexingTask> = left_tasks
+            .iter()
+            .filter(|t| t.index_uid().index_id == swap.left_index_id)
+            .cloned()
+            .collect();
+        let right_tasks_to_move: Vec<IndexingTask> = right_tasks
+            .iter()
+            .filter(|t| t.index_uid().index_id == swap.right_index_id)
+            .cloned()
+            .collect();
+
+        // 3. Reject if no tasks found on either side.
+        if left_tasks_to_move.is_empty() {
+            return Err(format!(
+                "no pipelines found for index '{}' on indexer '{}'",
+                swap.left_index_id, swap.left_node_id,
+            ));
+        }
+        if right_tasks_to_move.is_empty() {
+            return Err(format!(
+                "no pipelines found for index '{}' on indexer '{}'",
+                swap.right_index_id, swap.right_node_id,
+            ));
+        }
+
+        // 4. Reject if pipeline counts differ.
+        if left_tasks_to_move.len() != right_tasks_to_move.len() {
+            return Err(format!(
+                "pipeline count mismatch: '{}' has {} pipeline(s) on '{}', but '{}' has {} \
+                 pipeline(s) on '{}'",
+                swap.left_index_id,
+                left_tasks_to_move.len(),
+                swap.left_node_id,
+                swap.right_index_id,
+                right_tasks_to_move.len(),
+                swap.right_node_id,
+            ));
+        }
+
+        Ok(ValidSwapOperation {
+            left_node_id: swap.left_node_id.clone(),
+            left_tasks: left_tasks_to_move,
+            right_node_id: swap.right_node_id.clone(),
+            right_tasks: right_tasks_to_move,
+            left_index_id: swap.left_index_id.clone(),
+            right_index_id: swap.right_index_id.clone(),
+        })
+    }
+
+    /// Applies a validated swap operation to a working copy of the plan.
+    fn apply_swap_operation(plan: &mut PhysicalIndexingPlan, operation: &ValidSwapOperation) {
+        let plan_map = plan.indexing_tasks_per_indexer_mut();
+
+        // Remove the swapped tasks from their origin nodes.
+        if let Some(left_node_tasks) = plan_map.get_mut(&operation.left_node_id) {
+            left_node_tasks.retain(|t| t.index_uid().index_id != operation.left_index_id);
+        }
+        if let Some(right_node_tasks) = plan_map.get_mut(&operation.right_node_id) {
+            right_node_tasks.retain(|t| t.index_uid().index_id != operation.right_index_id);
+        }
+
+        // Add tasks to their new nodes with fresh pipeline UIDs.
+        for task in &operation.left_tasks {
+            let mut moved_task = task.clone();
+            moved_task.pipeline_uid = Some(PipelineUid::random());
+            plan.add_indexing_task(&operation.right_node_id, moved_task);
+        }
+        for task in &operation.right_tasks {
+            let mut moved_task = task.clone();
+            moved_task.pipeline_uid = Some(PipelineUid::random());
+            plan.add_indexing_task(&operation.left_node_id, moved_task);
+        }
     }
 }
 
@@ -714,6 +962,10 @@ mod tests {
     use proptest::{prop_compose, proptest};
     use quickwit_config::{IndexConfig, KafkaSourceParams, SourceConfig, SourceParams};
     use quickwit_metastore::IndexMetadata;
+    use quickwit_proto::control_plane::{SwapIndexingPipelinesEntry, SwapIndexingPipelinesRequest};
+    use quickwit_proto::indexing::{
+        ApplyIndexingPlanResponse, IndexingServiceClient, MockIndexingService,
+    };
     use quickwit_proto::types::{IndexUid, PipelineUid, ShardId, SourceUid};
 
     use super::*;
@@ -878,6 +1130,467 @@ mod tests {
                 FnvHashMap::from_iter([("indexer-1", vec![&task_1b, &task_1c])])
             );
         }
+    }
+
+    fn make_test_task(index_id: &str, source_id: &str, pipeline_uid: u128) -> IndexingTask {
+        IndexingTask {
+            index_uid: Some(IndexUid::for_test(index_id, 0)),
+            source_id: source_id.to_string(),
+            pipeline_uid: Some(PipelineUid::for_test(pipeline_uid)),
+            shard_ids: Vec::new(),
+            params_fingerprint: 0,
+        }
+    }
+
+    fn make_swap_entry(
+        left_node: &str,
+        left_index: &str,
+        right_node: &str,
+        right_index: &str,
+    ) -> SwapIndexingPipelinesEntry {
+        SwapIndexingPipelinesEntry {
+            left_node_id: left_node.to_string(),
+            left_index_id: left_index.to_string(),
+            right_node_id: right_node.to_string(),
+            right_index_id: right_index.to_string(),
+        }
+    }
+
+    fn build_test_scheduler_with_plan(plan: PhysicalIndexingPlan) -> IndexingScheduler {
+        let indexer_pool = IndexerPool::default();
+        for node_id in plan.indexing_tasks_per_indexer().keys() {
+            let mut mock_indexer = MockIndexingService::new();
+            mock_indexer
+                .expect_apply_indexing_plan()
+                .returning(|_| Ok(ApplyIndexingPlanResponse {}));
+            let indexer_info = IndexerNodeInfo {
+                node_id: NodeId::from(node_id.as_str()),
+                generation_id: 0,
+                client: IndexingServiceClient::from_mock(mock_indexer),
+                indexing_tasks: Vec::new(),
+                indexing_capacity: CpuCapacity::from_cpu_millis(4_000),
+            };
+            indexer_pool.insert(indexer_info.node_id.clone(), indexer_info);
+        }
+        let mut scheduler =
+            IndexingScheduler::new("test-cluster".to_string(), "test-node".into(), indexer_pool);
+        scheduler.state.last_applied_physical_plan = Some(plan);
+        scheduler
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_basic() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+        ]);
+        let task_a = make_test_task("index-a", "source-1", 1);
+        let task_b = make_test_task("index-b", "source-1", 2);
+        plan.add_indexing_task("indexer-1", task_a.clone());
+        plan.add_indexing_task("indexer-2", task_b.clone());
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-a",
+                "indexer-2",
+                "index-b",
+            )],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        assert_eq!(response.results.len(), 1);
+        assert!(response.results[0].success);
+
+        let new_plan = scheduler.state.last_applied_physical_plan.as_ref().unwrap();
+        // index-a should now be on indexer-2
+        let indexer_2_tasks = new_plan.indexer("indexer-2").unwrap();
+        assert_eq!(indexer_2_tasks.len(), 1);
+        assert_eq!(indexer_2_tasks[0].index_uid().index_id, "index-a");
+        // index-b should now be on indexer-1
+        let indexer_1_tasks = new_plan.indexer("indexer-1").unwrap();
+        assert_eq!(indexer_1_tasks.len(), 1);
+        assert_eq!(indexer_1_tasks[0].index_uid().index_id, "index-b");
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_count_mismatch() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+        ]);
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 1));
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 2));
+        plan.add_indexing_task("indexer-2", make_test_task("index-b", "source-1", 3));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan.clone());
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-a",
+                "indexer-2",
+                "index-b",
+            )],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        assert_eq!(response.results.len(), 1);
+        assert!(!response.results[0].success);
+        assert!(
+            response.results[0]
+                .reason
+                .contains("pipeline count mismatch")
+        );
+
+        // Plan should be unchanged.
+        assert_eq!(
+            scheduler.state.last_applied_physical_plan.as_ref().unwrap(),
+            &plan,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_unknown_indexer() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&["indexer-1".to_string()]);
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 1));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-a",
+                "indexer-999",
+                "index-b",
+            )],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        assert!(!response.results[0].success);
+        assert!(response.results[0].reason.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_no_pipelines_for_index() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+        ]);
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 1));
+        plan.add_indexing_task("indexer-2", make_test_task("index-b", "source-1", 2));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-NONEXISTENT",
+                "indexer-2",
+                "index-b",
+            )],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        assert!(!response.results[0].success);
+        assert!(response.results[0].reason.contains("no pipelines found"));
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_multiple_swaps_partial_success() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+            "indexer-3".to_string(),
+        ]);
+        // Valid swap pair: 1 pipeline each.
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 1));
+        plan.add_indexing_task("indexer-2", make_test_task("index-b", "source-1", 2));
+        // Invalid swap pair: count mismatch (2 vs 1).
+        plan.add_indexing_task("indexer-2", make_test_task("index-c", "source-1", 3));
+        plan.add_indexing_task("indexer-2", make_test_task("index-c", "source-1", 4));
+        plan.add_indexing_task("indexer-3", make_test_task("index-d", "source-1", 5));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![
+                make_swap_entry("indexer-1", "index-a", "indexer-2", "index-b"),
+                make_swap_entry("indexer-2", "index-c", "indexer-3", "index-d"),
+            ],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        assert_eq!(response.results.len(), 2);
+        assert!(response.results[0].success);
+        assert!(!response.results[1].success);
+        assert!(
+            response.results[1]
+                .reason
+                .contains("pipeline count mismatch")
+        );
+
+        // The first swap should have been applied.
+        let new_plan = scheduler.state.last_applied_physical_plan.as_ref().unwrap();
+        let indexer_1_tasks = new_plan.indexer("indexer-1").unwrap();
+        assert_eq!(indexer_1_tasks.len(), 1);
+        assert_eq!(indexer_1_tasks[0].index_uid().index_id, "index-b");
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_no_plan() {
+        let indexer_pool = IndexerPool::default();
+        let mut scheduler =
+            IndexingScheduler::new("test-cluster".to_string(), "test-node".into(), indexer_pool);
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-a",
+                "indexer-2",
+                "index-b",
+            )],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        assert!(!response.results[0].success);
+        assert!(response.results[0].reason.contains("no indexing plan"));
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_same_node_rejected() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&["indexer-1".to_string()]);
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 1));
+        plan.add_indexing_task("indexer-1", make_test_task("index-b", "source-1", 2));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-a",
+                "indexer-1",
+                "index-b",
+            )],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        assert!(!response.results[0].success);
+        assert!(response.results[0].reason.contains("same node"));
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_contradiction_same_slot() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+            "indexer-3".to_string(),
+        ]);
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 1));
+        plan.add_indexing_task("indexer-2", make_test_task("index-b", "source-1", 2));
+        plan.add_indexing_task("indexer-3", make_test_task("index-c", "source-1", 3));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+
+        // Both swaps try to move index-a from indexer-1.
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![
+                make_swap_entry("indexer-1", "index-a", "indexer-2", "index-b"),
+                make_swap_entry("indexer-1", "index-a", "indexer-3", "index-c"),
+            ],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        // ALL swaps should be rejected.
+        assert_eq!(response.results.len(), 2);
+        assert!(!response.results[0].success);
+        assert!(!response.results[1].success);
+        assert!(response.results[0].reason.contains("contradictory"));
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_contradiction_does_not_apply_any() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+            "indexer-3".to_string(),
+        ]);
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 1));
+        plan.add_indexing_task("indexer-2", make_test_task("index-b", "source-1", 2));
+        plan.add_indexing_task("indexer-3", make_test_task("index-c", "source-1", 3));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan.clone());
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![
+                make_swap_entry("indexer-1", "index-a", "indexer-2", "index-b"),
+                make_swap_entry("indexer-1", "index-a", "indexer-3", "index-c"),
+            ],
+        };
+        let _response = scheduler.swap_pipelines(request).unwrap();
+
+        // Plan should be completely unchanged.
+        assert_eq!(
+            scheduler.state.last_applied_physical_plan.as_ref().unwrap(),
+            &plan,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_fresh_pipeline_uids() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+        ]);
+        let task_a = make_test_task("index-a", "source-1", 100);
+        let task_b = make_test_task("index-b", "source-1", 200);
+        let original_uid_a = task_a.pipeline_uid;
+        let original_uid_b = task_b.pipeline_uid;
+        plan.add_indexing_task("indexer-1", task_a);
+        plan.add_indexing_task("indexer-2", task_b);
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-a",
+                "indexer-2",
+                "index-b",
+            )],
+        };
+        scheduler.swap_pipelines(request).unwrap();
+
+        let new_plan = scheduler.state.last_applied_physical_plan.as_ref().unwrap();
+        let moved_a = &new_plan.indexer("indexer-2").unwrap()[0];
+        let moved_b = &new_plan.indexer("indexer-1").unwrap()[0];
+        // Pipeline UIDs must be fresh (different from originals).
+        assert_ne!(moved_a.pipeline_uid, original_uid_a);
+        assert_ne!(moved_b.pipeline_uid, original_uid_b);
+        // And different from each other.
+        assert_ne!(moved_a.pipeline_uid, moved_b.pipeline_uid);
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_multiple_sources_same_index() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+        ]);
+        // index-a has 2 sources on indexer-1.
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-kafka", 1));
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-ingest", 2));
+        // index-b has 2 sources on indexer-2.
+        plan.add_indexing_task("indexer-2", make_test_task("index-b", "source-kafka", 3));
+        plan.add_indexing_task("indexer-2", make_test_task("index-b", "source-ingest", 4));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-a",
+                "indexer-2",
+                "index-b",
+            )],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        assert!(response.results[0].success);
+
+        let new_plan = scheduler.state.last_applied_physical_plan.as_ref().unwrap();
+        // Both sources of index-a should now be on indexer-2.
+        let indexer_2_tasks = new_plan.indexer("indexer-2").unwrap();
+        assert_eq!(indexer_2_tasks.len(), 2);
+        assert!(
+            indexer_2_tasks
+                .iter()
+                .all(|t| t.index_uid().index_id == "index-a")
+        );
+        // Both sources of index-b should now be on indexer-1.
+        let indexer_1_tasks = new_plan.indexer("indexer-1").unwrap();
+        assert_eq!(indexer_1_tasks.len(), 2);
+        assert!(
+            indexer_1_tasks
+                .iter()
+                .all(|t| t.index_uid().index_id == "index-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_plan_timestamp_updated() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+        ]);
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 1));
+        plan.add_indexing_task("indexer-2", make_test_task("index-b", "source-1", 2));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+        assert!(scheduler.state.last_applied_plan_timestamp.is_none());
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-a",
+                "indexer-2",
+                "index-b",
+            )],
+        };
+        scheduler.swap_pipelines(request).unwrap();
+
+        // Timestamp should be set (benefits from the 30s grace period).
+        assert!(scheduler.state.last_applied_plan_timestamp.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_preserves_other_tasks() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+        ]);
+        // Tasks being swapped.
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 1));
+        plan.add_indexing_task("indexer-2", make_test_task("index-b", "source-1", 2));
+        // Other tasks that should not be affected.
+        plan.add_indexing_task("indexer-1", make_test_task("index-c", "source-1", 3));
+        plan.add_indexing_task("indexer-2", make_test_task("index-d", "source-1", 4));
+
+        let mut scheduler = build_test_scheduler_with_plan(plan);
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_swap_entry(
+                "indexer-1",
+                "index-a",
+                "indexer-2",
+                "index-b",
+            )],
+        };
+        scheduler.swap_pipelines(request).unwrap();
+
+        let new_plan = scheduler.state.last_applied_physical_plan.as_ref().unwrap();
+        let indexer_1_tasks = new_plan.indexer("indexer-1").unwrap();
+        let indexer_2_tasks = new_plan.indexer("indexer-2").unwrap();
+
+        // indexer-1 should have index-c (unchanged) and index-b (swapped in).
+        assert_eq!(indexer_1_tasks.len(), 2);
+        let indexer_1_index_ids: Vec<&str> = indexer_1_tasks
+            .iter()
+            .map(|t| t.index_uid().index_id.as_str())
+            .collect();
+        assert!(indexer_1_index_ids.contains(&"index-c"));
+        assert!(indexer_1_index_ids.contains(&"index-b"));
+
+        // indexer-2 should have index-d (unchanged) and index-a (swapped in).
+        assert_eq!(indexer_2_tasks.len(), 2);
+        let indexer_2_index_ids: Vec<&str> = indexer_2_tasks
+            .iter()
+            .map(|t| t.index_uid().index_id.as_str())
+            .collect();
+        assert!(indexer_2_index_ids.contains(&"index-d"));
+        assert!(indexer_2_index_ids.contains(&"index-a"));
     }
 
     #[test]
