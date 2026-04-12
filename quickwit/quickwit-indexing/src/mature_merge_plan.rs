@@ -105,8 +105,8 @@ pub fn plan_merge_operations_for_index(
     let mut groups: HashMap<(u64, String, i64), Vec<SplitMetadata>> = HashMap::new();
 
     for split in splits {
-        // Only mature splits.
-        if !split.is_mature(now) {
+        // Only splits that have been mature for a while
+        if !split.is_mature(now - Duration::from_hours(6)) {
             continue;
         }
 

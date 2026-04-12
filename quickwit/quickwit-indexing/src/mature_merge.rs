@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use bytesize::ByteSize;
 use futures::StreamExt;
 use quickwit_actors::{ActorExitStatus, Universe};
 use quickwit_common::io::IoControls;
@@ -116,14 +117,16 @@ async fn fetch_splits_and_plan(
     let splits_stream = metastore.list_splits(list_splits_request).await?;
     let splits = splits_stream.collect_splits_metadata().await?;
 
-    info!(
-        index_id = %index_metadata.index_config.index_id,
-        num_splits = splits.len(),
-        "fetched splits for mature merge planning"
-    );
-
+    let total_splits = splits.len();
     let operations =
         plan_merge_operations_for_index(&index_metadata.index_config, splits, now, config);
+
+    info!(
+        index_id = %index_metadata.index_config.index_id,
+        total_splits,
+        num_planned_merges = operations.len(),
+        "fetched splits for mature merge planning"
+    );
     Ok(operations)
 }
 
@@ -302,13 +305,7 @@ async fn merge_mature_single_index(
 
     if config.dry_run {
         for op in &operations {
-            info!(
-                index_id = %index_id,
-                num_input_splits = op.splits.len(),
-                num_docs = op.splits.iter().map(|s| s.num_docs).sum::<usize>(),
-                input_bytes = op.splits.iter().map(|s| s.footer_offsets.end).sum::<u64>(),
-                "[dry-run] merge operation planned"
-            );
+            log_op_for_dry_run(op, &index_metadata.index_config.index_id);
         }
         return Ok(IndexMergeSummary {
             num_merges_planned,
@@ -369,19 +366,34 @@ async fn merge_mature_single_index(
 
 /// Aggregates per-index results, logs per-index and global summary lines, and warns on errors.
 fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>) {
-    let mut total_planned = 0usize;
+    let mut total_planned_merges = 0usize;
     let mut total_input_splits = 0usize;
     let mut total_input_bytes = 0u64;
-    let mut total_published_merges = 0u64;
-    let mut total_replaced_splits = 0u64;
+    let mut total_successfully_published_merges = 0u64;
+    let mut total_successfully_replaced_splits = 0u64;
+
+    let mut num_indexes_successfully_merged = 0usize;
+    let mut num_indexes_partially_merged = 0usize;
+    let mut num_indexes_without_opportunity = 0usize;
+
     for result in results {
         match result {
             Ok(summary) => {
-                total_planned += summary.num_merges_planned;
+                total_planned_merges += summary.num_merges_planned;
                 total_input_splits += summary.num_input_splits;
                 total_input_bytes += summary.total_input_bytes;
-                total_published_merges += summary.outcome.num_published_merges;
-                total_replaced_splits += summary.outcome.num_replaced_splits;
+                total_successfully_published_merges += summary.outcome.num_published_merges;
+                total_successfully_replaced_splits += summary.outcome.num_replaced_splits;
+
+                if summary.num_merges_planned == 0 {
+                    num_indexes_without_opportunity += 1;
+                } else if summary.outcome.num_published_merges
+                    == (summary.num_merges_planned as u64)
+                {
+                    num_indexes_successfully_merged += 1;
+                } else {
+                    num_indexes_partially_merged += 1;
+                }
             }
             Err(err) => {
                 warn!(err = ?err, "error processing index during mature merge");
@@ -389,12 +401,54 @@ fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>) {
         }
     }
     info!(
-        total_planned,
-        total_published_merges,
-        total_replaced_splits,
+        num_indexes_successfully_merged,
+        num_indexes_partially_merged,
+        num_indexes_without_opportunity,
+        total_planned_merges,
+        total_successfully_published_merges,
+        total_successfully_replaced_splits,
         total_input_splits,
         total_input_bytes,
         "mature merge complete"
+    );
+}
+
+fn log_op_for_dry_run(op: &MergeOperation, index_id: &str) {
+    let start_time = op
+        .splits
+        .iter()
+        .map(|s| s.time_range.as_ref().map(|r| r.start()))
+        .flatten()
+        .min()
+        .unwrap_or(&0);
+    let end_time = op
+        .splits
+        .iter()
+        .map(|s| s.time_range.as_ref().map(|r| r.end()))
+        .flatten()
+        .max()
+        .unwrap_or(&0);
+    let fmt_ts = |ts: i64| {
+        OffsetDateTime::from_unix_timestamp(ts)
+            .map(|dt| {
+                format!(
+                    "{}-{:02}-{:02}T{:02}",
+                    dt.year(),
+                    dt.month() as u8,
+                    dt.day(),
+                    dt.hour()
+                )
+            })
+            .unwrap_or_else(|_| ts.to_string())
+    };
+    // print is better than log because dry-run will be used interactively from the CLI
+    println!(
+        "[dry-run] {index_id}: {} splits | {} docs | {} | {} → {}",
+        op.splits.len(),
+        op.splits.iter().map(|s| s.num_docs).sum::<usize>(),
+        ByteSize(op.splits.iter().map(|s| s.footer_offsets.end).sum::<u64>()),
+        fmt_ts(*start_time),
+        fmt_ts(*end_time),
     );
 }
 

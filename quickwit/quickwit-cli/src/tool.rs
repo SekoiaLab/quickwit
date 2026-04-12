@@ -178,7 +178,7 @@ pub fn build_tool_command() -> Command {
                         "Prints the planned merge operations without executing them.")
                         .required(false),
                     arg!(--"max-concurrent-merges" <MAX_CONCURRENT_MERGES>
-                        "Maximum number of merges to run concurrently (default: 3).")
+                        "Maximum number of merges to run concurrently (default: 10).")
                         .display_order(1)
                         .required(false),
                     arg!(--"retention-safety-buffer-days" <RETENTION_SAFETY_BUFFER_DAYS>
@@ -190,15 +190,15 @@ pub fn build_tool_command() -> Command {
                         .display_order(3)
                         .required(false),
                     arg!(--"input-split-max-num-docs" <INPUT_SPLIT_MAX_NUM_DOCS>
-                        "Maximum number of docs in a split for it to be eligible (default: 10000).")
+                        "Maximum number of docs in a split for it to be eligible (default: 10_000).")
                         .display_order(4)
                         .required(false),
                     arg!(--"max-merge-group-size" <MAX_MERGE_GROUP_SIZE>
-                        "Maximum number of splits per merge operation (default: 50).")
+                        "Maximum number of splits per merge operation (default: 100).")
                         .display_order(5)
                         .required(false),
                     arg!(--"split-target-num-docs" <SPLIT_TARGET_NUM_DOCS>
-                        "Maximum total docs per merge operation (default: 5000000).")
+                        "Maximum total docs per merge operation (default: 5_000_000).")
                         .display_order(6)
                         .required(false),
                     arg!(--"index-parallelism" <INDEX_PARALLELISM>
