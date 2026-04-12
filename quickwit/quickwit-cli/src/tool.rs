@@ -209,6 +209,10 @@ pub fn build_tool_command() -> Command {
                         "Comma-separated list of index ID patterns to include (default: '*').")
                         .display_order(8)
                         .required(false),
+                    arg!(--"metrics"
+                        "Expose Prometheus metrics on the REST listen address during the run.")
+                        .display_order(9)
+                        .required(false),
                 ])
             )
         .arg_required_else_help(true)
@@ -259,6 +263,7 @@ pub struct MergeArgs {
 pub struct MatureMergeArgs {
     pub config_uri: Uri,
     pub merge_config: MatureMergeConfig,
+    pub serve_metrics: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -487,8 +492,10 @@ impl ToolCliCommand {
             .remove_one::<String>("index-id-patterns")
             .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
             .unwrap_or(defaults.index_id_patterns);
+        let serve_metrics = matches.get_flag("metrics");
         Ok(Self::MatureMerge(MatureMergeArgs {
             config_uri,
+            serve_metrics,
             merge_config: MatureMergeConfig {
                 dry_run,
                 max_concurrent_merges,
@@ -784,6 +791,11 @@ pub async fn merge_mature_cli(args: MatureMergeArgs) -> anyhow::Result<()> {
         runtimes_config,
         &HashSet::from_iter([QuickwitService::Indexer]),
     )?;
+
+    if args.serve_metrics {
+        let metrics_addr = config.rest_config.listen_addr;
+        tokio::spawn(serve_metrics(metrics_addr));
+    }
 
     merge_mature_all_indexes(
         metastore,
@@ -1100,4 +1112,49 @@ async fn create_empty_cluster(config: &NodeConfig) -> anyhow::Result<Cluster> {
     .await?;
 
     Ok(cluster)
+}
+
+/// A shortcut to expose the metrics without loading the whole quickwit_serve
+/// machinery.
+async fn serve_metrics(addr: std::net::SocketAddr) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(err) => {
+            tracing::warn!("metrics server could not bind to {addr}: {err}");
+            return;
+        }
+    };
+    tracing::info!("metrics server listening on http://{addr}/metrics");
+    loop {
+        let Ok((mut stream, _peer)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            let is_metrics = request.starts_with("GET /metrics");
+            let (status, body) = if is_metrics {
+                match quickwit_common::metrics::metrics_text_payload() {
+                    Ok(payload) => ("200 OK", payload),
+                    Err(e) => {
+                        tracing::error!("failed to encode prometheus metrics: {e}");
+                        ("500 Internal Server Error", String::new())
+                    }
+                }
+            } else {
+                ("404 Not Found", String::new())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: \
+                 {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+    }
 }
