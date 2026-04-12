@@ -71,6 +71,8 @@ pub struct MatureMergeConfig {
     pub max_concurrent_merges: usize,
     /// Print planned operations without executing them.
     pub dry_run: bool,
+    /// List of index patterns to include in the mature merge process.
+    pub index_id_patterns: Vec<String>,
 }
 
 impl Default for MatureMergeConfig {
@@ -84,6 +86,7 @@ impl Default for MatureMergeConfig {
             index_parallelism: 50,
             max_concurrent_merges: 10,
             dry_run: false,
+            index_id_patterns: vec!["*".to_string()],
         }
     }
 }
@@ -470,7 +473,9 @@ pub async fn merge_mature_all_indexes(
     let now = OffsetDateTime::now_utc();
 
     let indexes_metadata = metastore
-        .list_indexes_metadata(ListIndexesMetadataRequest::all())
+        .list_indexes_metadata(ListIndexesMetadataRequest {
+            index_id_patterns: config.index_id_patterns.clone(),
+        })
         .await
         .context("failed to list indexes")?
         .deserialize_indexes_metadata()
@@ -518,7 +523,9 @@ mod tests {
     use std::sync::Arc;
 
     use quickwit_common::temp_dir::TempDirectory;
-    use quickwit_metastore::{IndexMetadata, IndexMetadataResponseExt, SplitMetadata};
+    use quickwit_metastore::{
+        IndexMetadata, IndexMetadataResponseExt, SplitMaturity, SplitMetadata,
+    };
     use quickwit_proto::metastore::{
         IndexMetadataRequest, ListSplitsRequest, MetastoreService, MetastoreServiceClient,
         MockMetastoreService,
@@ -632,6 +639,7 @@ mod tests {
             .await?;
         assert_eq!(published_after.len(), 1);
         assert_eq!(published_after[0].num_docs, 4);
+        assert_eq!(published_after[0].maturity, SplitMaturity::Mature);
 
         test_sandbox.assert_quit().await;
         Ok(())

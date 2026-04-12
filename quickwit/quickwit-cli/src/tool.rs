@@ -205,6 +205,10 @@ pub fn build_tool_command() -> Command {
                         "Number of indexes processed concurrently (default: 50).")
                         .display_order(7)
                         .required(false),
+                    arg!(--"index-id-patterns" <INDEX_ID_PATTERNS>
+                        "Comma-separated list of index ID patterns to include (default: '*').")
+                        .display_order(8)
+                        .required(false),
                 ])
             )
         .arg_required_else_help(true)
@@ -479,6 +483,10 @@ impl ToolCliCommand {
             .map(|s| s.parse::<usize>())
             .transpose()?
             .unwrap_or(defaults.index_parallelism);
+        let index_id_patterns = matches
+            .remove_one::<String>("index-id-patterns")
+            .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+            .unwrap_or(defaults.index_id_patterns);
         Ok(Self::MatureMerge(MatureMergeArgs {
             config_uri,
             merge_config: MatureMergeConfig {
@@ -490,6 +498,7 @@ impl ToolCliCommand {
                 max_merge_group_size,
                 split_target_num_docs,
                 index_parallelism,
+                index_id_patterns,
             },
         }))
     }
