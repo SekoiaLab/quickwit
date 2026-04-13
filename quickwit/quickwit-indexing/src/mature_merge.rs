@@ -65,7 +65,8 @@ pub struct MatureMergeConfig {
     pub max_merge_group_size: usize,
     /// Maximum total number of documents per merge operation.
     pub split_target_num_docs: usize,
-    /// Number of indexes processed concurrently.
+    /// Number of indexes processed concurrently. Lower to avoid fetching splits
+    /// metadata too eagerly.
     pub index_parallelism: usize,
     /// Maximum number of merges running concurrently across all indexes.
     pub max_concurrent_merges: usize,
@@ -135,6 +136,7 @@ async fn fetch_splits_and_plan(
 
 /// Executes the given merge operations for a single index using the standard actor pipeline:
 /// `MergeSplitDownloader -> MergeExecutor -> Packager -> Uploader -> Publisher`.
+#[allow(clippy::too_many_arguments)]
 async fn run_mature_merges_for_index(
     index_metadata: &IndexMetadata,
     operations: Vec<MergeOperation>,
@@ -286,6 +288,7 @@ async fn run_mature_merges_for_index(
 }
 
 /// Plans and optionally executes mature merges for a single index
+#[allow(clippy::too_many_arguments)]
 async fn merge_mature_single_index(
     index_metadata: IndexMetadata,
     metastore: &MetastoreServiceClient,
@@ -420,15 +423,13 @@ fn log_op_for_dry_run(op: &MergeOperation, index_id: &str) {
     let start_time = op
         .splits
         .iter()
-        .map(|s| s.time_range.as_ref().map(|r| r.start()))
-        .flatten()
+        .filter_map(|s| s.time_range.as_ref().map(|r| r.start()))
         .min()
         .unwrap_or(&0);
     let end_time = op
         .splits
         .iter()
-        .map(|s| s.time_range.as_ref().map(|r| r.end()))
-        .flatten()
+        .filter_map(|s| s.time_range.as_ref().map(|r| r.end()))
         .max()
         .unwrap_or(&0);
     let fmt_ts = |ts: i64| {
@@ -457,10 +458,6 @@ fn log_op_for_dry_run(op: &MergeOperation, index_id: &str) {
 
 /// Processes all indexes from the metastore, discovering and running mature
 /// merge opportunities.
-///
-/// Up to [`INDEX_PARALLELISM`] indexes are processed concurrently. This avoids
-/// fetching split metadata too eagerly. The total merge concurrency is
-/// protected by max_concurrent_merges.
 ///
 /// If `dry_run` is `true`, the planned operations are printed but not executed.
 pub async fn merge_mature_all_indexes(

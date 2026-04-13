@@ -62,18 +62,19 @@ fn plan_operations_for_group(
         return Vec::new();
     }
     // Sort ascending by end time so each sub-operation covers the most compact range.
-    group_splits.sort_by_key(|s| s.time_range.as_ref().map_or(0, |r| *r.end()));
+    group_splits.sort_by_key(|s| s.time_range.as_ref().map(|r| *r.end()).unwrap_or(0));
 
     let n = group_splits.len();
     let total_docs: usize = group_splits.iter().map(|s| s.num_docs).sum();
 
     // Minimum number of balanced operations needed to respect both per-operation limits.
-    let k = ((n + config.max_merge_group_size - 1) / config.max_merge_group_size)
-        .max((total_docs + config.split_target_num_docs - 1) / config.split_target_num_docs)
+    let k = n
+        .div_ceil(config.max_merge_group_size)
+        .max(total_docs.div_ceil(config.split_target_num_docs))
         .max(1);
 
     // Divide into k balanced chunks (first chunks are ≥ last chunks by at most 1 split).
-    let chunk_size = (n + k - 1) / k;
+    let chunk_size = n.div_ceil(k);
     group_splits
         .chunks(chunk_size)
         .filter(|chunk| chunk.len() >= config.min_merge_group_size)
@@ -124,10 +125,10 @@ pub fn plan_merge_operations_for_index(
         }
 
         // Check that we are not too close to the retention cutoff.
-        if let Some(cutoff) = earliest_cutoff_timestamp {
-            if *time_range.end() < cutoff {
-                continue;
-            }
+        if let Some(cutoff) = earliest_cutoff_timestamp
+            && *time_range.end() < cutoff
+        {
+            continue;
         }
 
         let day_bucket = start_day * 86400;
