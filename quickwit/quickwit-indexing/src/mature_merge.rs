@@ -12,15 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Mature merge: merge fully-mature splits across all nodes of an index.
-//!
-//! Unlike the standard `MergePipeline`, this module:
-//! - Considers only *mature* splits (i.e., splits that are past their maturation period).
-//! - Has no node-id restriction — it can merge splits originally created on different nodes.
-//! - Is driven by a simple one-shot batch run, not a reactive actor loop.
-//!
-//! Entry point: [`merge_mature_all_indexes`].
-
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -49,7 +40,7 @@ use crate::actors::{
     MergeExecutor, MergePermit, MergeSplitDownloader, Packager, Publisher, PublisherType, Uploader,
     UploaderType,
 };
-use crate::mature_merge_plan::plan_merge_operations_for_index;
+use crate::mature_merge_plan::{MATURITY_BUFFER, plan_merge_operations_for_index};
 use crate::merge_policy::{MergeOperation, MergeTask, NopMergePolicy};
 use crate::split_store::{IndexingSplitCache, IndexingSplitStore};
 
@@ -106,8 +97,8 @@ struct IndexMergeSummary {
     outcome: IndexMergeOutcome,
 }
 
-/// Fetches all published splits for the given index from the metastore (no node-id filter,
-/// no immature filter) and calls [`plan_merge_operations_for_index`].
+/// Fetches all published splits for the given index from the metastore (no
+/// node-id filter) and calls [`plan_merge_operations_for_index`].
 async fn fetch_splits_and_plan(
     index_metadata: &IndexMetadata,
     metastore: &MetastoreServiceClient,
@@ -115,8 +106,9 @@ async fn fetch_splits_and_plan(
     config: &MatureMergeConfig,
 ) -> anyhow::Result<Vec<MergeOperation>> {
     let index_uid = index_metadata.index_uid.clone();
-    let list_splits_query =
-        ListSplitsQuery::for_index(index_uid).with_split_state(SplitState::Published);
+    let list_splits_query = ListSplitsQuery::for_index(index_uid)
+        .with_split_state(SplitState::Published)
+        .retain_mature(now - MATURITY_BUFFER);
     let list_splits_request = ListSplitsRequest::try_from_list_splits_query(&list_splits_query)?;
     let splits_stream = metastore.list_splits(list_splits_request).await?;
     let splits = splits_stream.collect_splits_metadata().await?;
@@ -297,8 +289,8 @@ async fn merge_mature_single_index(
     data_dir_path: &std::path::Path,
     config: &MatureMergeConfig,
     node_id: NodeId,
-    now: OffsetDateTime,
 ) -> anyhow::Result<IndexMergeSummary> {
+    let now = OffsetDateTime::now_utc();
     let index_id = index_metadata.index_config.index_id.clone();
     let operations = fetch_splits_and_plan(&index_metadata, metastore, now, config).await?;
     let num_merges_planned = operations.len();
@@ -467,8 +459,6 @@ pub async fn merge_mature_all_indexes(
     config: MatureMergeConfig,
     node_id: NodeId,
 ) -> anyhow::Result<()> {
-    let now = OffsetDateTime::now_utc();
-
     let indexes_metadata = metastore
         .list_indexes_metadata(ListIndexesMetadataRequest {
             index_id_patterns: config.index_id_patterns.clone(),
@@ -502,7 +492,6 @@ pub async fn merge_mature_all_indexes(
                     data_dir_path,
                     config_ref,
                     node_id,
-                    now,
                 )
                 .await
             }

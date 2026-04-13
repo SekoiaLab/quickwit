@@ -12,11 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Planning logic for mature-merge: pure, synchronous functions that decide
-//! which splits to merge and how to group them. No I/O, no actors.
-//!
-//! The main entry point is [`plan_merge_operations_for_index`].
-
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -26,6 +21,12 @@ use time::OffsetDateTime;
 
 use crate::mature_merge::MatureMergeConfig;
 use crate::merge_policy::MergeOperation;
+
+pub const SECS_PER_DAY: i64 = 60 * 60 * 24;
+
+/// Wait a couple of hours after the split got mature to be extra sure no merge
+/// process is still running on it.
+pub const MATURITY_BUFFER: Duration = Duration::from_hours(6);
 
 /// Computes the earliest UTC-day midnight (seconds since epoch) that is safe to merge,
 /// given the index's retention policy and the current time.
@@ -43,7 +44,7 @@ fn retention_safety_cutoff_secs(
     }
     let cutoff_raw = now_secs - period.as_secs() as i64 + retention_safety_buffer.as_secs() as i64;
     // Round up to the next day boundary so we never partially exclude a day bucket.
-    Some((cutoff_raw / 86400 + 1) * 86400)
+    Some((cutoff_raw / SECS_PER_DAY + 1) * SECS_PER_DAY)
 }
 
 /// Converts a single day-bucket group of eligible splits into one or more balanced
@@ -53,12 +54,6 @@ fn plan_operations_for_group(
     config: &MatureMergeConfig,
 ) -> Vec<MergeOperation> {
     if group_splits.len() < config.min_merge_group_size {
-        return Vec::new();
-    }
-    if !group_splits
-        .iter()
-        .all(|s| s.num_docs < config.input_split_max_num_docs)
-    {
         return Vec::new();
     }
     // Sort ascending by end time so each sub-operation covers the most compact range.
@@ -92,6 +87,11 @@ fn plan_operations_for_group(
 ///   fall on the same UTC day (i.e., the split does not span midnight).
 /// - Immature splits are excluded.
 /// - Splits whose `time_range.end()` falls within the retention safety buffer are excluded.
+///
+/// Important: This plan merges splits accross sources. It can be problematic if
+/// the IndexingSettings are different (e.g different maturation period), which
+/// was made possible on Kafka sources by specifying an override in the
+/// client_params.
 pub fn plan_merge_operations_for_index(
     index_config: &IndexConfig,
     splits: Vec<SplitMetadata>,
@@ -107,7 +107,12 @@ pub fn plan_merge_operations_for_index(
 
     for split in splits {
         // Only splits that have been mature for a while
-        if !split.is_mature(now - Duration::from_hours(6)) {
+        if !split.is_mature(now - MATURITY_BUFFER) {
+            continue;
+        }
+
+        // Enforce the max size for splits to be considered for merging.
+        if split.num_docs > config.input_split_max_num_docs {
             continue;
         }
 
@@ -116,8 +121,8 @@ pub fn plan_merge_operations_for_index(
             continue;
         };
 
-        let start_day = time_range.start() / 86400;
-        let end_day = time_range.end() / 86400;
+        let start_day = time_range.start() / SECS_PER_DAY;
+        let end_day = time_range.end() / SECS_PER_DAY;
 
         // Both endpoints must fall on the same UTC day.
         if start_day != end_day {
@@ -131,7 +136,7 @@ pub fn plan_merge_operations_for_index(
             continue;
         }
 
-        let day_bucket = start_day * 86400;
+        let day_bucket = start_day * SECS_PER_DAY;
         let key = (
             split.partition_id,
             split.doc_mapping_uid.to_string(),
@@ -161,7 +166,7 @@ mod tests {
     /// Builds a mature [`SplitMetadata`] for use in tests.
     ///
     /// - `day_bucket`: UTC day expressed as seconds-since-epoch (midnight). For example `day_bucket
-    ///   = 0` means 1970-01-01, `day_bucket = 86400` means 1970-01-02.
+    ///   = 0` means 1970-01-01, `day_bucket = SECS_PER_DAY` means 1970-01-02.
     fn mature_split_for_test(
         split_id: &str,
         index_uid: &IndexUid,
@@ -199,11 +204,11 @@ mod tests {
 
     // UTC day 0 = 1970-01-01.  Use a recent-ish day to avoid the retention buffer.
     // We use day 20000 (approx 2024-10) so splits are "recent" relative to a "now" we control.
-    const RECENT_DAY: i64 = 20_000 * 86400;
+    const RECENT_DAY: i64 = 20_000 * SECS_PER_DAY;
 
     fn now_well_after_recent_day() -> OffsetDateTime {
         // 1 day after the splits' day — they are mature but not in a retention buffer.
-        OffsetDateTime::from_unix_timestamp(RECENT_DAY + 86400 + 1).unwrap()
+        OffsetDateTime::from_unix_timestamp(RECENT_DAY + SECS_PER_DAY + 1).unwrap()
     }
 
     #[test]
@@ -238,7 +243,7 @@ mod tests {
     fn test_plan_below_threshold() {
         let index_uid = IndexUid::for_test("test-index", 0);
         let doc_mapping_uid = DocMappingUid::random();
-        // Only 4 splits — below MIN_MERGE_GROUP_SIZE (6).
+        // Only 4 splits — below the min_merge_group_size (5).
         let splits: Vec<SplitMetadata> = (0..4)
             .map(|i| {
                 mature_split_for_test(
@@ -256,7 +261,10 @@ mod tests {
             &index_config_no_retention(),
             splits,
             now_well_after_recent_day(),
-            &MatureMergeConfig::default(),
+            &MatureMergeConfig {
+                min_merge_group_size: 5,
+                ..Default::default()
+            },
         );
 
         assert!(operations.is_empty(), "expected no operations for 4 splits");
@@ -342,7 +350,7 @@ mod tests {
         // Then: cutoff_raw = (RECENT_DAY + 91d) - 90d + 30d = RECENT_DAY + 31d
         //       cutoff = RECENT_DAY + 32d (rounded up to next day boundary)
         // Because RECENT_DAY + 3600 < cutoff, splits should be excluded.
-        let now_ts = RECENT_DAY + 91 * 86400;
+        let now_ts = RECENT_DAY + 91 * SECS_PER_DAY;
         let now = OffsetDateTime::from_unix_timestamp(now_ts).unwrap();
 
         let splits: Vec<SplitMetadata> = (0..10)

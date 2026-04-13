@@ -169,9 +169,8 @@ pub fn build_tool_command() -> Command {
                 .display_order(10)
                 .about("Merges mature splits across all indexes and nodes.")
                 .long_about(
-                    "Scans all indexes for mature Published splits, groups them by day \
-                     and partition, and merges groups with more than 5 small splits. \
-                     Runs once and exits."
+                    "Scans indexes for merge opportunities in mature Published splits. Considers \
+                    opportunities across all origin nodes and sources. Runs once and exits."
                 )
                 .args(&[
                     arg!(--"dry-run"
@@ -493,6 +492,13 @@ impl ToolCliCommand {
             .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
             .unwrap_or(defaults.index_id_patterns);
         let serve_metrics = matches.get_flag("metrics");
+
+        if max_concurrent_merges == 0 {
+            bail!("`max-concurrent-merges` must be greater than or equal to 1.");
+        }
+        if index_parallelism == 0 {
+            bail!("`index-parallelism` must be greater than or equal to 1.");
+        }
         Ok(Self::MatureMerge(MatureMergeArgs {
             config_uri,
             serve_metrics,
