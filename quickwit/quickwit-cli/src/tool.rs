@@ -807,10 +807,15 @@ pub async fn merge_mature_cli(args: MatureMergeArgs) -> anyhow::Result<()> {
         metastore,
         storage_resolver,
         &config.data_dir_path,
-        args.merge_config,
+        args.merge_config.clone(),
         config.node_id,
     )
     .await?;
+
+    if !args.merge_config.dry_run {
+        info!("mature splits successfully merged, waiting for explicit termination signal");
+        tokio::time::sleep(Duration::MAX).await;
+    }
 
     Ok(())
 }

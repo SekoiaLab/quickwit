@@ -136,11 +136,10 @@ pub fn plan_merge_operations_for_index(
             continue;
         }
 
-        let day_bucket = start_day * SECS_PER_DAY;
         let key = (
             split.partition_id,
             split.doc_mapping_uid.to_string(),
-            day_bucket,
+            start_day,
         );
         groups.entry(key).or_default().push(split);
     }
