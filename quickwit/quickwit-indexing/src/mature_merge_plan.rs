@@ -102,8 +102,8 @@ pub fn plan_merge_operations_for_index(
 
     let earliest_cutoff_timestamp = retention_safety_cutoff_secs(index_config, now_secs, config);
 
-    // Key: (partition_id, doc_mapping_uid_string, day_bucket_seconds)
-    let mut groups: HashMap<(u64, String, i64), Vec<SplitMetadata>> = HashMap::new();
+    // Key: (partition_id, doc_mapping_uid_string, day_bucket_seconds, secondary_day_opt)
+    let mut groups: HashMap<(u64, String, i64, Option<i64>), Vec<SplitMetadata>> = HashMap::new();
 
     for split in splits {
         // Only splits that have been mature for a while
@@ -124,6 +124,16 @@ pub fn plan_merge_operations_for_index(
         let start_day = time_range.start() / SECS_PER_DAY;
         let end_day = time_range.end() / SECS_PER_DAY;
 
+        // also group on secondary time range to make sure retention can still be applied
+        let secondary_day_opt = split
+            .secondary_time_range
+            .as_ref()
+            // In the nominal case, the secondary time (ingest time) is only
+            // slightly greater than the primary time (event time). Using
+            // `start()` here decreases the chances of further fragmenting the
+            // group at the day limits.
+            .map(|r| r.start() / SECS_PER_DAY);
+
         // Both endpoints must fall on the same UTC day.
         if start_day != end_day {
             continue;
@@ -140,6 +150,7 @@ pub fn plan_merge_operations_for_index(
             split.partition_id,
             split.doc_mapping_uid.to_string(),
             start_day,
+            secondary_day_opt,
         );
         groups.entry(key).or_default().push(split);
     }
