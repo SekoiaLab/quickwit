@@ -14,13 +14,12 @@
 
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use bytesize::ByteSize;
 use futures::StreamExt;
 use quickwit_actors::{ActorExitStatus, Universe};
 use quickwit_common::io::IoControls;
 use quickwit_common::{KillSwitch, temp_dir};
-use quickwit_config::build_doc_mapper;
 use quickwit_metastore::{
     IndexMetadata, ListIndexesMetadataResponseExt, ListSplitsQuery, ListSplitsRequestExt,
     MetastoreServiceStreamSplitsExt, SplitState,
@@ -113,6 +112,12 @@ async fn fetch_splits_and_plan(
     let splits_stream = metastore.list_splits(list_splits_request).await?;
     let splits = splits_stream.collect_splits_metadata().await?;
 
+    if splits.iter().any(|s| !s.tags.is_empty()) {
+        // with tags and doc mapping evolutions, we might have weird edge cases
+        // -> just refuse them for now
+        bail!("tags not supported in mature merges")
+    }
+
     let total_splits = splits.len();
     let operations =
         plan_merge_operations_for_index(&index_metadata.index_config, splits, now, config);
@@ -126,8 +131,13 @@ async fn fetch_splits_and_plan(
     Ok(operations)
 }
 
-/// Executes the given merge operations for a single index using the standard actor pipeline:
-/// `MergeSplitDownloader -> MergeExecutor -> Packager -> Uploader -> Publisher`.
+/// Executes the given merge operations for a single index using the standard
+/// actor pipeline: `MergeSplitDownloader -> MergeExecutor -> Packager ->
+/// Uploader -> Publisher`.
+///
+/// Tags are not supported and we use the default tokenizer manager. In practice
+/// we could use the tags and custom tokenizers from the current doc mapping,
+/// but schema evolutions could lead to un-anticipated edge cases.
 #[allow(clippy::too_many_arguments)]
 async fn run_mature_merges_for_index(
     index_metadata: &IndexMetadata,
@@ -148,10 +158,6 @@ async fn run_mature_merges_for_index(
 
     let index_config = &index_metadata.index_config;
     let index_uid = index_metadata.index_uid.clone();
-
-    let doc_mapper = build_doc_mapper(&index_config.doc_mapping, &index_config.search_settings)
-        .context("failed to build doc mapper")?;
-    let tag_fields = doc_mapper.tag_named_fields()?;
 
     let indexing_directory = temp_dir::Builder::default()
         .join("mature-merge")
@@ -196,16 +202,19 @@ async fn run_mature_merges_for_index(
         .set_kill_switch(kill_switch.clone())
         .spawn(merge_uploader);
 
+    // Tag fields not supported for now
+    let tag_fields = Vec::new();
     let merge_packager = Packager::new("MaturePackager", tag_fields, merge_uploader_mailbox);
     let (merge_packager_mailbox, merge_packager_handle) = universe
         .spawn_builder()
         .set_kill_switch(kill_switch.clone())
         .spawn(merge_packager);
 
-    let merge_executor = MergeExecutor::new(
+    let merge_executor = MergeExecutor::new_with_tokenizers_only(
         pipeline_id,
         metastore,
-        doc_mapper,
+        // we only support the default tokenizer manager
+        quickwit_query::create_default_quickwit_tokenizer_manager(),
         IoControls::default().set_component("mature_merger"),
         merge_packager_mailbox,
     );
@@ -478,6 +487,15 @@ pub async fn merge_mature_all_indexes(
     let metastore_ref = &metastore;
     let storage_resolver_ref = &storage_resolver;
     let config_ref = &config;
+
+    if indexes_metadata
+        .iter()
+        .any(|m| !m.index_config.doc_mapping.tag_fields.is_empty())
+    {
+        // with tags and doc mapping evolutions, we might have weird edge cases
+        // -> just refuse them for now
+        bail!("tags not supported in mature merges");
+    }
 
     let results: Vec<anyhow::Result<IndexMergeSummary>> = futures::stream::iter(indexes_metadata)
         .map(|index_metadata| {
