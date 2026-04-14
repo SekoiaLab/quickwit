@@ -298,8 +298,8 @@ async fn merge_mature_single_index(
     data_dir_path: &std::path::Path,
     config: &MatureMergeConfig,
     node_id: NodeId,
+    now: OffsetDateTime,
 ) -> anyhow::Result<IndexMergeSummary> {
-    let now = OffsetDateTime::now_utc();
     let index_id = index_metadata.index_config.index_id.clone();
     let operations = fetch_splits_and_plan(&index_metadata, metastore, now, config).await?;
     let num_merges_planned = operations.len();
@@ -502,6 +502,7 @@ pub async fn merge_mature_all_indexes(
             let node_id = node_id.clone();
             let semaphore = Arc::clone(&semaphore);
             async move {
+                let now = OffsetDateTime::now_utc();
                 merge_mature_single_index(
                     index_metadata,
                     metastore_ref,
@@ -510,6 +511,7 @@ pub async fn merge_mature_all_indexes(
                     data_dir_path,
                     config_ref,
                     node_id,
+                    now,
                 )
                 .await
             }
@@ -527,12 +529,14 @@ mod tests {
     use std::sync::Arc;
 
     use quickwit_common::temp_dir::TempDirectory;
+    use quickwit_config::ConfigFormat;
     use quickwit_metastore::{
         IndexMetadata, IndexMetadataResponseExt, SplitMaturity, SplitMetadata,
+        UpdateIndexRequestExt,
     };
     use quickwit_proto::metastore::{
         IndexMetadataRequest, ListSplitsRequest, MetastoreService, MetastoreServiceClient,
-        MockMetastoreService,
+        MockMetastoreService, UpdateIndexRequest,
     };
     use quickwit_proto::types::NodeId;
     use quickwit_storage::RamStorage;
@@ -585,8 +589,7 @@ mod tests {
         let test_sandbox =
             TestSandbox::create("test-index-mature2", doc_mapping_yaml, "", &["body"]).await?;
 
-        // Each add_documents() call runs the full indexing pipeline and produces
-        // exactly one Published split on the underlying RamStorage.
+        // each add_documents() call produces 1 split
         for i in 0..4u64 {
             test_sandbox
                 .add_documents(std::iter::once(
@@ -644,6 +647,196 @@ mod tests {
         assert_eq!(published_after.len(), 1);
         assert_eq!(published_after[0].num_docs, 4);
         assert_eq!(published_after[0].maturity, SplitMaturity::Mature);
+        assert_eq!(
+            published_after[0].time_range,
+            Some(1_631_072_713..=1_631_072_716)
+        );
+
+        test_sandbox.assert_quit().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_mature_single_index_schema_evolution() -> anyhow::Result<()> {
+        let doc_mapping_v1_yaml = r#"
+            field_mappings:
+              - name: ts
+                type: datetime
+                input_formats: [unix_timestamp]
+                fast: true
+              - name: label
+                type: text
+                fast: true
+                tokenizer: lowercase
+            timestamp_field: ts
+        "#;
+        let test_sandbox =
+            TestSandbox::create("test-index-schema-evo", doc_mapping_v1_yaml, "", &["label"])
+                .await?;
+
+        let base_time = 1_631_072_713i64; // Wednesday, September 8, 2021 at 3:45:13 AM UTC
+
+        // create 3 splits with v1 mapping
+        for i in 0..3i64 {
+            test_sandbox
+                .add_documents(std::iter::once(
+                    serde_json::json!({"label": format!("Doc{i}"), "ts": base_time + i}),
+                ))
+                .await?;
+        }
+
+        let metastore = test_sandbox.metastore();
+        let index_uid = test_sandbox.index_uid();
+
+        let v1_splits: Vec<SplitMetadata> = metastore
+            .list_splits(ListSplitsRequest::try_from_index_uid(index_uid.clone()).unwrap())
+            .await?
+            .collect_splits_metadata()
+            .await?;
+        assert_eq!(v1_splits.len(), 3);
+        let v1_doc_mapping_uid = v1_splits[0].doc_mapping_uid;
+
+        // Update the index config: change tokenizer to `default` and add a secondary timestamp.
+        let index_metadata_v1 = metastore
+            .index_metadata(IndexMetadataRequest::for_index_id(
+                index_uid.index_id.to_string(),
+            ))
+            .await?
+            .deserialize_index_metadata()?;
+        let doc_mapping_v2 = ConfigFormat::Yaml.parse(
+            r#"
+            field_mappings:
+              - name: ts
+                type: datetime
+                input_formats: [unix_timestamp]
+                fast: true
+              - name: label
+                type: text
+                fast: true
+                tokenizer: default
+              - name: ts2
+                type: datetime
+                input_formats: [unix_timestamp]
+                fast: true
+            timestamp_field: ts
+            secondary_timestamp_field: ts2
+            "#
+            .as_bytes(),
+        )?;
+        let update_request = UpdateIndexRequest::try_from_updates(
+            index_uid.clone(),
+            &doc_mapping_v2,
+            &index_metadata_v1.index_config.indexing_settings,
+            &index_metadata_v1.index_config.ingest_settings,
+            &index_metadata_v1.index_config.search_settings,
+            &index_metadata_v1.index_config.retention_policy_opt,
+        )?;
+        metastore.update_index(update_request).await?;
+
+        // create 3 more splits with v2 mapping
+        for i in 3..6i64 {
+            test_sandbox
+                .add_documents(std::iter::once(serde_json::json!({
+                    "label": format!("Doc{i}"),
+                    "ts": base_time + i,
+                    "ts2": base_time + i + 1000,
+                })))
+                .await?;
+        }
+
+        let all_splits: Vec<SplitMetadata> = metastore
+            .list_splits(ListSplitsRequest::try_from_index_uid(index_uid.clone()).unwrap())
+            .await?
+            .collect_splits_metadata()
+            .await?;
+        assert_eq!(all_splits.len(), 6);
+        let v2_doc_mapping_uid = all_splits
+            .iter()
+            .find(|s| s.doc_mapping_uid != v1_doc_mapping_uid)
+            .unwrap()
+            .doc_mapping_uid;
+        assert_eq!(
+            all_splits
+                .iter()
+                .filter(|s| s.doc_mapping_uid == v1_doc_mapping_uid)
+                .count(),
+            3
+        );
+        assert_eq!(
+            all_splits
+                .iter()
+                .filter(|s| s.doc_mapping_uid == v2_doc_mapping_uid)
+                .count(),
+            3
+        );
+
+        let index_metadata_v2 = metastore
+            .index_metadata(IndexMetadataRequest::for_index_id(
+                index_uid.index_id.to_string(),
+            ))
+            .await?
+            .deserialize_index_metadata()?;
+        let data_dir = TempDirectory::for_test();
+        let semaphore = Arc::new(Semaphore::new(2));
+        // Splits have the default 48h maturation period. Pass a `now` far enough in the future
+        // so all splits (both v1 and v2) are mature at `now - MATURITY_BUFFER (6h)`.
+        let now = OffsetDateTime::now_utc() + time::Duration::days(3);
+        // Override min_merge_group_size to 2 so that 3-split groups qualify.
+        let config = MatureMergeConfig {
+            min_merge_group_size: 2,
+            ..MatureMergeConfig::default()
+        };
+
+        let summary = merge_mature_single_index(
+            index_metadata_v2,
+            &metastore,
+            &test_sandbox.storage_resolver(),
+            semaphore,
+            data_dir.path(),
+            &config,
+            test_sandbox.node_id(),
+            now,
+        )
+        .await?;
+
+        // Both the v1 and v2 groups (3 splits each, different doc_mapping_uid) get merged.
+        assert_eq!(summary.num_merges_planned, 2);
+        assert_eq!(summary.outcome.num_published_merges, 2);
+        assert_eq!(summary.outcome.num_replaced_splits, 6);
+
+        let published_after: Vec<SplitMetadata> = metastore
+            .list_splits(ListSplitsRequest::try_from_list_splits_query(
+                &ListSplitsQuery::for_index(index_uid).with_split_state(SplitState::Published),
+            )?)
+            .await?
+            .collect_splits_metadata()
+            .await?;
+        assert_eq!(published_after.len(), 2);
+
+        // The merged v1 split preserves the original doc_mapping_uid, time range, and has no
+        // secondary_time_range because the v1 schema had no secondary timestamp field.
+        let merged_v1 = published_after
+            .iter()
+            .find(|s| s.doc_mapping_uid == v1_doc_mapping_uid)
+            .expect("merged v1 split must exist");
+        assert_eq!(merged_v1.num_docs, 3);
+        assert_eq!(merged_v1.maturity, SplitMaturity::Mature);
+        assert_eq!(merged_v1.time_range, Some(base_time..=base_time + 2));
+        assert_eq!(merged_v1.secondary_time_range, None);
+
+        // The merged v2 split has the updated doc_mapping_uid and a secondary_time_range
+        // derived from the ts2 field.
+        let merged_v2 = published_after
+            .iter()
+            .find(|s| s.doc_mapping_uid == v2_doc_mapping_uid)
+            .expect("merged v2 split must exist");
+        assert_eq!(merged_v2.num_docs, 3);
+        assert_eq!(merged_v2.maturity, SplitMaturity::Mature);
+        assert_eq!(merged_v2.time_range, Some(base_time + 3..=base_time + 5));
+        assert_eq!(
+            merged_v2.secondary_time_range,
+            Some(base_time + 1003..=base_time + 1005)
+        );
 
         test_sandbox.assert_quit().await;
         Ok(())
