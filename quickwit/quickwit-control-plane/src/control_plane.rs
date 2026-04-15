@@ -354,7 +354,7 @@ impl ControlPlane {
         let physical_indexing_plan: Vec<JsonValue> = self
             .indexing_scheduler
             .observable_state()
-            .last_applied_physical_plan
+            .current_targetted_physical_plan
             .map(|plan| {
                 plan.indexing_tasks_per_indexer()
                     .iter()
@@ -1921,7 +1921,7 @@ mod tests {
             control_plane_mailbox.ask(Observe).await.unwrap();
         let last_applied_physical_plan = control_plane_obs
             .indexing_scheduler
-            .last_applied_physical_plan
+            .current_targetted_physical_plan
             .unwrap();
         let indexing_tasks = last_applied_physical_plan
             .indexing_tasks_per_indexer()
@@ -1952,7 +1952,7 @@ mod tests {
             control_plane_mailbox.ask(Observe).await.unwrap();
         let last_applied_physical_plan = control_plane_obs
             .indexing_scheduler
-            .last_applied_physical_plan
+            .current_targetted_physical_plan
             .unwrap();
         let indexing_tasks = last_applied_physical_plan
             .indexing_tasks_per_indexer()
