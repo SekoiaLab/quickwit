@@ -21,6 +21,7 @@ use bytes::Bytes;
 use elasticsearch_dsl::search::Hit as ElasticHit;
 use elasticsearch_dsl::{HitsMetadata, ShardStatistics, Source, TotalHits, TotalHitsRelation};
 use futures_util::StreamExt;
+use http::HeaderValue;
 use itertools::Itertools;
 use quickwit_cluster::Cluster;
 use quickwit_common::truncate_str;
@@ -307,7 +308,7 @@ fn build_request_for_es_api(
     index_id_patterns: Vec<String>,
     search_params: SearchQueryParams,
     search_body: SearchBody,
-    user_agent: Option<String>,
+    user_agent: Option<HeaderValue>,
 ) -> Result<(quickwit_proto::search::SearchRequest, bool), ElasticsearchError> {
     let default_operator = search_params.default_operator.unwrap_or(BooleanOperand::Or);
     // The query string, if present, takes priority over what can be in the request
@@ -414,7 +415,7 @@ fn build_request_for_es_api(
             count_hits,
             ignore_missing_indexes,
             split_id: None,
-            user_agent,
+            user_agent: user_agent.and_then(|h| h.to_str().ok().map(str::to_owned)),
         },
         has_doc_id_field,
     ))
@@ -492,7 +493,7 @@ async fn es_compat_index_count(
     index_id_patterns: Vec<String>,
     search_params: SearchQueryParamsCount,
     search_body: SearchBody,
-    user_agent: Option<String>,
+    user_agent: Option<HeaderValue>,
     search_service: Arc<dyn SearchService>,
 ) -> Result<ElasticsearchCountResponse, ElasticsearchError> {
     let mut search_params: SearchQueryParams = search_params.into();
@@ -510,7 +511,7 @@ async fn es_compat_index_search(
     index_id_patterns: Vec<String>,
     search_params: SearchQueryParams,
     search_body: SearchBody,
-    user_agent: Option<String>,
+    user_agent: Option<HeaderValue>,
     search_service: Arc<dyn SearchService>,
 ) -> Result<ElasticsearchResponse, ElasticsearchError> {
     if search_params.scroll.is_some() && !search_params.allow_partial_search_results() {
@@ -814,7 +815,7 @@ fn convert_hit(
 async fn es_compat_index_multi_search(
     payload: Bytes,
     multi_search_params: MultiSearchQueryParams,
-    user_agent: Option<String>,
+    user_agent: Option<HeaderValue>,
     search_service: Arc<dyn SearchService>,
 ) -> Result<MultiSearchResponse, ElasticsearchError> {
     let mut search_requests = Vec::new();

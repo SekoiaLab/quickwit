@@ -15,6 +15,7 @@
 use std::convert::TryFrom;
 use std::sync::Arc;
 
+use http::HeaderValue;
 use percent_encoding::percent_decode_str;
 use quickwit_config::validate_index_id_pattern;
 use quickwit_proto::search::{CountHits, SortField, SortOrder};
@@ -302,24 +303,24 @@ async fn search_endpoint(
 }
 
 fn search_get_filter()
--> impl Filter<Extract = (Vec<String>, SearchRequestQueryString, Option<String>), Error = Rejection>
+-> impl Filter<Extract = (Vec<String>, SearchRequestQueryString, Option<HeaderValue>), Error = Rejection>
 + Clone {
     warp::path!(String / "search")
         .and_then(extract_index_id_patterns)
         .and(warp::get())
         .and(warp::query())
-        .and(warp::header::optional::<String>("user-agent"))
+        .and(warp::header::optional::<HeaderValue>("user-agent"))
 }
 
 fn search_post_filter()
--> impl Filter<Extract = (Vec<String>, SearchRequestQueryString, Option<String>), Error = Rejection>
+-> impl Filter<Extract = (Vec<String>, SearchRequestQueryString, Option<HeaderValue>), Error = Rejection>
 + Clone {
     warp::path!(String / "search")
         .and_then(extract_index_id_patterns)
         .and(warp::post())
         .and(warp::body::content_length_limit(1024 * 1024))
         .and(warp::body::json())
-        .and(warp::header::optional::<String>("user-agent"))
+        .and(warp::header::optional::<HeaderValue>("user-agent"))
 }
 
 fn search_plan_get_filter()
@@ -342,7 +343,7 @@ fn search_plan_post_filter()
 async fn search(
     index_id_patterns: Vec<String>,
     search_request: SearchRequestQueryString,
-    user_agent: Option<String>,
+    user_agent: Option<HeaderValue>,
     search_service: Arc<dyn SearchService>,
 ) -> impl warp::Reply {
     info!(request =? search_request, "search");
@@ -350,7 +351,7 @@ async fn search(
     let result = search_endpoint(
         index_id_patterns,
         search_request,
-        user_agent,
+        user_agent.and_then(|h| h.to_str().ok().map(str::to_owned)),
         &*search_service,
     )
     .await;
