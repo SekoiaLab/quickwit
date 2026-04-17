@@ -467,7 +467,7 @@ impl IndexingScheduler {
         request: SwapIndexingPipelinesRequest,
     ) -> ControlPlaneResult<SwapIndexingPipelinesResponse> {
         // Phase 0: Check that a plan exists.
-        let Some(original_plan) = &self.state.current_targeted_physical_plan else {
+        let Some(original_plan) = &mut self.state.current_targeted_physical_plan else {
             return Ok(SwapIndexingPipelinesResponse {
                 results: request
                     .swaps
@@ -514,11 +514,9 @@ impl IndexingScheduler {
 
         // Phase 3: Apply all valid swaps atomically to a working copy.
         if !valid_operations.is_empty() {
-            let mut new_plan = original_plan.clone();
             for operation in &valid_operations {
-                Self::apply_swap_operation(&mut new_plan, operation);
+                Self::apply_swap_operation(original_plan, operation);
             }
-            self.state.current_targeted_physical_plan = Some(new_plan);
         }
 
         Ok(SwapIndexingPipelinesResponse {
