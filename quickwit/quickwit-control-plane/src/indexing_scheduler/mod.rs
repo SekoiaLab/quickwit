@@ -64,7 +64,7 @@ const MAX_LOAD_PER_PIPELINE: CpuCapacity = CpuCapacity::from_cpu_millis(3_200);
 pub struct IndexingSchedulerState {
     pub num_applied_physical_indexing_plan: usize,
     pub num_schedule_indexing_plan: usize,
-    pub current_targetted_physical_plan: Option<PhysicalIndexingPlan>,
+    pub current_targeted_physical_plan: Option<PhysicalIndexingPlan>,
     #[serde(skip)]
     pub last_applied_plan_timestamp: Option<Instant>,
 }
@@ -348,15 +348,15 @@ impl IndexingScheduler {
         let new_physical_plan = build_physical_indexing_plan(
             &sources,
             &indexer_id_to_cpu_capacities,
-            self.state.current_targetted_physical_plan.as_ref(),
+            self.state.current_targeted_physical_plan.as_ref(),
             &shard_locations,
         );
         let shard_locality_metrics =
             get_shard_locality_metrics(&new_physical_plan, &shard_locations);
         crate::metrics::CONTROL_PLANE_METRICS.set_shard_locality_metrics(shard_locality_metrics);
-        if let Some(last_applied_plan) = &self.state.current_targetted_physical_plan {
+        if let Some(current_targeted_plan) = &self.state.current_targeted_physical_plan {
             let plans_diff = get_indexing_plans_diff(
-                last_applied_plan.indexing_tasks_per_indexer(),
+                current_targeted_plan.indexing_tasks_per_indexer(),
                 new_physical_plan.indexing_tasks_per_indexer(),
             );
             // No need to apply the new plan as it is the same as the old one.
@@ -373,9 +373,9 @@ impl IndexingScheduler {
     /// - If node IDs differ, schedule a new indexing plan.
     /// - If indexing tasks differ, apply again the last plan.
     pub(crate) fn control_running_plan(&mut self, model: &ControlPlaneModel) {
-        let last_applied_plan =
-            if let Some(last_applied_plan) = &self.state.current_targetted_physical_plan {
-                last_applied_plan
+        let current_targeted_plan =
+            if let Some(current_targeted) = &self.state.current_targeted_physical_plan {
+                current_targeted
             } else {
                 // If there is no plan, the node is probably starting and the scheduler did not find
                 // indexers yet. In this case, we want to schedule as soon as possible to find new
@@ -397,7 +397,7 @@ impl IndexingScheduler {
 
         let indexing_plans_diff = get_indexing_plans_diff(
             &running_indexing_tasks_by_node_id,
-            last_applied_plan.indexing_tasks_per_indexer(),
+            current_targeted_plan.indexing_tasks_per_indexer(),
         );
         if !indexing_plans_diff.has_same_nodes() {
             info!(plans_diff=?indexing_plans_diff, "running plan and last applied plan node IDs differ: schedule an indexing plan");
@@ -405,7 +405,7 @@ impl IndexingScheduler {
         } else if !indexing_plans_diff.has_same_tasks() {
             // Some nodes may have not received their tasks, apply it again.
             info!(plans_diff=?indexing_plans_diff, "running tasks and last applied tasks differ: reapply last plan");
-            self.apply_physical_indexing_plan(&indexers, last_applied_plan.clone(), None);
+            self.apply_physical_indexing_plan(&indexers, current_targeted_plan.clone(), None);
         }
     }
 
@@ -453,7 +453,7 @@ impl IndexingScheduler {
         }
         self.state.num_applied_physical_indexing_plan += 1;
         self.state.last_applied_plan_timestamp = Some(Instant::now());
-        self.state.current_targetted_physical_plan = Some(new_physical_plan);
+        self.state.current_targeted_physical_plan = Some(new_physical_plan);
     }
 
     /// Swaps indexing pipelines between indexers as requested.
@@ -467,7 +467,7 @@ impl IndexingScheduler {
         request: SwapIndexingPipelinesRequest,
     ) -> ControlPlaneResult<SwapIndexingPipelinesResponse> {
         // Phase 0: Check that a plan exists.
-        let Some(original_plan) = &self.state.current_targetted_physical_plan else {
+        let Some(original_plan) = &self.state.current_targeted_physical_plan else {
             return Ok(SwapIndexingPipelinesResponse {
                 results: request
                     .swaps
@@ -518,7 +518,7 @@ impl IndexingScheduler {
             for operation in &valid_operations {
                 Self::apply_swap_operation(&mut new_plan, operation);
             }
-            self.state.current_targetted_physical_plan = Some(new_plan);
+            self.state.current_targeted_physical_plan = Some(new_plan);
         }
 
         Ok(SwapIndexingPipelinesResponse {
@@ -866,14 +866,14 @@ fn format_indexing_task_map(
 /// the last plan applied by the scheduler.
 fn get_indexing_plans_diff<'a>(
     running_plan: &'a FnvHashMap<String, Vec<IndexingTask>>,
-    last_applied_plan: &'a FnvHashMap<String, Vec<IndexingTask>>,
+    current_targeted_plan: &'a FnvHashMap<String, Vec<IndexingTask>>,
 ) -> IndexingPlansDiff<'a> {
     // Nodes diff.
     let running_node_ids: FnvHashSet<&str> = running_plan
         .keys()
         .map(|node_id| node_id.as_str())
         .collect();
-    let planned_node_ids: FnvHashSet<&str> = last_applied_plan
+    let planned_node_ids: FnvHashSet<&str> = current_targeted_plan
         .keys()
         .map(|node_id| node_id.as_str())
         .collect();
@@ -894,7 +894,7 @@ fn get_indexing_plans_diff<'a>(
             .get(*node_id)
             .map(Vec::as_slice)
             .unwrap_or_else(|| &[]);
-        let last_applied_tasks = last_applied_plan
+        let last_applied_tasks = current_targeted_plan
             .get(*node_id)
             .map(Vec::as_slice)
             .unwrap_or_else(|| &[]);
@@ -1173,7 +1173,7 @@ mod tests {
         }
         let mut scheduler =
             IndexingScheduler::new("test-cluster".to_string(), "test-node".into(), indexer_pool);
-        scheduler.state.current_targetted_physical_plan = Some(plan);
+        scheduler.state.current_targeted_physical_plan = Some(plan);
         scheduler
     }
 
@@ -1205,7 +1205,7 @@ mod tests {
 
         let new_plan = scheduler
             .state
-            .current_targetted_physical_plan
+            .current_targeted_physical_plan
             .as_ref()
             .unwrap();
         // index-a should now be on indexer-2
@@ -1252,7 +1252,7 @@ mod tests {
         assert_eq!(
             scheduler
                 .state
-                .current_targetted_physical_plan
+                .current_targeted_physical_plan
                 .as_ref()
                 .unwrap(),
             &plan,
@@ -1342,7 +1342,7 @@ mod tests {
         // The first swap should have been applied.
         let new_plan = scheduler
             .state
-            .current_targetted_physical_plan
+            .current_targeted_physical_plan
             .as_ref()
             .unwrap();
         let indexer_1_tasks = new_plan.indexer("indexer-1").unwrap();
@@ -1446,7 +1446,7 @@ mod tests {
         assert_eq!(
             scheduler
                 .state
-                .current_targetted_physical_plan
+                .current_targeted_physical_plan
                 .as_ref()
                 .unwrap(),
             &plan,
@@ -1480,7 +1480,7 @@ mod tests {
 
         let new_plan = scheduler
             .state
-            .current_targetted_physical_plan
+            .current_targeted_physical_plan
             .as_ref()
             .unwrap();
         let moved_a = &new_plan.indexer("indexer-2").unwrap()[0];
@@ -1521,7 +1521,7 @@ mod tests {
 
         let new_plan = scheduler
             .state
-            .current_targetted_physical_plan
+            .current_targeted_physical_plan
             .as_ref()
             .unwrap();
         // Both sources of index-a should now be on indexer-2.
@@ -1569,7 +1569,7 @@ mod tests {
 
         let new_plan = scheduler
             .state
-            .current_targetted_physical_plan
+            .current_targeted_physical_plan
             .as_ref()
             .unwrap();
         let indexer_1_tasks = new_plan.indexer("indexer-1").unwrap();
