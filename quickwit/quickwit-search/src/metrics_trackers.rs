@@ -35,6 +35,7 @@ pub struct SearchPlanMetricsFuture<F> {
     pub tracked: F,
     pub start: Instant,
     pub is_success: Option<bool>,
+    pub user_agent: String,
 }
 
 #[pinned_drop]
@@ -47,7 +48,7 @@ impl<F> PinnedDrop for SearchPlanMetricsFuture<F> {
             None => "plan-cancelled",
         };
 
-        let label_values = [status];
+        let label_values = [normalize_user_agent(&self.user_agent), status];
         SEARCH_METRICS
             .root_search_requests_total
             .with_label_values(label_values)
@@ -85,13 +86,14 @@ pub struct RootSearchMetricsFuture<F> {
     pub start: Instant,
     pub num_targeted_splits: usize,
     pub status: Option<&'static str>,
+    pub user_agent: String,
 }
 
 #[pinned_drop]
 impl<F> PinnedDrop for RootSearchMetricsFuture<F> {
     fn drop(self: Pin<&mut Self>) {
         let status = self.status.unwrap_or("cancelled");
-        let label_values = [status];
+        let label_values = [normalize_user_agent(&self.user_agent), status];
         SEARCH_METRICS
             .root_search_requests_total
             .with_label_values(label_values)
@@ -181,4 +183,40 @@ where F: Future<Output = Result<LeafSearchResponse, SearchError>>
         };
         Poll::Ready(Ok(response?))
     }
+}
+
+/// Simplify the user agent to limit the metric's cardinality.
+pub fn normalize_user_agent(user_agent: &str) -> &str {
+    let ua = user_agent.trim();
+
+    // Browsers always start with "Mozilla/"
+    if ua.starts_with("Mozilla") {
+        return "browser";
+    }
+
+    let lower = ua.to_ascii_lowercase();
+
+    // Well-known CLI / library prefixes (match on the start of the lower-cased
+    // string so version numbers don't matter).
+    const CLI_PREFIXES: &[(&str, &str)] = &[
+        ("curl", "curl"),
+        ("wget", "wget"),
+        ("python-httpx", "python-httpx"),
+        ("python-requests", "python-requests"),
+        ("go-http-client", "go-http-client"),
+        ("java", "java"),
+        ("okhttp", "okhttp"),
+        ("axios", "axios"),
+        ("ruby", "ruby"),
+        ("node-fetch", "node-fetch"),
+        ("node", "node"),
+    ];
+    for (prefix, label) in CLI_PREFIXES {
+        if lower.starts_with(prefix) {
+            return label;
+        }
+    }
+
+    // Keep short service names verbatim; truncate anything exotic.
+    if ua.len() <= 64 { ua } else { "other" }
 }

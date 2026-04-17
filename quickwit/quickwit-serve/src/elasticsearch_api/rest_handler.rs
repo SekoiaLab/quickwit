@@ -307,6 +307,7 @@ fn build_request_for_es_api(
     index_id_patterns: Vec<String>,
     search_params: SearchQueryParams,
     search_body: SearchBody,
+    user_agent: Option<String>,
 ) -> Result<(quickwit_proto::search::SearchRequest, bool), ElasticsearchError> {
     let default_operator = search_params.default_operator.unwrap_or(BooleanOperand::Or);
     // The query string, if present, takes priority over what can be in the request
@@ -413,6 +414,7 @@ fn build_request_for_es_api(
             count_hits,
             ignore_missing_indexes,
             split_id: None,
+            user_agent,
         },
         has_doc_id_field,
     ))
@@ -490,12 +492,13 @@ async fn es_compat_index_count(
     index_id_patterns: Vec<String>,
     search_params: SearchQueryParamsCount,
     search_body: SearchBody,
+    user_agent: Option<String>,
     search_service: Arc<dyn SearchService>,
 ) -> Result<ElasticsearchCountResponse, ElasticsearchError> {
     let mut search_params: SearchQueryParams = search_params.into();
     search_params.track_total_hits = Some(TrackTotalHits::Track(true));
     let (search_request, _append_shard_doc) =
-        build_request_for_es_api(index_id_patterns, search_params, search_body)?;
+        build_request_for_es_api(index_id_patterns, search_params, search_body, user_agent)?;
     let search_response: SearchResponse = search_service.root_search(search_request).await?;
     let search_response_rest: ElasticsearchCountResponse = ElasticsearchCountResponse {
         count: search_response.num_hits,
@@ -507,6 +510,7 @@ async fn es_compat_index_search(
     index_id_patterns: Vec<String>,
     search_params: SearchQueryParams,
     search_body: SearchBody,
+    user_agent: Option<String>,
     search_service: Arc<dyn SearchService>,
 ) -> Result<ElasticsearchResponse, ElasticsearchError> {
     if search_params.scroll.is_some() && !search_params.allow_partial_search_results() {
@@ -520,7 +524,7 @@ async fn es_compat_index_search(
     let start_instant = Instant::now();
     let allow_partial_search_results = search_params.allow_partial_search_results();
     let (search_request, append_shard_doc) =
-        build_request_for_es_api(index_id_patterns, search_params, search_body)?;
+        build_request_for_es_api(index_id_patterns, search_params, search_body, user_agent)?;
     let search_response: SearchResponse = search_service.root_search(search_request).await?;
     let elapsed = start_instant.elapsed();
     let mut search_response_rest: ElasticsearchResponse = convert_to_es_search_response(
@@ -810,6 +814,7 @@ fn convert_hit(
 async fn es_compat_index_multi_search(
     payload: Bytes,
     multi_search_params: MultiSearchQueryParams,
+    user_agent: Option<String>,
     search_service: Arc<dyn SearchService>,
 ) -> Result<MultiSearchResponse, ElasticsearchError> {
     let mut search_requests = Vec::new();
@@ -864,8 +869,12 @@ async fn es_compat_index_multi_search(
         if let Some(extra_filters) = &multi_search_params.extra_filters {
             search_query_params.extra_filters = Some(extra_filters.to_vec());
         }
-        let es_request =
-            build_request_for_es_api(index_ids_patterns, search_query_params, search_body)?;
+        let es_request = build_request_for_es_api(
+            index_ids_patterns,
+            search_query_params,
+            search_body,
+            user_agent.clone(),
+        )?;
         search_requests.push(es_request);
     }
 
