@@ -140,7 +140,7 @@ mod tests {
                 left_node_id: "indexer-1".to_string(),
                 left_index_id: "index-a".to_string(),
                 right_node_id: "indexer-2".to_string(),
-                right_index_id: "index-b".to_string(),
+                right_index_id: Some("index-b".to_string()),
             }],
         })
         .unwrap();
@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(swap.left_node_id, "indexer-1");
         assert_eq!(swap.left_index_id, "index-a");
         assert_eq!(swap.right_node_id, "indexer-2");
-        assert_eq!(swap.right_index_id, "index-b");
+        assert_eq!(swap.right_index_id.as_deref(), Some("index-b"));
     }
 
     #[tokio::test]
@@ -201,13 +201,13 @@ mod tests {
                     left_node_id: "indexer-1".to_string(),
                     left_index_id: "index-a".to_string(),
                     right_node_id: "indexer-2".to_string(),
-                    right_index_id: "index-b".to_string(),
+                    right_index_id: Some("index-b".to_string()),
                 },
                 SwapIndexingPipelinesEntry {
                     left_node_id: "indexer-3".to_string(),
                     left_index_id: "index-c".to_string(),
                     right_node_id: "indexer-4".to_string(),
-                    right_index_id: "index-d".to_string(),
+                    right_index_id: Some("index-d".to_string()),
                 },
             ],
         })
@@ -232,6 +232,48 @@ mod tests {
                 .reason
                 .contains("pipeline count mismatch")
         );
+    }
+
+    #[tokio::test]
+    async fn test_swap_pipelines_handler_move_without_right_index() {
+        let mut mock = MockControlPlaneService::new();
+        mock.expect_swap_indexing_pipelines().returning(|request| {
+            let results = request
+                .swaps
+                .iter()
+                .map(|swap| SwapIndexingPipelinesResult {
+                    swap: Some(swap.clone()),
+                    success: true,
+                    reason: String::new(),
+                })
+                .collect();
+            Ok(SwapIndexingPipelinesResponse { results })
+        });
+        let control_plane_client = ControlPlaneServiceClient::from_mock(mock);
+
+        let handler = swap_pipelines_handler(control_plane_client).recover(recover_fn);
+
+        // Send JSON without right_index_id field — should deserialize to None.
+        let body = r#"{"swaps": [{"left_node_id": "indexer-1", "left_index_id": "index-a", "right_node_id": "indexer-2"}]}"#;
+
+        let resp = warp::test::request()
+            .method("POST")
+            .path("/indexing/swap-pipelines")
+            .header("content-type", "application/json")
+            .body(body)
+            .reply(&handler)
+            .await;
+
+        assert_eq!(resp.status(), 200);
+
+        let response: SwapIndexingPipelinesResponse = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(response.results.len(), 1);
+        assert!(response.results[0].success);
+        let swap = response.results[0].swap.as_ref().unwrap();
+        assert_eq!(swap.left_node_id, "indexer-1");
+        assert_eq!(swap.left_index_id, "index-a");
+        assert_eq!(swap.right_node_id, "indexer-2");
+        assert!(swap.right_index_id.is_none());
     }
 
     #[tokio::test]

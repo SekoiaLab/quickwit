@@ -137,7 +137,7 @@ message SwapIndexingPipelinesEntry {
   string left_node_id = 1;
   string left_index_id = 2;
   string right_node_id = 3;
-  string right_index_id = 4;
+  optional string right_index_id = 4;
 }
 
 message SwapIndexingPipelinesResponse {

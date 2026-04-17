@@ -87,8 +87,8 @@ pub struct SwapIndexingPipelinesEntry {
     pub left_index_id: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub right_node_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub right_index_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub right_index_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, ::prost::Message)]
