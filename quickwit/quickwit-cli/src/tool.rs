@@ -488,7 +488,7 @@ impl ToolCliCommand {
             .unwrap_or(defaults.split_target_num_docs);
         let split_timestamp_days_range = matches
             .remove_one::<String>("split-timestamp-days-range")
-            .map(|s| s.parse::<i64>())
+            .map(|s| s.parse::<u8>())
             .transpose()?
             .unwrap_or(defaults.split_timestamp_days_range);
         let index_parallelism = matches
