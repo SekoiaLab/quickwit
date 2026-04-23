@@ -825,7 +825,11 @@ pub(crate) async fn search_partial_hits_phase(
     }
 
     if !leaf_search_response.failed_splits.is_empty() {
-        quickwit_common::rate_limited_error!(limit_per_min=6, failed_splits = ?leaf_search_response.failed_splits, "leaf search response contains at least one failed split");
+        quickwit_common::rate_limited_error!(
+            limit_per_min = 6,
+            failed_splits = ?PrettySample::new(&leaf_search_response.failed_splits, 5),
+            "leaf search response contains at least one failed split"
+        );
     }
 
     Ok(leaf_search_response)
