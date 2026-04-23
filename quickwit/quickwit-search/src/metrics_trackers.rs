@@ -198,23 +198,21 @@ pub fn normalize_user_agent(user_agent: &str) -> &str {
 
     // Well-known CLI / library prefixes (match on the start of the lower-cased
     // string so version numbers don't matter).
-    const CLI_PREFIXES: &[(&str, &str)] = &[
-        ("curl", "curl"),
-        ("wget", "wget"),
-        ("python-httpx", "python-httpx"),
-        ("python-requests", "python-requests"),
-        ("go-http-client", "go-http-client"),
-        ("java", "java"),
-        ("okhttp", "okhttp"),
-        ("axios", "axios"),
-        ("ruby", "ruby"),
-        ("node-fetch", "node-fetch"),
-        ("node", "node"),
+    const CLI_PREFIXES: &[&str] = &[
+        "curl",
+        "wget",
+        "python-httpx",
+        "python-requests",
+        "go-http-client",
+        "java",
+        "okhttp",
+        "axios",
+        "ruby",
+        "node-fetch",
+        "node",
     ];
-    for (prefix, label) in CLI_PREFIXES {
-        if lower.starts_with(prefix) {
-            return label;
-        }
+    if let Some(&prefix) = CLI_PREFIXES.iter().find(|p| lower.starts_with(*p)) {
+        return prefix;
     }
 
     // Keep short service names verbatim; truncate anything exotic.
