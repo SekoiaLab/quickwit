@@ -19,18 +19,18 @@ use hyper_util::rt::TokioExecutor;
 use quickwit_config::service::QuickwitService;
 use quickwit_serve::SearchRequestQueryString;
 
-use crate::test_utils::ClusterSandboxBuilder;
+use crate::test_utils::{ClusterSandboxBuilder, STANDALONE_NODE_NAME};
 
 #[tokio::test]
 async fn test_ui_redirect_on_get() {
     quickwit_common::setup_logging_for_tests();
     let sandbox = ClusterSandboxBuilder::build_and_start_standalone().await;
-    let node_config = sandbox.node_configs.first().unwrap();
+    let node_config = sandbox.node_configs().next().unwrap();
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(30))
         .http2_only(true)
         .build_http();
-    let root_uri = format!("http://{}/", node_config.0.rest_config.listen_addr)
+    let root_uri = format!("http://{}/", node_config.rest_config.listen_addr)
         .parse::<hyper::Uri>()
         .unwrap();
     let response = client.get(root_uri.clone()).await.unwrap();
@@ -52,7 +52,7 @@ async fn test_standalone_server() {
     {
         // The indexing service should be running.
         let counters = sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client(STANDALONE_NODE_NAME)
             .node_stats()
             .indexing()
             .await
@@ -63,7 +63,7 @@ async fn test_standalone_server() {
     {
         // Create an dynamic index.
         sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client(STANDALONE_NODE_NAME)
             .indexes()
             .create(
                 r#"
@@ -83,7 +83,7 @@ async fn test_standalone_server() {
         // Index should be searchable
         assert_eq!(
             sandbox
-                .rest_client(QuickwitService::Indexer)
+                .rest_client(STANDALONE_NODE_NAME)
                 .search(
                     "my-new-index",
                     SearchRequestQueryString {
@@ -97,7 +97,10 @@ async fn test_standalone_server() {
                 .num_hits,
             0
         );
-        sandbox.wait_for_indexing_pipelines(1).await.unwrap();
+        sandbox
+            .wait_for_indexing_pipelines(STANDALONE_NODE_NAME, 1)
+            .await
+            .unwrap();
     }
     sandbox.shutdown().await.unwrap();
 }
@@ -106,16 +109,16 @@ async fn test_standalone_server() {
 async fn test_multi_nodes_cluster() {
     quickwit_common::setup_logging_for_tests();
     let sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Searcher])
-        .add_node([QuickwitService::Metastore])
-        .add_node([QuickwitService::Indexer])
-        .add_node([QuickwitService::ControlPlane])
-        .add_node([QuickwitService::Janitor])
+        .add_node("searcher", [QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node("indexer", [QuickwitService::Indexer])
+        .add_node("control-plane", [QuickwitService::ControlPlane])
+        .add_node("janitor", [QuickwitService::Janitor])
         .build_and_start()
         .await;
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .create(
             r#"
@@ -136,7 +139,7 @@ async fn test_multi_nodes_cluster() {
 
     assert!(
         sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client("indexer")
             .node_health()
             .is_live()
             .await
@@ -144,11 +147,14 @@ async fn test_multi_nodes_cluster() {
     );
 
     // Assert that at least 1 indexing pipelines is successfully started
-    sandbox.wait_for_indexing_pipelines(1).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines("indexer", 1)
+        .await
+        .unwrap();
 
     // Check that search is working
     let search_response_empty = sandbox
-        .rest_client(QuickwitService::Searcher)
+        .rest_client("searcher")
         .search(
             "my-new-multi-node-index",
             SearchRequestQueryString {

@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -50,16 +51,23 @@ use tokio::net::TcpListener;
 use tracing::debug;
 
 use super::shutdown::NodeShutdownHandle;
+use crate::test_utils::STANDALONE_NODE_NAME;
 
-pub struct TestNodeConfig {
+struct ClusterNode {
+    node_name: String,
+    config: NodeConfig,
+    shutdown_handle: NodeShutdownHandle,
+}
+
+pub struct SandboxNodeConfig {
+    pub node_name: String,
     pub services: HashSet<QuickwitService>,
     pub enable_otlp: bool,
 }
 
 pub struct ClusterSandboxBuilder {
     temp_dir: TempDir,
-    node_configs: Vec<TestNodeConfig>,
-    use_legacy_ingest: bool,
+    node_configs: Vec<SandboxNodeConfig>,
 }
 
 impl Default for ClusterSandboxBuilder {
@@ -67,14 +75,65 @@ impl Default for ClusterSandboxBuilder {
         Self {
             temp_dir: tempfile::tempdir().unwrap(),
             node_configs: Vec::new(),
-            use_legacy_ingest: false,
         }
     }
 }
 
+struct SandboxCommonConfigs {
+    root_data_dir: PathBuf,
+    metastore_uri: QuickwitUri,
+    default_index_root_uri: QuickwitUri,
+    cluster_id: String,
+}
+
+impl SandboxCommonConfigs {
+    fn new(tmp_dir: &TempDir) -> Self {
+        let unique_ram_dir_name = new_coolid("test-ram-dir");
+        let metastore_uri =
+            QuickwitUri::from_str(&format!("ram:///{}/metastore", unique_ram_dir_name)).unwrap();
+        let default_index_root_uri =
+            QuickwitUri::from_str(&format!("ram:///{}/indexes", unique_ram_dir_name)).unwrap();
+        let cluster_id = new_coolid("test-cluster");
+        Self {
+            root_data_dir: tmp_dir.path().to_path_buf(),
+            metastore_uri,
+            default_index_root_uri,
+            cluster_id,
+        }
+    }
+}
+
+/// Creates a NodeConfig from sandbox configs.
+///
+/// Peer seeds still need to be filled later.
+fn assemble_node_config(
+    common_configs: &SandboxCommonConfigs,
+    test_node_config: SandboxNodeConfig,
+    rest_port: u16,
+    grpc_port: u16,
+) -> NodeConfig {
+    let mut config = NodeConfig::for_test_from_ports(rest_port, grpc_port);
+    config.indexer_config.enable_otlp_endpoint = test_node_config.enable_otlp;
+    config
+        .enabled_services
+        .clone_from(&test_node_config.services);
+    config.jaeger_config.enable_endpoint = true;
+    config.cluster_id.clone_from(&common_configs.cluster_id);
+    config.node_id = NodeId::new(test_node_config.node_name.clone());
+    config.data_dir_path = common_configs.root_data_dir.join(config.node_id.as_str());
+    config.metastore_uri = common_configs.metastore_uri.clone();
+    config.default_index_root_uri = common_configs.default_index_root_uri.clone();
+    config
+}
+
 impl ClusterSandboxBuilder {
-    pub fn add_node(mut self, services: impl IntoIterator<Item = QuickwitService>) -> Self {
-        self.node_configs.push(TestNodeConfig {
+    pub fn add_node(
+        mut self,
+        node_name: impl Into<String>,
+        services: impl IntoIterator<Item = QuickwitService>,
+    ) -> Self {
+        self.node_configs.push(SandboxNodeConfig {
+            node_name: node_name.into(),
             services: HashSet::from_iter(services),
             enable_otlp: false,
         });
@@ -83,63 +142,46 @@ impl ClusterSandboxBuilder {
 
     pub fn add_node_with_otlp(
         mut self,
+        node_name: impl Into<String>,
         services: impl IntoIterator<Item = QuickwitService>,
     ) -> Self {
-        self.node_configs.push(TestNodeConfig {
+        self.node_configs.push(SandboxNodeConfig {
+            node_name: node_name.into(),
             services: HashSet::from_iter(services),
             enable_otlp: true,
         });
         self
     }
 
-    pub fn use_legacy_ingest(mut self) -> Self {
-        self.use_legacy_ingest = true;
-        self
-    }
-
     /// Builds a list of of [`NodeConfig`] from the node definitions added to
     /// builder. For each node, a [`NodeConfig`] is built with the right
     /// parameters such that we will be able to run `quickwit_serve` on them and
-    /// form a Quickwit cluster. For each node, we set:
-    /// - `data_dir_path` defined by `root_data_dir/node_id`.
-    /// - `metastore_uri` defined by `root_data_dir/metastore`.
-    /// - `default_index_root_uri` defined by `root_data_dir/indexes`.
-    /// - `peers` defined by others nodes `gossip_advertise_addr`.
+    /// form a Quickwit cluster.
     pub async fn build_config(self) -> ResolvedClusterConfig {
-        let root_data_dir = self.temp_dir.path().to_path_buf();
-        let cluster_id = new_coolid("test-cluster");
+        let common_configs = SandboxCommonConfigs::new(&self.temp_dir);
         let mut resolved_node_configs = Vec::new();
         let mut peers: Vec<String> = Vec::new();
-        let unique_dir_name = new_coolid("test-dir");
         let tcp_listener_resolver = TestTcpListenerResolver::default();
-        for (node_idx, node_builder) in self.node_configs.iter().enumerate() {
+        for node_builder in self.node_configs {
             let socket: SocketAddr = ([127, 0, 0, 1], 0u16).into();
             let rest_tcp_listener = TcpListener::bind(socket).await.unwrap();
             let grpc_tcp_listener = TcpListener::bind(socket).await.unwrap();
-            let mut config = NodeConfig::for_test_from_ports(
+            let config = assemble_node_config(
+                &common_configs,
+                node_builder,
                 rest_tcp_listener.local_addr().unwrap().port(),
                 grpc_tcp_listener.local_addr().unwrap().port(),
             );
             tcp_listener_resolver.add_listener(rest_tcp_listener).await;
             tcp_listener_resolver.add_listener(grpc_tcp_listener).await;
-            config.indexer_config.enable_otlp_endpoint = node_builder.enable_otlp;
-            config.enabled_services.clone_from(&node_builder.services);
-            config.jaeger_config.enable_endpoint = true;
-            config.cluster_id.clone_from(&cluster_id);
-            config.node_id = NodeId::new(format!("test-node-{node_idx}"));
-            config.data_dir_path = root_data_dir.join(config.node_id.as_str());
-            config.metastore_uri =
-                QuickwitUri::from_str(&format!("ram:///{unique_dir_name}/metastore")).unwrap();
-            config.default_index_root_uri =
-                QuickwitUri::from_str(&format!("ram:///{unique_dir_name}/indexes")).unwrap();
             peers.push(config.gossip_advertise_addr.to_string());
-            resolved_node_configs.push((config, node_builder.services.clone()));
+            resolved_node_configs.push(config);
         }
         for node_config in resolved_node_configs.iter_mut() {
-            node_config.0.peer_seeds = peers
+            node_config.peer_seeds = peers
                 .clone()
                 .into_iter()
-                .filter(|seed| *seed != node_config.0.gossip_advertise_addr.to_string())
+                .filter(|seed| *seed != node_config.gossip_advertise_addr.to_string())
                 .collect_vec();
         }
         ResolvedClusterConfig {
@@ -156,7 +198,7 @@ impl ClusterSandboxBuilder {
 
     pub async fn build_and_start_standalone() -> ClusterSandbox {
         ClusterSandboxBuilder::default()
-            .add_node(QuickwitService::supported_services())
+            .add_node(STANDALONE_NODE_NAME, QuickwitService::supported_services())
             .build_config()
             .await
             .start()
@@ -168,7 +210,7 @@ impl ClusterSandboxBuilder {
 /// been reserved and the configurations have been generated.
 pub struct ResolvedClusterConfig {
     temp_dir: TempDir,
-    pub node_configs: Vec<(NodeConfig, HashSet<QuickwitService>)>,
+    pub node_configs: Vec<NodeConfig>,
     tcp_listener_resolver: TestTcpListenerResolver,
 }
 
@@ -176,17 +218,16 @@ impl ResolvedClusterConfig {
     /// Start a cluster using this config and waits for the nodes to be ready
     pub async fn start(self) -> ClusterSandbox {
         quickwit_cli::install_default_crypto_ring_provider();
-        let mut node_shutdown_handles = Vec::new();
         let runtimes_config = RuntimesConfig::light_for_tests();
         let storage_resolver = StorageResolver::unconfigured();
         let metastore_resolver = MetastoreResolver::unconfigured();
         let cluster_size = self.node_configs.len();
-        for node_config in self.node_configs.iter() {
-            let mut shutdown_handler =
-                NodeShutdownHandle::new(node_config.0.node_id.clone(), node_config.1.clone());
-            let shutdown_signal = shutdown_handler.shutdown_signal();
+        let mut nodes = Vec::with_capacity(self.node_configs.len());
+        for node_config in self.node_configs {
+            let mut shutdown_handle = NodeShutdownHandle::new();
+            let shutdown_signal = shutdown_handle.shutdown_signal();
             let join_handle = tokio::spawn({
-                let node_config = node_config.0.clone();
+                let node_config = node_config.clone();
                 let node_id = node_config.node_id.clone();
                 let services = node_config.enabled_services.clone();
                 let metastore_resolver = metastore_resolver.clone();
@@ -208,14 +249,17 @@ impl ResolvedClusterConfig {
                     Result::<_, anyhow::Error>::Ok(result)
                 }
             });
-            shutdown_handler.set_node_join_handle(join_handle);
-            node_shutdown_handles.push(shutdown_handler);
+            shutdown_handle.set_node_join_handle(join_handle);
+            nodes.push(ClusterNode {
+                node_name: node_config.node_id.as_str().to_string(),
+                config: node_config,
+                shutdown_handle,
+            });
         }
 
         let sandbox = ClusterSandbox {
-            node_configs: self.node_configs,
+            nodes,
             _temp_dir: self.temp_dir,
-            node_shutdown_handles,
         };
         sandbox
             .wait_for_cluster_num_ready_nodes(cluster_size)
@@ -257,18 +301,22 @@ pub(crate) async fn ingest(
 /// A test environment where you can start a Quickwit cluster and use the gRPC
 /// or REST clients to test it.
 pub struct ClusterSandbox {
-    pub node_configs: Vec<(NodeConfig, HashSet<QuickwitService>)>,
+    nodes: Vec<ClusterNode>,
     _temp_dir: TempDir,
-    node_shutdown_handles: Vec<NodeShutdownHandle>,
 }
 
 impl ClusterSandbox {
-    fn find_node_for_service(&self, service: QuickwitService) -> NodeConfig {
-        self.node_configs
+    /// Returns the node configurations (useful for tests that need to access node settings)
+    pub fn node_configs(&self) -> impl Iterator<Item = &NodeConfig> {
+        self.nodes.iter().map(|node| &node.config)
+    }
+
+    pub fn find_node_for_service(&self, service: QuickwitService) -> NodeConfig {
+        self.nodes
             .iter()
-            .find(|config| config.1.contains(&service))
+            .find(|node| node.config.is_service_enabled(service))
             .unwrap_or_else(|| panic!("No {service:?} node"))
-            .0
+            .config
             .clone()
     }
 
@@ -281,8 +329,14 @@ impl ClusterSandbox {
     }
 
     /// Returns a client to one of the nodes that runs the specified service
-    pub fn rest_client(&self, service: QuickwitService) -> QuickwitClient {
-        let node_config = self.find_node_for_service(service);
+    pub fn rest_client(&self, node_name: &str) -> QuickwitClient {
+        let node_config = self
+            .nodes
+            .iter()
+            .find(|node| node.node_name == node_name)
+            .unwrap_or_else(|| panic!("No node named {node_name}"))
+            .config
+            .clone();
 
         let certificate = if let Some(tls_conf) = &node_config.rest_config.tls {
             let cert_bytes = std::fs::read(&tls_conf.ca_path).unwrap();
@@ -296,46 +350,6 @@ impl ClusterSandbox {
             certificate.is_some(),
         ))
         .set_tls_ca(certificate)
-        .build()
-    }
-
-    /// A client configured to ingest documents and return detailed parse failures.
-    pub fn detailed_ingest_client(&self) -> QuickwitClient {
-        let node_config = self.find_node_for_service(QuickwitService::Indexer);
-
-        let certificate = if let Some(tls_conf) = &node_config.rest_config.tls {
-            let cert_bytes = std::fs::read(&tls_conf.ca_path).unwrap();
-            Some(reqwest::tls::Certificate::from_pem(&cert_bytes).unwrap())
-        } else {
-            None
-        };
-
-        QuickwitClientBuilder::new(transport_url(
-            node_config.rest_config.listen_addr,
-            certificate.is_some(),
-        ))
-        .set_tls_ca(certificate)
-        .detailed_response(true)
-        .build()
-    }
-
-    // TODO(#5604)
-    pub fn rest_client_legacy_indexer(&self) -> QuickwitClient {
-        let node_config = self.find_node_for_service(QuickwitService::Indexer);
-
-        let certificate = if let Some(tls_conf) = &node_config.rest_config.tls {
-            let cert_bytes = std::fs::read(&tls_conf.ca_path).unwrap();
-            Some(reqwest::tls::Certificate::from_pem(&cert_bytes).unwrap())
-        } else {
-            None
-        };
-
-        QuickwitClientBuilder::new(transport_url(
-            node_config.rest_config.listen_addr,
-            certificate.is_some(),
-        ))
-        .set_tls_ca(certificate)
-        .use_legacy_ingest(true)
         .build()
     }
 
@@ -355,10 +369,13 @@ impl ClusterSandbox {
         &self,
         expected_num_ready_nodes: usize,
     ) -> anyhow::Result<()> {
+        let metastore_node_id = self
+            .find_node_for_service(QuickwitService::Metastore)
+            .node_id;
         wait_until_predicate(
-            || async move {
+            || async {
                 match self
-                    .rest_client(QuickwitService::Metastore)
+                    .rest_client(metastore_node_id.as_str())
                     .cluster()
                     .snapshot()
                     .await
@@ -388,21 +405,23 @@ impl ClusterSandbox {
         Ok(())
     }
 
-    /// Waits for the needed number of indexing pipeline to start.
-    ///
-    /// WARNING! does not work if multiple indexers are running
+    /// Waits for the needed number of indexing pipeline to start on the given indexer.
     pub async fn wait_for_indexing_pipelines(
         &self,
+        node_name: &str,
         required_pipeline_num: usize,
     ) -> anyhow::Result<()> {
+        let node_config = self
+            .node_configs()
+            .find(|conf| conf.node_id.as_str() == node_name)
+            .unwrap();
+        assert!(
+            node_config.is_service_enabled(QuickwitService::Indexer),
+            "{node_name} is not an indexer"
+        );
         wait_until_predicate(
-            || async move {
-                match self
-                    .rest_client(QuickwitService::Indexer)
-                    .node_stats()
-                    .indexing()
-                    .await
-                {
+            || async {
+                match self.rest_client(node_name).node_stats().indexing().await {
                     Ok(result) => {
                         if result.num_running_pipelines != required_pipeline_num {
                             debug!(
@@ -415,7 +434,7 @@ impl ClusterSandbox {
                         }
                     }
                     Err(err) => {
-                        debug!("wait_for_cluster_num_ready_nodes error {err}");
+                        debug!("wait_for_indexing_pipelines error {err}");
                         false
                     }
                 }
@@ -434,15 +453,18 @@ impl ClusterSandbox {
         split_states_filter: Option<Vec<SplitState>>,
         required_splits_num: usize,
     ) -> anyhow::Result<()> {
+        let metastore_node_id = self
+            .find_node_for_service(QuickwitService::Metastore)
+            .node_id;
         wait_until_predicate(
             || {
                 let splits_query_params = ListSplitsQueryParams {
                     split_states: split_states_filter.clone(),
                     ..Default::default()
                 };
-                async move {
+                async {
                     match self
-                        .rest_client(QuickwitService::Metastore)
+                        .rest_client(metastore_node_id.as_str())
                         .splits(index_id)
                         .list(splits_query_params)
                         .await
@@ -474,17 +496,17 @@ impl ClusterSandbox {
     }
 
     pub async fn local_ingest(&self, index_id: &str, json_data: &[Value]) -> anyhow::Result<()> {
-        let test_conf = self
-            .node_configs
+        let test_node = self
+            .nodes
             .iter()
-            .find(|config| config.1.contains(&QuickwitService::Indexer))
+            .find(|node| node.config.is_service_enabled(QuickwitService::Indexer))
             .ok_or(anyhow::anyhow!("No indexer node found"))?;
         // NodeConfig cannot be serialized, we write our own simplified config
         let mut tmp_config_file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
         // we suffix data_dir with a random slug to save us from multiple local ingestion trying to
         // concurrently do something, and cleanup the directory to start a new ingestion.
-        let data_dir = test_conf
-            .0
+        let data_dir = test_node
+            .config
             .data_dir_path
             .join(rand::random::<u64>().to_string());
         tokio::fs::create_dir(&data_dir).await?;
@@ -494,7 +516,7 @@ impl ClusterSandbox {
                 metastore_uri: {}
                 data_dir: {:?}
                 "#,
-            test_conf.0.metastore_uri, data_dir
+            test_node.config.metastore_uri, data_dir
         );
         tmp_config_file.write_all(node_config.as_bytes())?;
         tmp_config_file.flush()?;
@@ -525,8 +547,11 @@ impl ClusterSandbox {
     }
 
     pub async fn assert_hit_count(&self, index_id: &str, query: &str, expected_num_hits: u64) {
+        let searcher_node_id = self
+            .find_node_for_service(QuickwitService::Searcher)
+            .node_id;
         let search_response = self
-            .rest_client(QuickwitService::Searcher)
+            .rest_client(searcher_node_id.as_str())
             .search(
                 index_id,
                 SearchRequestQueryString {
@@ -547,39 +572,42 @@ impl ClusterSandbox {
         );
     }
 
-    /// Shutdown nodes that only provide the specified services
-    pub async fn shutdown_services(
+    /// Shutdown nodes by name
+    pub async fn shutdown_nodes(
         &mut self,
-        shutdown_services: impl IntoIterator<Item = QuickwitService>,
+        node_names: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<Vec<HashMap<String, ActorExitStatus>>, anyhow::Error> {
         // We need to drop rest clients first because reqwest can hold connections open
         // preventing rest server's graceful shutdown.
         let mut indexer_shutdown_futures = Vec::new();
         let mut other_shutdown_futures = Vec::new();
-        let mut shutdown_nodes = HashMap::new();
+        let mut shutdown_node_info = HashMap::new();
+        let node_names_set: HashSet<String> = node_names
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
         let mut i = 0;
-        let shutdown_services_map = HashSet::from_iter(shutdown_services);
-        while i < self.node_shutdown_handles.len() {
-            let handler_services = &self.node_shutdown_handles[i].node_services;
-            if !handler_services.is_subset(&shutdown_services_map) {
+        while i < self.nodes.len() {
+            let node_name = &self.nodes[i].node_name;
+            if !node_names_set.contains(node_name) {
                 i += 1;
                 continue;
             }
-            let handler_to_shutdown = self.node_shutdown_handles.remove(i);
-            shutdown_nodes.insert(
-                handler_to_shutdown.node_id.clone(),
-                handler_to_shutdown.node_services.clone(),
+            let node_to_shutdown = self.nodes.remove(i);
+            shutdown_node_info.insert(
+                node_to_shutdown.config.node_id.clone(),
+                node_to_shutdown.config.enabled_services.clone(),
             );
-            if handler_to_shutdown
-                .node_services
-                .contains(&QuickwitService::Indexer)
+            if node_to_shutdown
+                .config
+                .is_service_enabled(QuickwitService::Indexer)
             {
-                indexer_shutdown_futures.push(handler_to_shutdown.shutdown());
+                indexer_shutdown_futures.push(node_to_shutdown.shutdown_handle.shutdown());
             } else {
-                other_shutdown_futures.push(handler_to_shutdown.shutdown());
+                other_shutdown_futures.push(node_to_shutdown.shutdown_handle.shutdown());
             }
         }
-        debug!("shutting down {:?}", shutdown_nodes);
+        debug!("shutting down {:?}", shutdown_node_info);
         // We must decommision the indexer nodes first and independently from the other nodes.
         let indexer_shutdown_results = future::join_all(indexer_shutdown_futures).await;
         let other_shutdown_results = future::join_all(other_shutdown_futures).await;
@@ -593,7 +621,7 @@ impl ClusterSandbox {
     pub async fn shutdown(
         mut self,
     ) -> Result<Vec<HashMap<String, ActorExitStatus>>, anyhow::Error> {
-        self.shutdown_services(QuickwitService::supported_services())
-            .await
+        let all_node_names: Vec<String> = self.nodes.iter().map(|n| n.node_name.clone()).collect();
+        self.shutdown_nodes(all_node_names).await
     }
 }

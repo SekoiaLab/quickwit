@@ -26,7 +26,7 @@ use quickwit_indexing::source::sqs_queue::test_helpers as sqs_test_helpers;
 use quickwit_metastore::SplitState;
 use tempfile::NamedTempFile;
 
-use crate::test_utils::ClusterSandboxBuilder;
+use crate::test_utils::{ClusterSandboxBuilder, STANDALONE_NODE_NAME};
 
 fn create_mock_data_file(num_lines: usize) -> (NamedTempFile, Uri) {
     let mut temp_file = tempfile::NamedTempFile::new().unwrap();
@@ -61,7 +61,7 @@ async fn test_sqs_with_duplicates() {
     let queue_url = sqs_test_helpers::create_queue(&sqs_client, "test-single-node-cluster").await;
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config.clone(), ConfigFormat::Yaml, false)
         .await
@@ -85,7 +85,7 @@ async fn test_sqs_with_duplicates() {
     );
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .sources(index_id)
         .create(source_config_input, ConfigFormat::Yaml)
         .await
@@ -133,7 +133,7 @@ async fn test_sqs_with_duplicates() {
     .expect("number of in-flight messages didn't reach 2 within the timeout");
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .delete(index_id, false)
         .await
@@ -164,7 +164,7 @@ async fn test_sqs_garbage_collect() {
     let queue_url = sqs_test_helpers::create_queue(&sqs_client, "test-single-node-cluster").await;
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(index_config.clone(), ConfigFormat::Yaml, false)
         .await
@@ -190,7 +190,7 @@ async fn test_sqs_garbage_collect() {
     );
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .sources(index_id)
         .create(source_config_input, ConfigFormat::Yaml)
         .await
@@ -213,7 +213,7 @@ async fn test_sqs_garbage_collect() {
     wait_until_predicate(
         || async {
             let shard_count = sandbox
-                .rest_client(QuickwitService::Indexer)
+                .rest_client(STANDALONE_NODE_NAME)
                 .sources(index_id)
                 .get_shards(source_id)
                 .await
@@ -229,7 +229,7 @@ async fn test_sqs_garbage_collect() {
     .expect("shards where not pruned within the timeout");
 
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .delete(index_id, false)
         .await
@@ -248,11 +248,11 @@ async fn test_update_source_multi_node_cluster() {
     let queue_url = sqs_test_helpers::create_queue(&sqs_client, "test-update-source-cluster").await;
 
     let sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Searcher])
-        .add_node([QuickwitService::Metastore])
-        .add_node([QuickwitService::Indexer])
-        .add_node([QuickwitService::ControlPlane])
-        .add_node([QuickwitService::Janitor])
+        .add_node("searcher", [QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node("indexer", [QuickwitService::Indexer])
+        .add_node("control-plane", [QuickwitService::ControlPlane])
+        .add_node("janitor", [QuickwitService::Janitor])
         .build_and_start()
         .await;
 
@@ -261,7 +261,7 @@ async fn test_update_source_multi_node_cluster() {
         // The starting time is a bit long for a cluster.
         tokio::time::sleep(Duration::from_secs(3)).await;
         let indexing_service_counters = sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client("indexer")
             .node_stats()
             .indexing()
             .await
@@ -283,14 +283,17 @@ async fn test_update_source_multi_node_cluster() {
         "#
     );
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .create(index_config, ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
     // Wait until indexing pipelines are started
-    sandbox.wait_for_indexing_pipelines(1).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines("indexer", 1)
+        .await
+        .unwrap();
 
     // create an SQS source with 1 pipeline
     let source_id: &str = "test-update-source-cluster";
@@ -312,14 +315,17 @@ async fn test_update_source_multi_node_cluster() {
         "#
     );
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .sources(index_id)
         .create(source_config_input, ConfigFormat::Yaml)
         .await
         .unwrap();
 
     // Wait until the SQS indexing pipeline is also started
-    sandbox.wait_for_indexing_pipelines(2).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines("indexer", 2)
+        .await
+        .unwrap();
 
     // increase the number of pipelines to 3
     let source_config_input = format!(
@@ -340,14 +346,17 @@ async fn test_update_source_multi_node_cluster() {
         "#
     );
     sandbox
-        .rest_client(QuickwitService::Metastore)
+        .rest_client("metastore")
         .sources(index_id)
         .update(source_id, source_config_input, ConfigFormat::Yaml, false)
         .await
         .unwrap();
 
     // Wait until the SQS indexing pipeline is also started
-    sandbox.wait_for_indexing_pipelines(4).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines("indexer", 4)
+        .await
+        .unwrap();
 
     sandbox.shutdown().await.unwrap();
 }

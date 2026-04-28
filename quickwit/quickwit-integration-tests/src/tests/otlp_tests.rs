@@ -47,15 +47,18 @@ fn initialize_tests() {
 async fn test_ingest_traces_with_otlp_grpc_api() {
     initialize_tests();
     let mut sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Searcher])
-        .add_node([QuickwitService::Metastore])
-        .add_node_with_otlp([QuickwitService::Indexer])
-        .add_node([QuickwitService::ControlPlane])
-        .add_node([QuickwitService::Janitor])
+        .add_node("searcher", [QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node_with_otlp("indexer", [QuickwitService::Indexer])
+        .add_node("control-plane", [QuickwitService::ControlPlane])
+        .add_node("janitor", [QuickwitService::Janitor])
         .build_and_start()
         .await;
     // Wait for the pipelines to start (one for logs and one for traces)
-    sandbox.wait_for_indexing_pipelines(2).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines("indexer", 2)
+        .await
+        .unwrap();
 
     fn build_span(span_name: String) -> Vec<ResourceSpans> {
         let scope_spans = vec![ScopeSpans {
@@ -129,10 +132,7 @@ async fn test_ingest_traces_with_otlp_grpc_api() {
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
-    sandbox
-        .shutdown_services([QuickwitService::Indexer])
-        .await
-        .unwrap();
+    sandbox.shutdown_nodes(["indexer"]).await.unwrap();
     sandbox.shutdown().await.unwrap();
 }
 
@@ -140,15 +140,18 @@ async fn test_ingest_traces_with_otlp_grpc_api() {
 async fn test_ingest_logs_with_otlp_grpc_api() {
     initialize_tests();
     let mut sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Searcher])
-        .add_node([QuickwitService::Metastore])
-        .add_node_with_otlp([QuickwitService::Indexer])
-        .add_node([QuickwitService::ControlPlane])
-        .add_node([QuickwitService::Janitor])
+        .add_node("searcher", [QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node_with_otlp("indexer", [QuickwitService::Indexer])
+        .add_node("control-plane", [QuickwitService::ControlPlane])
+        .add_node("janitor", [QuickwitService::Janitor])
         .build_and_start()
         .await;
     // Wait fo the pipelines to start (one for logs and one for traces)
-    sandbox.wait_for_indexing_pipelines(2).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines("indexer", 2)
+        .await
+        .unwrap();
 
     fn build_log(body: String) -> Vec<ResourceLogs> {
         let log_record = LogRecord {
@@ -203,10 +206,7 @@ async fn test_ingest_logs_with_otlp_grpc_api() {
             .await;
     }
 
-    sandbox
-        .shutdown_services([QuickwitService::Indexer])
-        .await
-        .unwrap();
+    sandbox.shutdown_nodes(["indexer"]).await.unwrap();
     sandbox.shutdown().await.unwrap();
 }
 
@@ -214,15 +214,18 @@ async fn test_ingest_logs_with_otlp_grpc_api() {
 async fn test_jaeger_api() {
     initialize_tests();
     let mut sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Searcher])
-        .add_node([QuickwitService::Metastore])
-        .add_node_with_otlp([QuickwitService::Indexer])
-        .add_node([QuickwitService::ControlPlane])
-        .add_node([QuickwitService::Janitor])
+        .add_node("searcher", [QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node_with_otlp("indexer", [QuickwitService::Indexer])
+        .add_node("control-plane", [QuickwitService::ControlPlane])
+        .add_node("janitor", [QuickwitService::Janitor])
         .build_and_start()
         .await;
     // Wait fo the pipelines to start (one for logs and one for traces)
-    sandbox.wait_for_indexing_pipelines(2).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines("indexer", 2)
+        .await
+        .unwrap();
 
     let export_trace_request = ExportTraceServiceRequest {
         resource_spans: make_resource_spans_for_test(),
@@ -238,10 +241,7 @@ async fn test_jaeger_api() {
         .await
         .unwrap();
 
-    sandbox
-        .shutdown_services([QuickwitService::Indexer])
-        .await
-        .unwrap();
+    sandbox.shutdown_nodes(["indexer"]).await.unwrap();
 
     {
         // Test `GetServices`

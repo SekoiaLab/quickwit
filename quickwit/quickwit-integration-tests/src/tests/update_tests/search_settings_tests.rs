@@ -26,11 +26,11 @@ use crate::test_utils::{ClusterSandboxBuilder, ingest};
 async fn test_update_search_settings_on_multi_nodes_cluster() {
     quickwit_common::setup_logging_for_tests();
     let sandbox = ClusterSandboxBuilder::default()
-        .add_node([QuickwitService::Searcher])
-        .add_node([QuickwitService::Metastore])
-        .add_node([QuickwitService::Indexer])
-        .add_node([QuickwitService::ControlPlane])
-        .add_node([QuickwitService::Janitor])
+        .add_node("searcher", [QuickwitService::Searcher])
+        .add_node("metastore", [QuickwitService::Metastore])
+        .add_node("indexer", [QuickwitService::Indexer])
+        .add_node("control-plane", [QuickwitService::ControlPlane])
+        .add_node("janitor", [QuickwitService::Janitor])
         .build_and_start()
         .await;
 
@@ -39,7 +39,7 @@ async fn test_update_search_settings_on_multi_nodes_cluster() {
         // The starting time is a bit long for a cluster.
         tokio::time::sleep(Duration::from_secs(3)).await;
         let indexing_service_counters = sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client("indexer")
             .node_stats()
             .indexing()
             .await
@@ -49,7 +49,7 @@ async fn test_update_search_settings_on_multi_nodes_cluster() {
 
     // Create an index
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .create(
             r#"
@@ -73,7 +73,7 @@ async fn test_update_search_settings_on_multi_nodes_cluster() {
         .unwrap();
     assert!(
         sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client("indexer")
             .node_health()
             .is_live()
             .await
@@ -81,10 +81,13 @@ async fn test_update_search_settings_on_multi_nodes_cluster() {
     );
 
     // Wait until indexing pipelines are started
-    sandbox.wait_for_indexing_pipelines(1).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines("indexer", 1)
+        .await
+        .unwrap();
 
     ingest(
-        &sandbox.rest_client(QuickwitService::Indexer),
+        &sandbox.rest_client("indexer"),
         "my-updatable-index",
         ingest_json!({"title": "first", "body": "first record"}),
         CommitType::Auto,
@@ -101,7 +104,7 @@ async fn test_update_search_settings_on_multi_nodes_cluster() {
     // Update the index to also search `body` by default, the same search should
     // now have 1 hit
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client("indexer")
         .indexes()
         .update(
             "my-updatable-index",

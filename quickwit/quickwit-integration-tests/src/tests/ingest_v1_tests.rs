@@ -15,7 +15,7 @@
 use quickwit_config::ConfigFormat;
 use quickwit_config::service::QuickwitService;
 use quickwit_metastore::SplitState;
-use quickwit_rest_client::rest_client::CommitType;
+use quickwit_rest_client::rest_client::{CommitType, QuickwitClientBuilder};
 use serde_json::json;
 
 use crate::ingest_json;
@@ -27,14 +27,16 @@ use crate::test_utils::{ClusterSandboxBuilder, ingest};
 #[tokio::test]
 async fn test_ingest_v1_happy_path() {
     let sandbox = ClusterSandboxBuilder::default()
-        .use_legacy_ingest()
-        .add_node([QuickwitService::Indexer])
-        .add_node([QuickwitService::Searcher])
-        .add_node([
-            QuickwitService::ControlPlane,
-            QuickwitService::Janitor,
-            QuickwitService::Metastore,
-        ])
+        .add_node("indexer", [QuickwitService::Indexer])
+        .add_node("searcher", [QuickwitService::Searcher])
+        .add_node(
+            "other",
+            [
+                QuickwitService::ControlPlane,
+                QuickwitService::Janitor,
+                QuickwitService::Metastore,
+            ],
+        )
         .build_and_start()
         .await;
 
@@ -51,7 +53,18 @@ async fn test_ingest_v1_happy_path() {
             commit_timeout_secs: 1
         "#
     );
-    let indexer_client = sandbox.rest_client_legacy_indexer();
+    let indexer_node_config = sandbox
+        .node_configs()
+        .find(|cfg| cfg.node_id.as_str() == "indexer")
+        .unwrap();
+    let url = reqwest::Url::parse(&format!(
+        "http://{}",
+        indexer_node_config.rest_config.listen_addr
+    ))
+    .unwrap();
+    let indexer_client = QuickwitClientBuilder::new(url)
+        .use_legacy_ingest(true)
+        .build();
     indexer_client
         .indexes()
         .create(index_config, ConfigFormat::Yaml, false)

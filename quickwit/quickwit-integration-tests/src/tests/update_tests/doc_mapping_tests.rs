@@ -15,13 +15,12 @@
 use std::fmt::Write;
 use std::time::Duration;
 
-use quickwit_config::service::QuickwitService;
 use quickwit_rest_client::models::IngestSource;
 use quickwit_rest_client::rest_client::CommitType;
 use serde_json::{Value, json};
 
 use super::assert_hits_unordered;
-use crate::test_utils::ClusterSandboxBuilder;
+use crate::test_utils::{ClusterSandboxBuilder, STANDALONE_NODE_NAME};
 
 /// Update the doc mapping between 2 calls to local-ingest (forces separate indexing pipelines) and
 /// assert the number of hits for the given query
@@ -40,7 +39,7 @@ async fn validate_search_across_doc_mapping_updates(
         // The starting time is a bit long for a cluster.
         tokio::time::sleep(Duration::from_secs(3)).await;
         let indexing_service_counters = sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client(STANDALONE_NODE_NAME)
             .node_stats()
             .indexing()
             .await
@@ -50,7 +49,7 @@ async fn validate_search_across_doc_mapping_updates(
 
     // Create index
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(
             json!({
@@ -70,7 +69,7 @@ async fn validate_search_across_doc_mapping_updates(
 
     assert!(
         sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client(STANDALONE_NODE_NAME)
             .node_health()
             .is_live()
             .await
@@ -78,7 +77,10 @@ async fn validate_search_across_doc_mapping_updates(
     );
 
     // Wait until indexing pipelines are started.
-    sandbox.wait_for_indexing_pipelines(1).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines(STANDALONE_NODE_NAME, 1)
+        .await
+        .unwrap();
 
     // We use local ingest to always pick up the latest doc mapping
     sandbox
@@ -88,7 +90,7 @@ async fn validate_search_across_doc_mapping_updates(
 
     // Update index to also search "body" by default, search should now have 1 hit
     sandbox
-        .rest_client(QuickwitService::Searcher)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .update(
             index_id,
@@ -591,23 +593,14 @@ async fn test_update_doc_mapping_add_field_on_strict() {
 async fn test_update_doc_validation() {
     quickwit_common::setup_logging_for_tests();
     let index_id = "update-doc-validation";
-    let sandbox = ClusterSandboxBuilder::default()
-        .add_node([
-            QuickwitService::Searcher,
-            QuickwitService::Metastore,
-            QuickwitService::Indexer,
-            QuickwitService::ControlPlane,
-            QuickwitService::Janitor,
-        ])
-        .build_and_start()
-        .await;
+    let sandbox = ClusterSandboxBuilder::build_and_start_standalone().await;
 
     {
         // Wait for indexer to fully start.
         // The starting time is a bit long for a cluster.
         tokio::time::sleep(Duration::from_secs(3)).await;
         let indexing_service_counters = sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client(STANDALONE_NODE_NAME)
             .node_stats()
             .indexing()
             .await
@@ -617,7 +610,7 @@ async fn test_update_doc_validation() {
 
     // Create index
     sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .create(
             json!({
@@ -641,7 +634,7 @@ async fn test_update_doc_validation() {
 
     assert!(
         sandbox
-            .rest_client(QuickwitService::Indexer)
+            .rest_client(STANDALONE_NODE_NAME)
             .node_health()
             .is_live()
             .await
@@ -649,7 +642,10 @@ async fn test_update_doc_validation() {
     );
 
     // Wait until indexing pipelines are started.
-    sandbox.wait_for_indexing_pipelines(1).await.unwrap();
+    sandbox
+        .wait_for_indexing_pipelines(STANDALONE_NODE_NAME, 1)
+        .await
+        .unwrap();
 
     let unsigned_payload = (0..20).fold(String::new(), |mut buffer, id| {
         writeln!(&mut buffer, "{{\"body\": {id}}}").unwrap();
@@ -657,7 +653,7 @@ async fn test_update_doc_validation() {
     });
 
     let unsigned_response = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .ingest(
             index_id,
             IngestSource::Str(unsigned_payload.clone()),
@@ -671,7 +667,7 @@ async fn test_update_doc_validation() {
     assert_eq!(unsigned_response.num_rejected_docs.unwrap(), 0);
 
     sandbox
-        .rest_client(QuickwitService::Searcher)
+        .rest_client(STANDALONE_NODE_NAME)
         .indexes()
         .update(
             index_id,
@@ -700,7 +696,7 @@ async fn test_update_doc_validation() {
     });
 
     let signed_response = sandbox
-        .rest_client(QuickwitService::Indexer)
+        .rest_client(STANDALONE_NODE_NAME)
         .ingest(
             index_id,
             IngestSource::Str(signed_payload.clone()),
