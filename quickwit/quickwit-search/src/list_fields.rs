@@ -437,11 +437,16 @@ pub async fn root_list_fields(
         .map(|split_metadata| {
             let index_uri = &index_uid_to_index_meta
                 .get(&split_metadata.index_uid)
-                .expect("index not found in metadata map")
+                .ok_or_else(|| {
+                    SearchError::Internal(format!(
+                        "index {} not found in metadata map",
+                        split_metadata.index_uid
+                    ))
+                })?
                 .index_uri;
-            SearchJob::from_split_metadata(split_metadata, index_uri)
+            Ok(SearchJob::from_split_metadata(split_metadata, index_uri))
         })
-        .collect();
+        .collect::<crate::Result<Vec<_>>>()?;
     let assigned_leaf_search_jobs = cluster_client
         .search_job_placer
         .assign_jobs(jobs, &HashSet::default())

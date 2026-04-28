@@ -134,10 +134,9 @@ impl IndexingSplitStore {
         split_folder_path: &Path,
         put_payload: Box<dyn PutPayload>,
     ) -> anyhow::Result<()> {
-        let target_uri = split
-            .storage_uri
-            .as_ref()
-            .expect("storage_uri must be set before upload");
+        let target_uri = split.storage_uri.as_ref().with_context(|| {
+            format!("split {} doesn't have a storage_uri set", split.split_id())
+        })?;
         let storage = self
             .inner
             .storages

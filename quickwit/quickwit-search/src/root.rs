@@ -775,11 +775,16 @@ pub(crate) async fn search_partial_hits_phase(
                 .map(|split_metadata| {
                     let index_uri = &indexes_metas_for_leaf_search
                         .get(&split_metadata.index_uid)
-                        .expect("index not found in metadata map")
+                        .ok_or_else(|| {
+                            SearchError::Internal(format!(
+                                "index {} not found in metadata map",
+                                split_metadata.index_uid
+                            ))
+                        })?
                         .index_uri;
-                    SearchJob::from_split_metadata(split_metadata, index_uri)
+                    Ok(SearchJob::from_split_metadata(split_metadata, index_uri))
                 })
-                .collect();
+                .collect::<crate::Result<Vec<_>>>()?;
             let assigned_leaf_search_jobs = cluster_client
                 .search_job_placer
                 .assign_jobs(jobs, &HashSet::default())
@@ -1695,18 +1700,23 @@ async fn assign_client_fetch_docs_jobs(
         .map(|metadata| {
             let index_uri = &indexes_metas_for_leaf_search
                 .get(&metadata.index_uid)
-                .expect("index not found in metadata map")
+                .ok_or_else(|| {
+                    SearchError::Internal(format!(
+                        "index {} not found in metadata map",
+                        metadata.index_uid
+                    ))
+                })?
                 .index_uri;
-            (
+            Ok((
                 metadata.split_id().to_string(),
                 (
                     metadata.index_uid.clone(),
                     metadata.effective_storage_uri(index_uri).clone(),
                     extract_split_and_footer_offsets(metadata),
                 ),
-            )
+            ))
         })
-        .collect();
+        .collect::<crate::Result<HashMap<_, _>>>()?;
 
     // Group the partial hits per split
     let mut partial_hits_map: HashMap<String, Vec<PartialHit>> = HashMap::new();

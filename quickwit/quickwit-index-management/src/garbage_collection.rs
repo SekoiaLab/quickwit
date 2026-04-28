@@ -66,7 +66,7 @@ impl RecordGcMetrics for Option<GcMetrics> {
 #[error("failed to delete splits from storage and/or metastore")]
 pub struct DeleteSplitsError {
     successes: Vec<SplitInfo>,
-    storage_error: Option<BulkDeleteError>,
+    storage_errors: Vec<BulkDeleteError>,
     storage_failures: Vec<SplitInfo>,
     metastore_error: Option<MetastoreError>,
     metastore_failures: Vec<SplitInfo>,
@@ -443,7 +443,7 @@ pub async fn delete_splits_from_storage_and_metastore(
     let total_split_count: usize = splits_by_uri.values().map(|v| v.len()).sum();
     let mut all_successes: Vec<SplitInfo> = Vec::with_capacity(total_split_count);
     let mut all_storage_failures: Vec<SplitInfo> = Vec::new();
-    let mut combined_storage_error: Option<BulkDeleteError> = None;
+    let mut combined_storage_errors: Vec<BulkDeleteError> = Vec::new();
 
     for (uri, group_splits) in splits_by_uri {
         // Resolve the storage for this group of splits.
@@ -492,14 +492,15 @@ pub async fn delete_splits_from_storage_and_metastore(
             Err(bulk_delete_error) => {
                 let success_split_paths: HashSet<&PathBuf> =
                     bulk_delete_error.successes.iter().collect();
+                let mut current_uri_failures: Vec<SplitInfo> = Vec::new();
                 for (split_path, split_info) in split_infos {
                     if success_split_paths.contains(&split_path) {
                         all_successes.push(split_info);
                     } else {
-                        all_storage_failures.push(split_info);
+                        current_uri_failures.push(split_info);
                     }
                 }
-                let failed_split_paths = all_storage_failures
+                let failed_split_paths = current_uri_failures
                     .iter()
                     .map(|split_info| split_info.file_name.as_path())
                     .collect::<Vec<_>>();
@@ -510,7 +511,8 @@ pub async fn delete_splits_from_storage_and_metastore(
                     "failed to delete split file(s) {:?} from storage",
                     PrettySample::new(&failed_split_paths, 5),
                 );
-                combined_storage_error = Some(bulk_delete_error);
+                all_storage_failures.extend(current_uri_failures);
+                combined_storage_errors.push(bulk_delete_error);
             }
         }
     }
@@ -537,7 +539,7 @@ pub async fn delete_splits_from_storage_and_metastore(
             );
             let delete_splits_error = DeleteSplitsError {
                 successes: Vec::new(),
-                storage_error: combined_storage_error,
+                storage_errors: combined_storage_errors,
                 storage_failures: all_storage_failures,
                 metastore_error: Some(metastore_error),
                 metastore_failures: all_successes,
@@ -548,7 +550,7 @@ pub async fn delete_splits_from_storage_and_metastore(
     if !all_storage_failures.is_empty() {
         let delete_splits_error = DeleteSplitsError {
             successes: all_successes,
-            storage_error: combined_storage_error,
+            storage_errors: combined_storage_errors,
             storage_failures: all_storage_failures,
             metastore_error: None,
             metastore_failures: Vec::new(),

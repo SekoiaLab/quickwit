@@ -157,6 +157,15 @@ impl IndexConfigForSerialization {
                 index_config.index_uri,
             );
         }
+        // Validate that extra_index_uris doesn't contain duplicates.
+        let mut seen = std::collections::HashSet::new();
+        for extra_uri in &index_config.extra_index_uris {
+            ensure!(
+                seen.insert(extra_uri),
+                "`extra_index_uris` contains duplicate URI ({})",
+                extra_uri,
+            );
+        }
         Ok(index_config)
     }
 }
@@ -532,6 +541,83 @@ mod test {
             format!("{err:?}").contains("`extra_index_uris` cannot have URIs removed"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn test_extra_index_uris_no_duplicates() {
+        let default_root = Uri::for_test("s3://mybucket");
+
+        // Duplicate URIs should be rejected.
+        let config_yaml = r#"
+            version: 0.8
+            index_id: hdfs-logs
+            doc_mapping: {}
+            extra_index_uris:
+                - s3://bucket-a/hdfs-logs
+                - s3://bucket-a/hdfs-logs
+        "#;
+        let err = load_index_config_from_user_config(
+            ConfigFormat::Yaml,
+            config_yaml.as_bytes(),
+            &default_root,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("`extra_index_uris` contains duplicate URI"),
+            "unexpected error: {err:?}"
+        );
+
+        // Duplicate URIs should also be rejected on update.
+        let original_config_yaml = r#"
+            version: 0.8
+            index_id: hdfs-logs
+            doc_mapping: {}
+            extra_index_uris:
+                - s3://bucket-a/hdfs-logs
+        "#;
+        let original_config: IndexConfig = load_index_config_from_user_config(
+            ConfigFormat::Yaml,
+            original_config_yaml.as_bytes(),
+            &default_root,
+        )
+        .unwrap();
+
+        let updated_config_yaml = r#"
+            version: 0.8
+            index_id: hdfs-logs
+            doc_mapping: {}
+            extra_index_uris:
+                - s3://bucket-a/hdfs-logs
+                - s3://bucket-b/hdfs-logs
+                - s3://bucket-b/hdfs-logs
+        "#;
+        let err = load_index_config_update(
+            ConfigFormat::Yaml,
+            updated_config_yaml.as_bytes(),
+            &default_root,
+            &original_config,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("`extra_index_uris` contains duplicate URI"),
+            "unexpected error: {err:?}"
+        );
+
+        // Distinct URIs should be accepted.
+        let config_yaml = r#"
+            version: 0.8
+            index_id: hdfs-logs
+            doc_mapping: {}
+            extra_index_uris:
+                - s3://bucket-a/hdfs-logs
+                - s3://bucket-b/hdfs-logs
+        "#;
+        load_index_config_from_user_config(
+            ConfigFormat::Yaml,
+            config_yaml.as_bytes(),
+            &default_root,
+        )
+        .expect("distinct extra_index_uris should be valid");
     }
 
     #[test]
