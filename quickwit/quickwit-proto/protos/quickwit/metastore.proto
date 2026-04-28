@@ -229,6 +229,7 @@ message UpdateIndexRequest {
   string ingest_settings_json = 6;
   string search_settings_json = 2;
   optional string retention_policy_json_opt = 3;
+  repeated string extra_index_uris = 7;
 }
 
 message ListIndexesMetadataRequest {

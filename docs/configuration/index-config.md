@@ -28,6 +28,9 @@ index_id: "hdfs"
 
 index_uri: "s3://my-bucket/hdfs"
 
+extra_index_uris:
+  - "s3://my-second-bucket/hdfs"
+
 doc_mapping:
   mode: lenient
   field_mappings:
@@ -80,6 +83,32 @@ By default, the `index-uri` will be computed by concatenating the `index-id` wit
 
 :::caution
 The file storage will not work when running quickwit in distributed mode. Instead, AWS S3, Azure Blob Storage, Google Cloud Storage (in s3 interoperability mode) or other S3-compatible storage systems including Scaleway Object Storage and Garage should be used as storage when running several searcher nodes.
+:::
+
+## Extra index URIs
+
+The `extra_index_uris` parameter is an optional list of additional [storage URIs](storage-config#storage-uris) where splits can be stored. When configured, new splits are distributed across all storage URIs (the primary `index_uri` plus the extra URIs) using a round-robin strategy.
+
+This enables **multi-bucket split sharding** — spreading an index's data across multiple storage buckets for better throughput.
+
+
+**Example:**
+
+```yaml
+version: 0.8
+index_id: "hdfs"
+index_uri: "s3://bucket-a/hdfs"
+extra_index_uris:
+  - "s3://bucket-b/hdfs"
+  - "s3://bucket-c/hdfs"
+doc_mapping:
+  field_mappings:
+    - name: body
+      type: text
+```
+
+:::caution
+Once an index uses `extra_index_uris`, it cannot be read by older Quickwit versions that don't support this feature.
 :::
 
 ## Doc mapping

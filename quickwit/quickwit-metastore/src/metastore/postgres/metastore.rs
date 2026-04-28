@@ -428,6 +428,7 @@ impl MetastoreService for PostgresqlMetastore {
         let ingest_settings = request.deserialize_ingest_settings()?;
         let search_settings = request.deserialize_search_settings()?;
         let retention_policy_opt = request.deserialize_retention_policy()?;
+        let extra_index_uris = request.deserialize_extra_index_uris()?;
 
         let index_uid: IndexUid = request.index_uid().clone();
         let updated_index_metadata = run_with_tx!(self.connection_pool, tx, "update index", {
@@ -438,6 +439,7 @@ impl MetastoreService for PostgresqlMetastore {
                     ingest_settings,
                     search_settings,
                     retention_policy_opt,
+                    extra_index_uris,
                 )?;
                 Ok(MutationOccurred::from(mutation_occurred))
             })

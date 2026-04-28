@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -331,13 +332,25 @@ async fn merge_mature_single_index(
         });
     }
 
-    let index_uri = index_metadata.index_uri();
-    let remote_storage = storage_resolver
-        .resolve(index_uri)
-        .await
-        .context("failed to resolve index storage")?;
-    let split_store =
-        IndexingSplitStore::new(remote_storage, Arc::new(IndexingSplitCache::no_caching()));
+    let primary_uri = index_metadata.index_uri().clone();
+    let all_uris = index_metadata.index_config.all_index_uris();
+    let mut storages = HashMap::new();
+    let mut selector_uris = Vec::with_capacity(all_uris.len());
+    for uri in &all_uris {
+        let resolved = storage_resolver
+            .resolve(uri)
+            .await
+            .with_context(|| format!("failed to resolve storage for URI {uri}"))?;
+        storages.insert((*uri).clone(), resolved);
+        selector_uris.push((*uri).clone());
+    }
+    let bucket_selector = crate::split_store::default_bucket_selector(selector_uris);
+    let split_store = IndexingSplitStore::new(
+        storages,
+        bucket_selector,
+        Arc::new(IndexingSplitCache::no_caching()),
+        primary_uri,
+    );
 
     let outcome = run_mature_merges_for_index(
         &index_metadata,
@@ -730,6 +743,7 @@ mod tests {
             &index_metadata_v1.index_config.ingest_settings,
             &index_metadata_v1.index_config.search_settings,
             &index_metadata_v1.index_config.retention_policy_opt,
+            &index_metadata_v1.index_config.extra_index_uris,
         )?;
         metastore.update_index(update_request).await?;
 

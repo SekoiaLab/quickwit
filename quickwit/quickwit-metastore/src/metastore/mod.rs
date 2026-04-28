@@ -21,6 +21,7 @@ pub mod control_plane_metastore;
 
 use std::cmp::Ordering;
 use std::ops::{Bound, RangeInclusive};
+use std::str::FromStr;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,6 +29,7 @@ use futures::TryStreamExt;
 pub use index_metadata::IndexMetadata;
 use itertools::Itertools;
 use quickwit_common::thread_pool::run_cpu_intensive;
+use quickwit_common::uri::Uri;
 use quickwit_config::{
     DocMapping, FileSourceParams, IndexConfig, IndexingSettings, IngestSettings, RetentionPolicy,
     SearchSettings, SourceConfig, SourceParams,
@@ -194,6 +196,7 @@ pub trait UpdateIndexRequestExt {
         ingest_settings: &IngestSettings,
         search_settings: &SearchSettings,
         retention_policy_opt: &Option<RetentionPolicy>,
+        extra_index_uris: &[Uri],
     ) -> MetastoreResult<UpdateIndexRequest>;
 
     /// Deserializes the `doc_mapping_json` field of an `[UpdateIndexRequest]` into a
@@ -215,6 +218,10 @@ pub trait UpdateIndexRequestExt {
     /// Deserializes the `retention_policy_json` field of an [`UpdateIndexRequest`] into a
     /// [`RetentionPolicy`] object.
     fn deserialize_retention_policy(&self) -> MetastoreResult<Option<RetentionPolicy>>;
+
+    /// Deserializes the `extra_index_uris` field of an [`UpdateIndexRequest`] into a
+    /// `Vec<Uri>`.
+    fn deserialize_extra_index_uris(&self) -> MetastoreResult<Vec<Uri>>;
 }
 
 impl UpdateIndexRequestExt for UpdateIndexRequest {
@@ -225,6 +232,7 @@ impl UpdateIndexRequestExt for UpdateIndexRequest {
         ingest_settings: &IngestSettings,
         search_settings: &SearchSettings,
         retention_policy_opt: &Option<RetentionPolicy>,
+        extra_index_uris: &[Uri],
     ) -> MetastoreResult<UpdateIndexRequest> {
         let doc_mapping_json = serde_utils::to_json_str(doc_mapping)?;
         let indexing_settings_json = serde_utils::to_json_str(indexing_settings)?;
@@ -235,6 +243,8 @@ impl UpdateIndexRequestExt for UpdateIndexRequest {
             .map(serde_utils::to_json_str)
             .transpose()?;
 
+        let extra_index_uris = extra_index_uris.iter().map(|uri| uri.to_string()).collect();
+
         let update_request = UpdateIndexRequest {
             index_uid: Some(index_uid.into()),
             doc_mapping_json,
@@ -242,6 +252,7 @@ impl UpdateIndexRequestExt for UpdateIndexRequest {
             ingest_settings_json,
             search_settings_json,
             retention_policy_json_opt,
+            extra_index_uris,
         };
         Ok(update_request)
     }
@@ -266,6 +277,18 @@ impl UpdateIndexRequestExt for UpdateIndexRequest {
             .as_ref()
             .map(|policy_json| serde_utils::from_json_str(policy_json))
             .transpose()
+    }
+
+    fn deserialize_extra_index_uris(&self) -> MetastoreResult<Vec<Uri>> {
+        self.extra_index_uris
+            .iter()
+            .map(|uri_str| {
+                Uri::from_str(uri_str).map_err(|error| MetastoreError::Internal {
+                    message: format!("failed to parse extra index URI `{uri_str}`: {error}"),
+                    cause: error.to_string(),
+                })
+            })
+            .collect()
     }
 }
 

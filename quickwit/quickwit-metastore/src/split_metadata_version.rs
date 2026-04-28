@@ -15,6 +15,7 @@
 use std::collections::BTreeSet;
 use std::ops::{Range, RangeInclusive};
 
+use quickwit_common::uri::Uri;
 use quickwit_proto::types::{DocMappingUid, IndexUid, SplitId};
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +102,12 @@ pub(crate) struct SplitMetadataV0_8 {
     /// Set of tantivy doc_ids that have been soft-deleted from this split.
     #[serde(default)]
     pub soft_deleted_doc_ids: BTreeSet<u32>,
+
+    /// The storage URI where this split is stored. When `None`, the split is stored
+    /// under the index-level `index_uri`.
+    #[schema(value_type = Option<String>)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_uri: Option<Uri>,
 }
 
 impl From<SplitMetadataV0_8> for SplitMetadata {
@@ -139,6 +146,7 @@ impl From<SplitMetadataV0_8> for SplitMetadata {
             num_merge_ops: v8.num_merge_ops,
             doc_mapping_uid: v8.doc_mapping_uid,
             soft_deleted_doc_ids: v8.soft_deleted_doc_ids,
+            storage_uri: v8.storage_uri,
         }
     }
 }
@@ -163,6 +171,7 @@ impl From<SplitMetadata> for SplitMetadataV0_8 {
             num_merge_ops: split.num_merge_ops,
             doc_mapping_uid: split.doc_mapping_uid,
             soft_deleted_doc_ids: split.soft_deleted_doc_ids,
+            storage_uri: split.storage_uri,
         }
     }
 }

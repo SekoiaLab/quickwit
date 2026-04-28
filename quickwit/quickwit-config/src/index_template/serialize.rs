@@ -55,6 +55,9 @@ pub struct IndexTemplateV0_8 {
     pub search_settings: SearchSettings,
     #[serde(default)]
     pub retention: Option<RetentionPolicy>,
+    #[schema(value_type = Vec<String>)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_index_uris: Vec<Uri>,
 }
 
 impl From<VersionedIndexTemplate> for IndexTemplate {
@@ -84,6 +87,7 @@ impl From<IndexTemplateV0_8> for IndexTemplate {
             ingest_settings: index_template_v0_8.ingest_settings,
             search_settings: index_template_v0_8.search_settings,
             retention_policy_opt: index_template_v0_8.retention,
+            extra_index_uris: index_template_v0_8.extra_index_uris,
         }
     }
 }
@@ -101,6 +105,7 @@ impl From<IndexTemplate> for IndexTemplateV0_8 {
             ingest_settings: index_template.ingest_settings,
             search_settings: index_template.search_settings,
             retention: index_template.retention_policy_opt,
+            extra_index_uris: index_template.extra_index_uris,
         }
     }
 }

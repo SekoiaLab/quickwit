@@ -327,7 +327,7 @@ impl Handler<PackagedSplitBatch> for Uploader {
                             return;
                         }
                     };
-                    let split_metadata = create_split_metadata(
+                    let mut split_metadata = create_split_metadata(
                         &merge_policy,
                         retention_policy.as_ref(),
                         &packaged_split.split_attrs,
@@ -335,8 +335,12 @@ impl Handler<PackagedSplitBatch> for Uploader {
                         split_streamer.footer_range.start..split_streamer.footer_range.end,
                     );
 
+                    // Select the target bucket and record it in the split metadata.
+                    let target_uri = split_store.select_bucket().clone();
+                    split_metadata.storage_uri = Some(target_uri.clone());
+
                     report_splits.push(ReportSplit {
-                        storage_uri: split_store.remote_uri().to_string(),
+                        storage_uri: target_uri.to_string(),
                         split_id: packaged_split.split_id().to_string(),
                     });
 

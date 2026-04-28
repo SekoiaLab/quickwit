@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -37,7 +36,6 @@ use quickwit_proto::indexing::MergePipelineId;
 use quickwit_proto::metastore::{IndexMetadataRequest, MetastoreService, MetastoreServiceClient};
 use quickwit_proto::types::{IndexUid, NodeId};
 use quickwit_search::SearchJobPlacer;
-use quickwit_storage::Storage;
 use serde::Serialize;
 use tokio::join;
 use tracing::info;
@@ -77,7 +75,7 @@ pub struct DeleteTaskPipeline {
     index_uid: IndexUid,
     metastore: MetastoreServiceClient,
     search_job_placer: SearchJobPlacer,
-    index_storage: Arc<dyn Storage>,
+    split_store: IndexingSplitStore,
     delete_service_task_dir: PathBuf,
     handles: Option<DeletePipelineHandle>,
     max_concurrent_split_uploads: usize,
@@ -129,7 +127,7 @@ impl DeleteTaskPipeline {
         index_uid: IndexUid,
         metastore: MetastoreServiceClient,
         search_job_placer: SearchJobPlacer,
-        index_storage: Arc<dyn Storage>,
+        split_store: IndexingSplitStore,
         delete_service_task_dir: PathBuf,
         max_concurrent_split_uploads: usize,
         merge_scheduler_service: Mailbox<MergeSchedulerService>,
@@ -139,7 +137,7 @@ impl DeleteTaskPipeline {
             index_uid,
             metastore,
             search_job_placer,
-            index_storage,
+            split_store,
             delete_service_task_dir,
             handles: Default::default(),
             max_concurrent_split_uploads,
@@ -169,8 +167,7 @@ impl DeleteTaskPipeline {
         );
         let (publisher_mailbox, publisher_supervisor_handler) =
             ctx.spawn_actor().supervise(publisher);
-        let split_store =
-            IndexingSplitStore::create_without_local_store_for_test(self.index_storage.clone());
+        let split_store = self.split_store.clone();
         let merge_policy = merge_policy_from_settings(&index_config.indexing_settings);
         let uploader = Uploader::new(
             UploaderType::DeleteUploader,
@@ -283,8 +280,8 @@ mod tests {
     use quickwit_actors::{Handler, Universe};
     use quickwit_common::pubsub::EventBroker;
     use quickwit_common::temp_dir::TempDirectory;
-    use quickwit_indexing::TestSandbox;
     use quickwit_indexing::actors::MergeSchedulerService;
+    use quickwit_indexing::{IndexingSplitStore, TestSandbox};
     use quickwit_metastore::{ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, SplitState};
     use quickwit_proto::metastore::{DeleteQuery, ListSplitsRequest, MetastoreService};
     use quickwit_proto::search::{LeafSearchRequest, LeafSearchResponse};
@@ -387,7 +384,7 @@ mod tests {
             test_sandbox.index_uid(),
             metastore.clone(),
             search_job_placer,
-            test_sandbox.storage(),
+            IndexingSplitStore::create_without_local_store_for_test(test_sandbox.storage()),
             delete_service_task_dir.path().into(),
             4,
             merge_scheduler_service,
@@ -468,7 +465,7 @@ mod tests {
             test_sandbox.index_uid(),
             metastore.clone(),
             search_job_placer,
-            test_sandbox.storage(),
+            IndexingSplitStore::create_without_local_store_for_test(test_sandbox.storage()),
             delete_service_task_dir.path().into(),
             4,
             merge_scheduler_mailbox,

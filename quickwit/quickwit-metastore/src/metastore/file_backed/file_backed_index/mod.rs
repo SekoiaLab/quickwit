@@ -25,6 +25,7 @@ use std::ops::Bound;
 
 use itertools::Itertools;
 use quickwit_common::pretty::PrettySample;
+use quickwit_common::uri::Uri;
 use quickwit_config::{
     DocMapping, IndexingSettings, IngestSettings, RetentionPolicy, SearchSettings, SourceConfig,
 };
@@ -222,6 +223,7 @@ impl FileBackedIndex {
         ingest_settings: IngestSettings,
         search_settings: SearchSettings,
         retention_policy_opt: Option<RetentionPolicy>,
+        extra_index_uris: Vec<Uri>,
     ) -> MetastoreResult<bool> {
         self.metadata.update_index_config(
             doc_mapping,
@@ -229,6 +231,7 @@ impl FileBackedIndex {
             ingest_settings,
             search_settings,
             retention_policy_opt,
+            extra_index_uris,
         )
     }
 

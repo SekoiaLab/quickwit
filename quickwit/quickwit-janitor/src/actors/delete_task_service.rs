@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ use quickwit_common::pubsub::EventBroker;
 use quickwit_common::temp_dir::{self};
 use quickwit_config::IndexConfig;
 use quickwit_indexing::actors::MergeSchedulerService;
+use quickwit_indexing::{IndexingSplitCache, IndexingSplitStore, default_bucket_selector};
 use quickwit_metastore::{IndexMetadataResponseExt, ListIndexesMetadataResponseExt};
 use quickwit_proto::metastore::{
     IndexMetadataRequest, ListIndexesMetadataRequest, MetastoreService, MetastoreServiceClient,
@@ -161,8 +163,22 @@ impl DeleteTaskService {
         index_config: IndexConfig,
         ctx: &ActorContext<Self>,
     ) -> anyhow::Result<()> {
-        let index_uri = index_config.index_uri.clone();
-        let index_storage = self.storage_resolver.resolve(&index_uri).await?;
+        let primary_uri = index_config.index_uri.clone();
+        let all_uris = index_config.all_index_uris();
+        let mut storages = HashMap::new();
+        let mut selector_uris = Vec::with_capacity(all_uris.len());
+        for uri in &all_uris {
+            let resolved = self.storage_resolver.resolve(uri).await?;
+            storages.insert((*uri).clone(), resolved);
+            selector_uris.push((*uri).clone());
+        }
+        let bucket_selector = default_bucket_selector(selector_uris);
+        let split_store = IndexingSplitStore::new(
+            storages,
+            bucket_selector,
+            Arc::new(IndexingSplitCache::no_caching()),
+            primary_uri,
+        );
         let index_metadata_request =
             IndexMetadataRequest::for_index_id(index_config.index_id.to_string());
         let index_metadata = self
@@ -174,7 +190,7 @@ impl DeleteTaskService {
             index_metadata.index_uid.clone(),
             self.metastore.clone(),
             self.search_job_placer.clone(),
-            index_storage,
+            split_store,
             self.delete_service_task_dir.clone(),
             self.max_concurrent_split_uploads,
             self.merge_scheduler_service.clone(),

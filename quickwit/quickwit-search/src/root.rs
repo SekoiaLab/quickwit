@@ -51,7 +51,7 @@ use crate::cluster_client::ClusterClient;
 use crate::collector::{QuickwitAggregations, make_merge_collector};
 use crate::metrics_trackers::{RootSearchMetricsFuture, SearchPlanMetricsFuture};
 use crate::scroll_context::{ScrollContext, ScrollKeyAndStartOffset};
-use crate::search_job_placer::{Job, group_by, group_jobs_by_index_id};
+use crate::search_job_placer::{Job, group_by, group_jobs_by_index_and_storage};
 use crate::search_response_rest::StorageRequestCount;
 use crate::service::SearcherContext;
 use crate::{
@@ -81,6 +81,8 @@ const SORT_DOC_FIELD_NAMES: &[&str] = &["_shard_doc", "_doc"];
 pub struct SearchJob {
     /// The index UID.
     pub index_uid: IndexUid,
+    /// The effective storage URI for this split.
+    pub storage_uri: Uri,
     cost: usize,
     /// The split ID and footer offsets of the split.
     pub offsets: SplitIdAndFooterOffsets,
@@ -93,6 +95,7 @@ impl SearchJob {
         use std::str::FromStr;
         SearchJob {
             index_uid: IndexUid::from_str("test-index:00000000000000000000000000").unwrap(),
+            storage_uri: Uri::for_test("ram:///test"),
             cost,
             offsets: SplitIdAndFooterOffsets {
                 split_id: split_id.to_string(),
@@ -100,21 +103,21 @@ impl SearchJob {
             },
         }
     }
+
+    /// Creates a [`SearchJob`] from split metadata, using the effective storage URI.
+    pub fn from_split_metadata(split_metadata: &SplitMetadata, index_uri: &Uri) -> Self {
+        SearchJob {
+            index_uid: split_metadata.index_uid.clone(),
+            storage_uri: split_metadata.effective_storage_uri(index_uri).clone(),
+            cost: compute_split_cost(split_metadata),
+            offsets: extract_split_and_footer_offsets(split_metadata),
+        }
+    }
 }
 
 impl From<SearchJob> for SplitIdAndFooterOffsets {
     fn from(search_job: SearchJob) -> Self {
         search_job.offsets
-    }
-}
-
-impl<'a> From<&'a SplitMetadata> for SearchJob {
-    fn from(split_metadata: &'a SplitMetadata) -> Self {
-        SearchJob {
-            index_uid: split_metadata.index_uid.clone(),
-            cost: compute_split_cost(split_metadata),
-            offsets: extract_split_and_footer_offsets(split_metadata),
-        }
     }
 }
 
@@ -130,6 +133,7 @@ impl Job for SearchJob {
 
 pub struct FetchDocsJob {
     index_uid: IndexUid,
+    storage_uri: Uri,
     offsets: SplitIdAndFooterOffsets,
     pub partial_hits: Vec<PartialHit>,
 }
@@ -766,7 +770,16 @@ pub(crate) async fn search_partial_hits_phase(
         if is_metadata_count_request(search_request) {
             get_count_from_metadata(split_metadatas)
         } else {
-            let jobs: Vec<SearchJob> = split_metadatas.iter().map(SearchJob::from).collect();
+            let jobs: Vec<SearchJob> = split_metadatas
+                .iter()
+                .map(|split_metadata| {
+                    let index_uri = &indexes_metas_for_leaf_search
+                        .get(&split_metadata.index_uid)
+                        .expect("index not found in metadata map")
+                        .index_uri;
+                    SearchJob::from_split_metadata(split_metadata, index_uri)
+                })
+                .collect();
             let assigned_leaf_search_jobs = cluster_client
                 .search_job_placer
                 .assign_jobs(jobs, &HashSet::default())
@@ -870,6 +883,7 @@ pub(crate) async fn fetch_docs_phase(
     let assigned_fetch_docs_jobs = assign_client_fetch_docs_jobs(
         partial_hits,
         split_metadatas,
+        indexes_metas_for_leaf_search,
         &cluster_client.search_job_placer,
     )
     .await?;
@@ -1673,21 +1687,26 @@ impl<'b> QueryAstVisitor<'b> for ExtractTimestampRange<'_> {
 async fn assign_client_fetch_docs_jobs(
     partial_hits: &[PartialHit],
     split_metadatas: &[SplitMetadata],
+    indexes_metas_for_leaf_search: &IndexesMetasForLeafSearch,
     client_pool: &SearchJobPlacer,
 ) -> crate::Result<impl Iterator<Item = (SearchServiceClient, Vec<FetchDocsJob>)>> {
-    let index_uids_and_split_offsets_map: HashMap<String, (IndexUid, SplitIdAndFooterOffsets)> =
-        split_metadatas
-            .iter()
-            .map(|metadata| {
+    let split_info_map: HashMap<String, (IndexUid, Uri, SplitIdAndFooterOffsets)> = split_metadatas
+        .iter()
+        .map(|metadata| {
+            let index_uri = &indexes_metas_for_leaf_search
+                .get(&metadata.index_uid)
+                .expect("index not found in metadata map")
+                .index_uri;
+            (
+                metadata.split_id().to_string(),
                 (
-                    metadata.split_id().to_string(),
-                    (
-                        metadata.index_uid.clone(),
-                        extract_split_and_footer_offsets(metadata),
-                    ),
-                )
-            })
-            .collect();
+                    metadata.index_uid.clone(),
+                    metadata.effective_storage_uri(index_uri).clone(),
+                    extract_split_and_footer_offsets(metadata),
+                ),
+            )
+        })
+        .collect();
 
     // Group the partial hits per split
     let mut partial_hits_map: HashMap<String, Vec<PartialHit>> = HashMap::new();
@@ -1700,7 +1719,7 @@ async fn assign_client_fetch_docs_jobs(
 
     let mut fetch_docs_req_jobs: Vec<FetchDocsJob> = Vec::new();
     for (split_id, partial_hits) in partial_hits_map {
-        let (index_uid, offsets) = index_uids_and_split_offsets_map
+        let (index_uid, storage_uri, offsets) = split_info_map
             .get(&split_id)
             .ok_or_else(|| {
                 crate::SearchError::Internal(format!(
@@ -1710,6 +1729,7 @@ async fn assign_client_fetch_docs_jobs(
             .clone();
         let fetch_docs_job = FetchDocsJob {
             index_uid: index_uid.clone(),
+            storage_uri,
             offsets,
             partial_hits,
         };
@@ -1749,15 +1769,23 @@ pub fn jobs_to_leaf_request(
     };
 
     let mut added_doc_mappers: HashMap<&str, u32> = HashMap::new();
-    // Group jobs by index uid, as the split offsets are relative to the index.
-    group_jobs_by_index_id(jobs, |job_group| {
+    let mut added_index_ids: HashSet<String> = HashSet::new();
+
+    // Group jobs by (index_uid, storage_uri) to support splits from the same
+    // index living in different storage buckets.
+    group_jobs_by_index_and_storage(jobs, |job_group| {
         let index_uid = &job_group[0].index_uid;
-        leaf_search_request
-            .search_request
-            .as_mut()
-            .unwrap()
-            .index_id_patterns
-            .push(index_uid.index_id.to_string());
+        let storage_uri = job_group[0].storage_uri.clone();
+
+        if added_index_ids.insert(index_uid.index_id.to_string()) {
+            leaf_search_request
+                .search_request
+                .as_mut()
+                .unwrap()
+                .index_id_patterns
+                .push(index_uid.index_id.to_string());
+        }
+
         let search_index_meta = search_indexes_metadatas.get(index_uid).ok_or_else(|| {
             SearchError::Internal(format!(
                 "received job for an unknown index {index_uid}. it should never happen"
@@ -1773,24 +1801,20 @@ pub fn jobs_to_leaf_request(
                 ord as u32
             });
         let index_uri_ord = leaf_search_request.index_uris.len() as u32;
-        leaf_search_request
-            .index_uris
-            .push(search_index_meta.index_uri.to_string());
+        leaf_search_request.index_uris.push(storage_uri.to_string());
 
-        let leaf_search_request_ref = LeafRequestRef {
+        leaf_search_request.leaf_requests.push(LeafRequestRef {
             split_offsets: job_group.into_iter().map(|job| job.offsets).collect(),
             doc_mapper_ord,
             index_uri_ord,
-        };
-        leaf_search_request
-            .leaf_requests
-            .push(leaf_search_request_ref);
+        });
         Ok(())
     })?;
     Ok(leaf_search_request)
 }
 
-/// Builds a list of [`FetchDocsRequest`], one per index, from a list of [`FetchDocsJob`].
+/// Builds a list of [`FetchDocsRequest`], one per (index, storage_uri) group,
+/// from a list of [`FetchDocsJob`].
 pub fn jobs_to_fetch_docs_requests(
     snippet_request_opt: Option<SnippetRequest>,
     indexes_metas_for_leaf_search: &IndexesMetasForLeafSearch,
@@ -1800,9 +1824,14 @@ pub fn jobs_to_fetch_docs_requests(
     // Group jobs by index uid.
     group_by(
         jobs,
-        |job| &job.index_uid,
+        |a, b| {
+            a.index_uid
+                .cmp(&b.index_uid)
+                .then_with(|| a.storage_uri.cmp(&b.storage_uri))
+        },
         |fetch_docs_jobs| {
             let index_uid = &fetch_docs_jobs[0].index_uid;
+            let storage_uri_string = fetch_docs_jobs[0].storage_uri.to_string();
 
             let index_meta = indexes_metas_for_leaf_search
                 .get(index_uid)
@@ -1822,7 +1851,7 @@ pub fn jobs_to_fetch_docs_requests(
             let fetch_docs_req = FetchDocsRequest {
                 partial_hits,
                 split_offsets,
-                index_uri: index_meta.index_uri.to_string(),
+                index_uri: storage_uri_string,
                 snippet_request: snippet_request_opt.clone(),
                 doc_mapper: index_meta.doc_mapper_str.clone(),
             };
@@ -1949,6 +1978,7 @@ mod tests {
             ingest_settings,
             search_settings,
             retention_policy_opt: None,
+            extra_index_uris: Vec::new(),
         })
     }
 
@@ -2123,6 +2153,7 @@ mod tests {
             indexing_settings,
             search_settings,
             retention_policy_opt: None,
+            extra_index_uris: Vec::new(),
         })
     }
 

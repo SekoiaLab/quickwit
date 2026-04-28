@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(any(test, feature = "testsuite"))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,7 +23,7 @@ use bytesize::ByteSize;
 use quickwit_common::io::{IoControls, IoControlsAccess};
 use quickwit_common::uri::Uri;
 use quickwit_metastore::SplitMetadata;
-use quickwit_storage::{PutPayload, Storage, StorageResult};
+use quickwit_storage::{PutPayload, Storage, StorageErrorKind, StorageResult};
 use tantivy::Directory;
 use tantivy::directory::{Advice, MmapDirectory};
 use time::OffsetDateTime;
@@ -58,19 +57,34 @@ pub struct IndexingSplitStore {
 }
 
 struct InnerIndexingSplitStore {
-    /// The remote storage.
-    remote_storage: Arc<dyn Storage>,
+    /// Pre-resolved storages keyed by URI.
+    storages: HashMap<Uri, Arc<dyn Storage>>,
+    /// Selects which bucket to write the next split to.
+    bucket_selector: Arc<dyn super::BucketSelector>,
+    /// Local disk cache for immature splits (shared, URI-agnostic since split IDs are ULIDs).
     split_cache: Arc<IndexingSplitCache>,
+    /// The primary storage URI (the index's `index_uri`). Used as fallback for
+    /// splits that don't have a `storage_uri` set.
+    primary_uri: Uri,
 }
 
 impl IndexingSplitStore {
-    /// Creates an instance of [`IndexingSplitStore`]
+    /// Creates an instance of [`IndexingSplitStore`].
     ///
-    /// It needs the remote storage to work with.
-    pub fn new(remote_storage: Arc<dyn Storage>, split_cache: Arc<IndexingSplitCache>) -> Self {
+    /// `storages` maps each URI to its resolved storage. `bucket_selector` picks
+    /// which URI to use for each new split. `primary_uri` is the fallback URI
+    /// for reading splits that don't have a `storage_uri`.
+    pub fn new(
+        storages: HashMap<Uri, Arc<dyn Storage>>,
+        bucket_selector: Arc<dyn super::BucketSelector>,
+        split_cache: Arc<IndexingSplitCache>,
+        primary_uri: Uri,
+    ) -> Self {
         let inner = InnerIndexingSplitStore {
-            remote_storage,
+            storages,
+            bucket_selector,
             split_cache,
+            primary_uri,
         };
         Self {
             inner: Arc::new(inner),
@@ -80,17 +94,24 @@ impl IndexingSplitStore {
     /// Helper function to create a indexing split store for tests.
     /// The resulting store does not have any local cache.
     pub fn create_without_local_store_for_test(remote_storage: Arc<dyn Storage>) -> Self {
+        let primary_uri = remote_storage.uri().clone();
+        let mut storages = HashMap::new();
+        storages.insert(primary_uri.clone(), remote_storage);
+        let bucket_selector = super::default_bucket_selector(vec![primary_uri.clone()]);
         let inner = InnerIndexingSplitStore {
-            remote_storage,
+            storages,
+            bucket_selector,
             split_cache: Arc::new(IndexingSplitCache::no_caching()),
+            primary_uri,
         };
         IndexingSplitStore {
             inner: Arc::new(inner),
         }
     }
 
-    pub fn remote_uri(&self) -> &Uri {
-        self.inner.remote_storage.uri()
+    /// Selects the next bucket URI for writing a split.
+    pub fn select_bucket(&self) -> &Uri {
+        self.inner.bucket_selector.select()
     }
 
     fn split_path(&self, split_id: &str) -> PathBuf {
@@ -113,21 +134,30 @@ impl IndexingSplitStore {
         split_folder_path: &Path,
         put_payload: Box<dyn PutPayload>,
     ) -> anyhow::Result<()> {
+        let target_uri = split
+            .storage_uri
+            .as_ref()
+            .expect("storage_uri must be set before upload");
+        let storage = self
+            .inner
+            .storages
+            .get(target_uri)
+            .with_context(|| format!("no storage configured for URI {target_uri}"))?
+            .clone();
         let start = Instant::now();
         let split_num_bytes = put_payload.len();
 
         let key = self.split_path(split.split_id());
         let is_mature = split.is_mature(OffsetDateTime::now_utc());
-        self.inner
-            .remote_storage
+        storage
             .put(&key, put_payload)
-            .instrument(info_span!("store_split_in_remote_storage", split=?split.split_id(), is_mature=is_mature, num_bytes=split_num_bytes))
+            .instrument(info_span!("store_split_in_remote_storage", split=?split.split_id(), is_mature=is_mature, num_bytes=split_num_bytes, %target_uri))
             .await
             .with_context(|| {
                 format!(
                     "failed uploading key {} in bucket {}",
                     key.display(),
-                    self.inner.remote_storage.uri()
+                    target_uri
                 )
             })?;
 
@@ -178,10 +208,11 @@ impl IndexingSplitStore {
     #[instrument(skip(self, output_dir_path, io_controls), fields(cache_hit))]
     pub async fn fetch_and_open_split(
         &self,
-        split_id: &str,
+        split: &SplitMetadata,
         output_dir_path: &Path,
         io_controls: &IoControls,
     ) -> StorageResult<Box<dyn Directory>> {
+        let split_id = split.split_id();
         let path = PathBuf::from(quickwit_common::split_file(split_id));
         if let Some(split_path) = self
             .inner
@@ -198,13 +229,24 @@ impl IndexingSplitStore {
         } else {
             tracing::Span::current().record("cache_hit", false);
         }
+        let effective_uri = split.effective_storage_uri(&self.inner.primary_uri);
+        let storage = self
+            .inner
+            .storages
+            .get(effective_uri)
+            .cloned()
+            .ok_or_else(|| {
+                StorageErrorKind::Internal.with_error(anyhow::anyhow!(
+                    "no storage configured for URI {effective_uri} (split {})",
+                    split.split_id()
+                ))
+            })?;
         let dest_filepath = output_dir_path.join(&path);
         let dest_file = tokio::fs::File::create(&dest_filepath).await?;
         let mut dest_file_with_write_limit = io_controls.clone().wrap_write(dest_file);
-        self.inner
-            .remote_storage
+        storage
             .copy_to(&path, &mut dest_file_with_write_limit)
-            .instrument(info_span!("fetch_split_from_remote_storage", path=?path))
+            .instrument(info_span!("fetch_split_from_remote_storage", path=?path, %effective_uri))
             .await?;
         get_tantivy_directory_from_split_bundle(&dest_filepath)
     }
@@ -218,13 +260,14 @@ impl IndexingSplitStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
     use bytesize::ByteSize;
     use quickwit_common::io::IoControls;
     use quickwit_metastore::{SplitMaturity, SplitMetadata};
-    use quickwit_storage::{PutPayload, RamStorage, SplitPayloadBuilder};
+    use quickwit_storage::{PutPayload, RamStorage, SplitPayloadBuilder, Storage};
     use tempfile::tempdir;
     use time::OffsetDateTime;
     use tokio::fs;
@@ -254,8 +297,17 @@ mod tests {
             SplitStoreQuota::default(),
         )
         .await?;
-        let remote_storage = Arc::new(RamStorage::default());
-        let split_store = IndexingSplitStore::new(remote_storage, Arc::new(split_cache));
+        let remote_storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
+        let primary_uri = remote_storage.uri().clone();
+        let mut storages = HashMap::new();
+        storages.insert(primary_uri.clone(), remote_storage);
+        let bucket_selector = super::super::default_bucket_selector(vec![primary_uri.clone()]);
+        let split_store = IndexingSplitStore::new(
+            storages,
+            bucket_selector,
+            Arc::new(split_cache),
+            primary_uri,
+        );
 
         let split_id1 = Ulid::new().to_string();
         let split_id2 = Ulid::new().to_string();
@@ -263,7 +315,8 @@ mod tests {
         {
             let split1_dir = temp_dir.path().join(&split_id1);
             fs::create_dir_all(&split1_dir).await?;
-            let split_metadata1 = create_test_split_metadata(&split_id1);
+            let mut split_metadata1 = create_test_split_metadata(&split_id1);
+            split_metadata1.storage_uri = Some(split_store.select_bucket().clone());
             fs::write(split1_dir.join("splitfile"), b"1234").await?;
             split_store
                 .store_split(&split_metadata1, &split1_dir, Box::new(b"1234".to_vec()))
@@ -286,7 +339,8 @@ mod tests {
             let split2_dir = temp_dir.path().join(&split_id2);
             fs::create_dir_all(&split2_dir).await?;
             fs::write(split2_dir.join("splitfile"), b"567").await?;
-            let split_metadata2 = create_test_split_metadata(&split_id2);
+            let mut split_metadata2 = create_test_split_metadata(&split_id2);
+            split_metadata2.storage_uri = Some(split_store.select_bucket().clone());
             split_store
                 .store_split(&split_metadata2, &split2_dir, Box::new(b"567".to_vec()))
                 .await?;
@@ -313,8 +367,9 @@ mod tests {
         let io_controls = IoControls::default();
         {
             let output = tempfile::tempdir()?;
+            let split_metadata1 = create_test_split_metadata(&split_id1);
             let split1 = split_store
-                .fetch_and_open_split(&split_id1, output.path(), &io_controls)
+                .fetch_and_open_split(&split_metadata1, output.path(), &io_controls)
                 .await?;
             let local_store_stats = split_store.inspect_split_cache().await;
             assert_eq!(local_store_stats.len(), 1);
@@ -322,8 +377,9 @@ mod tests {
         }
         {
             let output = tempfile::tempdir()?;
+            let split_metadata2 = create_test_split_metadata(&split_id2);
             let split2 = split_store
-                .fetch_and_open_split(&split_id2, output.path(), &io_controls)
+                .fetch_and_open_split(&split_metadata2, output.path(), &io_controls)
                 .await?;
             let local_store_stats = split_store.inspect_split_cache().await;
             assert_eq!(local_store_stats.len(), 0);
@@ -344,8 +400,17 @@ mod tests {
         )
         .await?;
 
-        let remote_storage = Arc::new(RamStorage::default());
-        let split_store = IndexingSplitStore::new(remote_storage, Arc::new(split_cache));
+        let remote_storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
+        let primary_uri = remote_storage.uri().clone();
+        let mut storages = HashMap::new();
+        storages.insert(primary_uri.clone(), remote_storage);
+        let bucket_selector = super::super::default_bucket_selector(vec![primary_uri.clone()]);
+        let split_store = IndexingSplitStore::new(
+            storages,
+            bucket_selector,
+            Arc::new(split_cache),
+            primary_uri,
+        );
 
         let split_id1 = Ulid::new().to_string();
         let split_payload1 = SplitPayloadBuilder::get_split_payload(&[], &[], &[5, 5, 5])?;
@@ -356,7 +421,8 @@ mod tests {
             let split_path = temp_dir.path().join(&split_id1);
             fs::create_dir_all(&split_path).await?;
             fs::write(split_path.join("splitdatafile"), b"hello-world").await?;
-            let split_metadata1 = create_test_split_metadata(&split_id1);
+            let mut split_metadata1 = create_test_split_metadata(&split_id1);
+            split_metadata1.storage_uri = Some(split_store.select_bucket().clone());
             split_store
                 .store_split(
                     &split_metadata1,
@@ -382,8 +448,8 @@ mod tests {
             let split_path = temp_dir.path().join(&split_id2);
             fs::create_dir_all(&split_path).await?;
             fs::write(split_path.join("splitdatafile2"), b"hello-world2").await?;
-            let split_metadata2 = create_test_split_metadata(&split_id2);
-
+            let mut split_metadata2 = create_test_split_metadata(&split_id2);
+            split_metadata2.storage_uri = Some(split_store.select_bucket().clone());
             split_store
                 .store_split(
                     &split_metadata2,
@@ -410,7 +476,11 @@ mod tests {
             // get from remote storage because split_id1 was evicted by split_id2
             let output = tempfile::tempdir()?;
             let _split1 = split_store
-                .fetch_and_open_split(&split_id1, output.path(), &io_controls)
+                .fetch_and_open_split(
+                    &create_test_split_metadata(&split_id1),
+                    output.path(),
+                    &io_controls,
+                )
                 .await?;
             assert_eq!(io_controls.num_bytes(), split_payload1.len());
         }
@@ -418,7 +488,11 @@ mod tests {
             // get from cache
             let output = tempfile::tempdir()?;
             let _split2 = split_store
-                .fetch_and_open_split(&split_id2, output.path(), &io_controls)
+                .fetch_and_open_split(
+                    &create_test_split_metadata(&split_id2),
+                    output.path(),
+                    &io_controls,
+                )
                 .await?;
             // the number of downloaded by didn't change (still the size of split_payload1)
             assert_eq!(io_controls.num_bytes(), split_payload1.len());
@@ -427,7 +501,11 @@ mod tests {
             // get from remote because getting from cache removes the split from the cache
             let output = tempfile::tempdir()?;
             let _split2 = split_store
-                .fetch_and_open_split(&split_id2, output.path(), &io_controls)
+                .fetch_and_open_split(
+                    &create_test_split_metadata(&split_id2),
+                    output.path(),
+                    &io_controls,
+                )
                 .await?;
             assert_eq!(
                 io_controls.num_bytes(),

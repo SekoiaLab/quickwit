@@ -51,6 +51,8 @@ pub struct IndexTemplate {
     #[serde(rename = "retention")]
     #[serde(default)]
     pub retention_policy_opt: Option<RetentionPolicy>,
+    #[serde(default)]
+    pub extra_index_uris: Vec<Uri>,
 }
 
 impl IndexTemplate {
@@ -77,6 +79,7 @@ impl IndexTemplate {
             ingest_settings: self.ingest_settings.clone(),
             search_settings: self.search_settings.clone(),
             retention_policy_opt: self.retention_policy_opt.clone(),
+            extra_index_uris: self.extra_index_uris.clone(),
         };
         Ok(index_config)
     }
@@ -97,6 +100,15 @@ impl IndexTemplate {
             &self.search_settings,
             &self.retention_policy_opt,
         )?;
+        // Validate that extra_index_uris has no duplicates.
+        let mut seen_uris = std::collections::HashSet::new();
+        for extra_uri in &self.extra_index_uris {
+            ensure!(
+                seen_uris.insert(extra_uri),
+                "`extra_index_uris` contains duplicate URI: {}",
+                extra_uri,
+            );
+        }
         Ok(())
     }
 
@@ -134,6 +146,7 @@ impl IndexTemplate {
             ingest_settings: IngestSettings::default(),
             search_settings: SearchSettings::default(),
             retention_policy_opt: None,
+            extra_index_uris: Vec::new(),
         }
     }
 }
@@ -179,6 +192,7 @@ impl crate::TestableForRegression for IndexTemplate {
                 evaluation_schedule: "daily".to_string(),
                 timestamp_type: Default::default(),
             }),
+            extra_index_uris: Vec::new(),
         }
     }
 
@@ -272,6 +286,87 @@ mod tests {
         assert_ne!(
             index_config_foo.doc_mapping.doc_mapping_uid,
             index_config_bar.doc_mapping.doc_mapping_uid
+        );
+    }
+
+    #[test]
+    fn test_index_template_serde_with_extra_index_uris() {
+        let index_template_yaml = r#"
+            version: 0.8
+
+            template_id: test-template
+            index_id_patterns:
+              - test-index-*
+            doc_mapping:
+              field_mappings:
+                - name: ts
+                  type: datetime
+                  fast: true
+              timestamp_field: ts
+            extra_index_uris:
+              - s3://bucket-b/indexes
+              - s3://bucket-c/indexes
+        "#;
+        let index_template: IndexTemplate = serde_yaml::from_str(index_template_yaml).unwrap();
+        assert_eq!(index_template.extra_index_uris.len(), 2);
+        assert_eq!(
+            index_template.extra_index_uris[0].as_str(),
+            "s3://bucket-b/indexes"
+        );
+        assert_eq!(
+            index_template.extra_index_uris[1].as_str(),
+            "s3://bucket-c/indexes"
+        );
+
+        // Round-trip through serde.
+        let serialized = serde_json::to_string(&index_template).unwrap();
+        let deserialized: IndexTemplate = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.extra_index_uris,
+            index_template.extra_index_uris
+        );
+    }
+
+    #[test]
+    fn test_index_template_serde_without_extra_index_uris() {
+        let index_template_yaml = r#"
+            version: 0.8
+
+            template_id: test-template
+            index_id_patterns:
+              - test-index-*
+            doc_mapping:
+              field_mappings:
+                - name: ts
+                  type: datetime
+                  fast: true
+              timestamp_field: ts
+        "#;
+        let index_template: IndexTemplate = serde_yaml::from_str(index_template_yaml).unwrap();
+        assert!(index_template.extra_index_uris.is_empty());
+    }
+
+    #[test]
+    fn test_index_template_apply_with_extra_index_uris() {
+        let mut index_template = IndexTemplate::for_test("test-template", &["test-index-*"], 0);
+        index_template.extra_index_uris = vec![
+            Uri::for_test("s3://bucket-b/indexes"),
+            Uri::for_test("s3://bucket-c/indexes"),
+        ];
+
+        let default_index_root_uri = Uri::for_test("s3://bucket-a/indexes");
+        let index_config = index_template
+            .apply_template("test-index-foo".to_string(), &default_index_root_uri)
+            .unwrap();
+
+        assert_eq!(index_config.extra_index_uris.len(), 2);
+        assert_eq!(
+            index_config.extra_index_uris[0].as_str(),
+            "s3://bucket-b/indexes"
+        );
+        assert_eq!(
+            index_config.extra_index_uris[1].as_str(),
+            "s3://bucket-c/indexes"
         );
     }
 

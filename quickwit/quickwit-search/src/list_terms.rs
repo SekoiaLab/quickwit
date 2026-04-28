@@ -20,6 +20,7 @@ use anyhow::Context;
 use futures::future::try_join_all;
 use itertools::{Either, Itertools};
 use quickwit_common::pretty::PrettySample;
+use quickwit_common::uri::Uri;
 use quickwit_config::build_doc_mapper;
 use quickwit_metastore::{ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, SplitMetadata};
 use quickwit_proto::metastore::{ListSplitsRequest, MetastoreService, MetastoreServiceClient};
@@ -35,7 +36,7 @@ use tracing::{debug, error, info, instrument};
 
 use crate::leaf::open_index_with_caches;
 use crate::metrics::queue_label;
-use crate::search_job_placer::group_jobs_by_index_id;
+use crate::search_job_placer::group_jobs_by_index_and_storage;
 use crate::search_permit_provider::compute_initial_memory_allocation;
 use crate::{ClusterClient, SearchError, SearchJob, SearcherContext, resolve_index_patterns};
 
@@ -101,12 +102,12 @@ pub async fn root_list_terms(
     if let Some(end_ts) = list_terms_request.end_timestamp {
         query = query.with_time_range_end_lt(end_ts);
     }
-    let index_uid_to_index_uri: HashMap<IndexUid, String> = indexes_metadata
+    let index_uid_to_index_uri: HashMap<IndexUid, Uri> = indexes_metadata
         .iter()
         .map(|index_metadata| {
             (
                 index_metadata.index_uid.clone(),
-                index_metadata.index_uri().to_string(),
+                index_metadata.index_uri().clone(),
             )
         })
         .collect();
@@ -118,7 +119,15 @@ pub async fn root_list_terms(
         .collect_splits_metadata()
         .await?;
 
-    let jobs: Vec<SearchJob> = split_metadatas.iter().map(SearchJob::from).collect();
+    let jobs: Vec<SearchJob> = split_metadatas
+        .iter()
+        .map(|split_metadata| {
+            let index_uri = index_uid_to_index_uri
+                .get(&split_metadata.index_uid)
+                .expect("index not found in metadata map");
+            SearchJob::from_split_metadata(split_metadata, index_uri)
+        })
+        .collect();
     let assigned_leaf_search_jobs = cluster_client
         .search_job_placer
         .assign_jobs(jobs, &HashSet::default())
@@ -126,8 +135,7 @@ pub async fn root_list_terms(
     let mut leaf_request_tasks = Vec::new();
     // For each node, forward to a node with an affinity for that index id.
     for (client, client_jobs) in assigned_leaf_search_jobs {
-        let leaf_requests =
-            jobs_to_leaf_requests(list_terms_request, &index_uid_to_index_uri, client_jobs)?;
+        let leaf_requests = jobs_to_leaf_requests(list_terms_request, client_jobs)?;
         for leaf_request in leaf_requests {
             leaf_request_tasks.push(cluster_client.leaf_list_terms(leaf_request, client.clone()));
         }
@@ -178,25 +186,21 @@ pub async fn root_list_terms(
     })
 }
 
-/// Builds a list of [`LeafListTermsRequest`], one per index, from a list of [`SearchJob`].
+/// Builds a list of [`LeafListTermsRequest`], one per `(index, storage_uri)` group,
+/// from a list of [`SearchJob`].
 pub fn jobs_to_leaf_requests(
     request: &ListTermsRequest,
-    index_uid_to_uri: &HashMap<IndexUid, String>,
     jobs: Vec<SearchJob>,
 ) -> crate::Result<Vec<LeafListTermsRequest>> {
     let search_request_for_leaf = request.clone();
     let mut leaf_search_requests = Vec::new();
-    group_jobs_by_index_id(jobs, |job_group| {
-        let index_uid = &job_group[0].index_uid;
-        let index_uri = index_uid_to_uri.get(index_uid).ok_or_else(|| {
-            SearchError::Internal(format!(
-                "received list fields job for an unknown index {index_uid}. it should never happen"
-            ))
-        })?;
+    // Group by (index_uid, storage_uri) so splits in different buckets get separate requests.
+    group_jobs_by_index_and_storage(jobs, |job_group| {
+        let storage_uri = &job_group[0].storage_uri;
 
         let leaf_search_request = LeafListTermsRequest {
             list_terms_request: Some(search_request_for_leaf.clone()),
-            index_uri: index_uri.to_string(),
+            index_uri: storage_uri.to_string(),
             split_offsets: job_group.into_iter().map(|job| job.offsets).collect(),
         };
         leaf_search_requests.push(leaf_search_request);

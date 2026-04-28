@@ -153,6 +153,7 @@ pub fn create_split_metadata(
         delete_opstamp: split_attrs.delete_opstamp,
         num_merge_ops: split_attrs.num_merge_ops,
         soft_deleted_doc_ids: BTreeSet::new(),
+        storage_uri: None,
     }
 }
 

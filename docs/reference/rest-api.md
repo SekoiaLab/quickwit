@@ -190,6 +190,7 @@ Create an index by posting an `IndexConfig` payload. The API accepts JSON with `
 | `version`           | `String`           | Config format version, use the same as your Quickwit version.                                                         | _required_                            |
 | `index_id`          | `String`           | Index ID, see its [validation rules](../configuration/index-config.md#index-id) on identifiers.                       | _required_                            |
 | `index_uri`         | `String`           | Defines where the index files are stored. This parameter expects a [storage URI](../configuration/storage-config.md#storage-uris).           | `{default_index_root_uri}/{index_id}` |
+| `extra_index_uris`  | `Array<String>`    | Additional storage URIs for [multi-bucket split sharding](../configuration/index-config.md#extra-index-uris). Must not contain `index_uri`. | `[]`                                  |
 | `doc_mapping`       | `DocMapping`       | Doc mapping object as specified in the [index config docs](../configuration/index-config.md#doc-mapping).             | _required_                            |
 | `indexing_settings` | `IndexingSettings` | Indexing settings object as specified in the [index config docs](../configuration/index-config.md#indexing-settings). |                                       |
 | `search_settings`   | `SearchSettings`   | Search settings object as specified in the [index config docs](../configuration/index-config.md#search-settings).     |                                       |
@@ -306,6 +307,7 @@ Updating the doc mapping doesn't reindex existing data. Queries and results are 
 | `version`           | `String`           | Config format version, use the same as your Quickwit version.                                                         | _required_                            |
 | `index_id`          | `String`           | Index ID, must be the same index as in the request URI.                                                               | _required_                            |
 | `index_uri`         | `String`           | Defines where the index files are stored. Cannot be updated.                                                          | `{default_index_root_uri}/{index_id}`                 |
+| `extra_index_uris`  | `Array<String>`    | Additional storage URIs for [multi-bucket split sharding](../configuration/index-config.md#extra-index-uris). New URIs can be added but existing ones cannot be removed. | `[]`                                  |
 | `doc_mapping`       | `DocMapping`       | Doc mapping object as specified in the [index config docs](../configuration/index-config.md#doc-mapping).             | _required_                            |
 | `indexing_settings` | `IndexingSettings` | Indexing settings object as specified in the [index config docs](../configuration/index-config.md#indexing-settings). |                                       |
 | `search_settings`   | `SearchSettings`   | Search settings object as specified in the [index config docs](../configuration/index-config.md#search-settings).     |                                       |

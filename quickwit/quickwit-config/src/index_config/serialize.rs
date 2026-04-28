@@ -89,6 +89,13 @@ pub fn load_index_config_update(
         current_index_config.index_uri,
         new_index_config.index_uri
     );
+    for current_uri in &current_index_config.extra_index_uris {
+        ensure!(
+            new_index_config.extra_index_uris.contains(current_uri),
+            "`extra_index_uris` cannot have URIs removed during an update, missing URI: {}",
+            current_uri,
+        );
+    }
     let (updated_doc_mapping, _mutation_occurred) = prepare_doc_mapping_update(
         new_index_config.doc_mapping,
         &current_index_config.doc_mapping,
@@ -134,6 +141,7 @@ impl IndexConfigForSerialization {
             ingest_settings: self.ingest_settings,
             search_settings: self.search_settings,
             retention_policy_opt: self.retention_policy_opt,
+            extra_index_uris: self.extra_index_uris,
         };
         validate_index_config(
             &index_config.doc_mapping,
@@ -141,6 +149,14 @@ impl IndexConfigForSerialization {
             &index_config.search_settings,
             &index_config.retention_policy_opt,
         )?;
+        // Validate that extra_index_uris don't contain the primary index_uri.
+        for extra_uri in &index_config.extra_index_uris {
+            ensure!(
+                *extra_uri != index_config.index_uri,
+                "`extra_index_uris` must not contain the primary `index_uri` ({})",
+                index_config.index_uri,
+            );
+        }
         Ok(index_config)
     }
 }
@@ -184,6 +200,11 @@ pub struct IndexConfigV0_8 {
     #[serde(rename = "retention")]
     #[serde(default)]
     pub retention_policy_opt: Option<RetentionPolicy>,
+    /// Additional storage URIs where splits can be sharded across multiple buckets.
+    /// The primary `index_uri` is always included implicitly.
+    #[schema(value_type = Vec<String>)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_index_uris: Vec<Uri>,
 }
 
 impl From<IndexConfig> for IndexConfigV0_8 {
@@ -196,6 +217,7 @@ impl From<IndexConfig> for IndexConfigV0_8 {
             ingest_settings: index_config.ingest_settings,
             search_settings: index_config.search_settings,
             retention_policy_opt: index_config.retention_policy_opt,
+            extra_index_uris: index_config.extra_index_uris,
         }
     }
 }
@@ -417,6 +439,99 @@ mod test {
             IndexingSettings::default_commit_timeout_secs()
         );
         assert_eq!(updated_config.retention_policy_opt, None);
+    }
+
+    #[test]
+    fn test_update_extra_index_uris() {
+        let original_config_yaml = r#"
+            version: 0.8
+            index_id: hdfs-logs
+            doc_mapping: {}
+            extra_index_uris:
+                - s3://bucket-a/hdfs-logs
+                - s3://bucket-b/hdfs-logs
+        "#;
+        let default_root = Uri::for_test("s3://mybucket");
+        let original_config: IndexConfig = load_index_config_from_user_config(
+            ConfigFormat::Yaml,
+            original_config_yaml.as_bytes(),
+            &default_root,
+        )
+        .unwrap();
+
+        // Adding a URI is allowed.
+        let updated_config_yaml = r#"
+            version: 0.8
+            index_id: hdfs-logs
+            doc_mapping: {}
+            extra_index_uris:
+                - s3://bucket-a/hdfs-logs
+                - s3://bucket-b/hdfs-logs
+                - s3://bucket-c/hdfs-logs
+        "#;
+        let updated_config = load_index_config_update(
+            ConfigFormat::Yaml,
+            updated_config_yaml.as_bytes(),
+            &default_root,
+            &original_config,
+        )
+        .unwrap();
+        assert_eq!(updated_config.extra_index_uris.len(), 3);
+
+        // Keeping the same URIs is allowed.
+        let updated_config_yaml = r#"
+            version: 0.8
+            index_id: hdfs-logs
+            doc_mapping: {}
+            extra_index_uris:
+                - s3://bucket-a/hdfs-logs
+                - s3://bucket-b/hdfs-logs
+        "#;
+        load_index_config_update(
+            ConfigFormat::Yaml,
+            updated_config_yaml.as_bytes(),
+            &default_root,
+            &original_config,
+        )
+        .expect("keeping same extra_index_uris should succeed");
+
+        // Removing a URI is not allowed.
+        let updated_config_yaml = r#"
+            version: 0.8
+            index_id: hdfs-logs
+            doc_mapping: {}
+            extra_index_uris:
+                - s3://bucket-a/hdfs-logs
+        "#;
+        let err = load_index_config_update(
+            ConfigFormat::Yaml,
+            updated_config_yaml.as_bytes(),
+            &default_root,
+            &original_config,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("`extra_index_uris` cannot have URIs removed"),
+            "unexpected error: {err:?}"
+        );
+
+        // Removing all extra URIs is not allowed.
+        let updated_config_yaml = r#"
+            version: 0.8
+            index_id: hdfs-logs
+            doc_mapping: {}
+        "#;
+        let err = load_index_config_update(
+            ConfigFormat::Yaml,
+            updated_config_yaml.as_bytes(),
+            &default_root,
+            &original_config,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("`extra_index_uris` cannot have URIs removed"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

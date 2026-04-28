@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod bucket_selector;
 mod indexing_split_cache;
 mod indexing_split_store;
 mod split_store_quota;
 
+pub use bucket_selector::{BucketSelector, default_bucket_selector};
 pub use indexing_split_cache::{IndexingSplitCache, get_tantivy_directory_from_split_bundle};
 pub use indexing_split_store::IndexingSplitStore;
 pub use split_store_quota::SplitStoreQuota;

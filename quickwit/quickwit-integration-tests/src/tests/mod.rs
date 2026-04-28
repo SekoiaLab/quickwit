@@ -17,6 +17,7 @@ mod ingest_v1_tests;
 mod ingest_v2_tests;
 #[cfg(feature = "kafka-broker-tests")]
 mod kafka_tests;
+mod multi_bucket_tests;
 mod no_cp_tests;
 mod otlp_tests;
 mod secondary_timestamp;

@@ -32,7 +32,7 @@ use quickwit_ingest::IngesterPool;
 use quickwit_proto::indexing::IndexingPipelineId;
 use quickwit_proto::metastore::{MetastoreError, MetastoreServiceClient};
 use quickwit_proto::types::ShardId;
-use quickwit_storage::{Storage, StorageResolver};
+use quickwit_storage::StorageResolver;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, instrument};
 
@@ -578,7 +578,6 @@ impl Handler<AssignShards> for IndexingPipeline {
 pub struct IndexingPipelineParams {
     pub pipeline_id: IndexingPipelineId,
     pub metastore: MetastoreServiceClient,
-    pub storage: Arc<dyn Storage>,
 
     // Indexing-related parameters
     pub doc_mapper: Arc<DocMapper>,
@@ -710,7 +709,7 @@ mod tests {
         let universe = Universe::new();
         let (merge_planner_mailbox, _) = universe.create_test_mailbox();
         let storage = Arc::new(RamStorage::default());
-        let split_store = IndexingSplitStore::create_without_local_store_for_test(storage.clone());
+        let split_store = IndexingSplitStore::create_without_local_store_for_test(storage);
         let pipeline_params = IndexingPipelineParams {
             pipeline_id,
             doc_mapper: Arc::new(default_doc_mapper_for_test()),
@@ -720,7 +719,6 @@ mod tests {
             indexing_settings: IndexingSettings::for_test(),
             ingester_pool: IngesterPool::default(),
             metastore: MetastoreServiceClient::from_mock(mock_metastore),
-            storage,
             split_store,
             merge_policy: default_merge_policy(),
             retention_policy: None,
@@ -833,7 +831,7 @@ mod tests {
 
         let universe = Universe::new();
         let storage = Arc::new(RamStorage::default());
-        let split_store = IndexingSplitStore::create_without_local_store_for_test(storage.clone());
+        let split_store = IndexingSplitStore::create_without_local_store_for_test(storage);
         let (merge_planner_mailbox, _) = universe.create_test_mailbox();
         let pipeline_params = IndexingPipelineParams {
             pipeline_id,
@@ -845,7 +843,6 @@ mod tests {
             ingester_pool: IngesterPool::default(),
             metastore: MetastoreServiceClient::from_mock(mock_metastore),
             queues_dir_path: PathBuf::from("./queues"),
-            storage,
             split_store,
             merge_policy: default_merge_policy(),
             retention_policy: None,
@@ -918,7 +915,7 @@ mod tests {
         let universe = Universe::with_accelerated_time();
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
         let storage = Arc::new(RamStorage::default());
-        let split_store = IndexingSplitStore::create_without_local_store_for_test(storage.clone());
+        let split_store = IndexingSplitStore::create_without_local_store_for_test(storage);
         let merge_pipeline_params = MergePipelineParams {
             pipeline_id: pipeline_id.merge_pipeline_id(),
             doc_mapper: doc_mapper.clone(),
@@ -946,7 +943,6 @@ mod tests {
             ingester_pool: IngesterPool::default(),
             metastore,
             queues_dir_path: PathBuf::from("./queues"),
-            storage,
             split_store,
             merge_policy: default_merge_policy(),
             retention_policy: None,
@@ -1044,7 +1040,7 @@ mod tests {
             .returning(|_| Ok(EmptyResponse {}));
         let universe = Universe::new();
         let storage = Arc::new(RamStorage::default());
-        let split_store = IndexingSplitStore::create_without_local_store_for_test(storage.clone());
+        let split_store = IndexingSplitStore::create_without_local_store_for_test(storage);
         let (merge_planner_mailbox, _) = universe.create_test_mailbox();
         // Create a minimal mapper with wrong date format to ensure that all documents will fail
         let broken_mapper = serde_json::from_str::<DocMapper>(
@@ -1074,7 +1070,6 @@ mod tests {
             ingester_pool: IngesterPool::default(),
             metastore: MetastoreServiceClient::from_mock(mock_metastore),
             queues_dir_path: PathBuf::from("./queues"),
-            storage,
             split_store,
             merge_policy: default_merge_policy(),
             retention_policy: None,

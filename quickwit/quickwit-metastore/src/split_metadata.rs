@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use bytesize::ByteSize;
+use quickwit_common::uri::Uri;
 use quickwit_proto::types::{DocMappingUid, IndexUid, SourceId, SplitId};
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
@@ -138,6 +139,10 @@ pub struct SplitMetadata {
 
     /// Set of tantivy doc_ids that have been soft-deleted from this split.
     pub soft_deleted_doc_ids: BTreeSet<u32>,
+
+    /// The storage URI where this split is stored. When `None`, the split is stored
+    /// under the index-level `index_uri`.
+    pub storage_uri: Option<Uri>,
 }
 
 impl fmt::Debug for SplitMetadata {
@@ -183,6 +188,9 @@ impl fmt::Debug for SplitMetadata {
         debug_struct.field("footer_offsets", &self.footer_offsets);
         debug_struct.field("delete_opstamp", &self.delete_opstamp);
         debug_struct.field("num_merge_ops", &self.num_merge_ops);
+        if let Some(ref storage_uri) = self.storage_uri {
+            debug_struct.field("storage_uri", storage_uri);
+        }
         if !self.soft_deleted_doc_ids.is_empty() {
             debug_struct.field("soft_deleted_doc_ids", &self.soft_deleted_doc_ids);
         }
@@ -249,6 +257,12 @@ impl SplitMetadata {
             num_docs: self.num_docs,
         }
     }
+
+    /// Returns the storage URI for this split, falling back to the given
+    /// index-level URI when no per-split URI is set.
+    pub fn effective_storage_uri<'a>(&'a self, default_index_uri: &'a Uri) -> &'a Uri {
+        self.storage_uri.as_ref().unwrap_or(default_index_uri)
+    }
 }
 
 /// A summarized version of the split metadata for display purposes.
@@ -293,6 +307,7 @@ impl quickwit_config::TestableForRegression for SplitMetadata {
             num_merge_ops: 3,
             doc_mapping_uid: DocMappingUid::default(),
             soft_deleted_doc_ids: BTreeSet::new(),
+            storage_uri: None,
         }
     }
 
@@ -435,6 +450,7 @@ mod tests {
             num_merge_ops: 0,
             doc_mapping_uid: DocMappingUid::default(),
             soft_deleted_doc_ids: BTreeSet::new(),
+            storage_uri: None,
         };
 
         let expected_output =
