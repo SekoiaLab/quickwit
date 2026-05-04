@@ -70,7 +70,7 @@ impl Default for MultiPartPolicy {
             // QW originally used 5GB to limit the number of PUT requests. This
             // is a bit excessive, and many cloud providers don't bill by
             // request. We don't want it to be too small either because parts
-            // incure a performance overhead when a range request spans 2 parts.
+            // incur a performance overhead when a range request spans 2 parts.
             target_part_num_bytes: 2_000_000_000, // 2GB
             multipart_threshold_num_bytes: 128 * 1_024 * 1_024, // 128 MiB
             max_num_parts: 10_000,
