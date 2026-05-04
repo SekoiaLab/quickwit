@@ -119,8 +119,11 @@ impl SearchPermitProvider {
         &self,
         splits: impl IntoIterator<Item = ByteSize>,
     ) -> Vec<SearchPermitFuture> {
+        let permit_sizes: Vec<u64> = splits.into_iter().map(|size| size.as_u64()).collect();
+        if permit_sizes.is_empty() {
+            return Vec::new();
+        }
         let (permit_sender, permit_receiver) = oneshot::channel();
-        let permit_sizes = splits.into_iter().map(|size| size.as_u64()).collect();
         self.message_sender
             .send(SearchPermitMessage::Request {
                 permit_sender,
@@ -160,7 +163,7 @@ struct LeafPermitRequest {
 
 impl Ord for LeafPermitRequest {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // we compare other with self and not the other way arround because we want a min-heap and
+        // we compare other with self and not the other way around because we want a min-heap and
         // Rust's is a max-heap
         other
             .single_split_permit_requests
@@ -238,6 +241,11 @@ impl SearchPermitActor {
                 permit_sizes,
                 permit_sender,
             } => {
+                assert_ne!(
+                    permit_sizes.len(),
+                    0,
+                    "empty permit request would lead to deadlock"
+                );
                 let (leaf_permit_request, permits) =
                     LeafPermitRequest::from_estimated_costs(permit_sizes);
                 self.permits_requests.push(leaf_permit_request);
@@ -312,9 +320,12 @@ impl SearchPermitActor {
                 // created SearchPermit which releases the resources
                 .ok();
         }
-        self.metrics
-            .pending_tasks
-            .set(self.permits_requests.len() as i64);
+        let pending_tasks = self
+            .permits_requests
+            .iter()
+            .map(|leaf_req| leaf_req.single_split_permit_requests.as_slice().len() as i64)
+            .sum();
+        self.metrics.pending_tasks.set(pending_tasks);
     }
 }
 
@@ -399,6 +410,18 @@ mod tests {
 
     fn test_metrics() -> SearchTaskMetrics {
         SEARCH_METRICS.search_task_metrics()
+    }
+
+    #[tokio::test]
+    async fn test_get_permits_empty() {
+        let permit_provider = SearchPermitProvider::new(1, ByteSize::mb(100), test_metrics());
+        let permits = permit_provider.get_permits(std::iter::empty()).await;
+        assert!(permits.is_empty());
+
+        // Subsequent non-empty requests must still be served normally.
+        let permits = permit_provider.get_permits([ByteSize::mb(10)]).await;
+        assert_eq!(permits.len(), 1);
+        let _permit = permits.into_iter().next().unwrap().await;
     }
 
     #[tokio::test]
