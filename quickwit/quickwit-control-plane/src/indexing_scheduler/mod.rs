@@ -312,6 +312,21 @@ impl IndexingScheduler {
         self.state.clone()
     }
 
+    /// Loads a frozen indexing plan without applying it
+    /// to indexers or triggering any scheduling logic.
+    ///
+    /// This is used during control plane initialization when maintenance mode is active:
+    /// the frozen plan is restored as the `current_targeted_physical_plan` so that the
+    /// `control_running_plan` loop can re-apply it to indexers that restart during the
+    /// maintenance window.
+    pub(crate) fn load_frozen_plan(&mut self, plan: crate::indexing_plan::PhysicalIndexingPlan) {
+        info!(
+            num_indexers = plan.num_indexers(),
+            "loading frozen indexing plan (maintenance mode)"
+        );
+        self.state.current_targeted_physical_plan = Some(plan);
+    }
+
     // Should be called whenever a change in the list of index/shard
     // has happened.
     //

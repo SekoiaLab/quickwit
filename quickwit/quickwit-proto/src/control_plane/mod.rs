@@ -41,6 +41,8 @@ pub enum ControlPlaneError {
     TooManyRequests,
     #[error("service unavailable: {0}")]
     Unavailable(String),
+    #[error("cluster is in maintenance mode: mutations and scheduling are frozen")]
+    MaintenanceMode,
 }
 
 impl From<TimeoutExceeded> for ControlPlaneError {
@@ -69,6 +71,7 @@ impl ServiceError for ControlPlaneError {
             Self::Timeout(_) => ServiceErrorCode::Timeout,
             Self::TooManyRequests => ServiceErrorCode::TooManyRequests,
             Self::Unavailable(_) => ServiceErrorCode::Unavailable,
+            Self::MaintenanceMode => ServiceErrorCode::Unavailable,
         }
     }
 }
@@ -108,6 +111,9 @@ impl From<ControlPlaneError> for MetastoreError {
             ControlPlaneError::Timeout(message) => MetastoreError::Timeout(message),
             ControlPlaneError::TooManyRequests => MetastoreError::TooManyRequests,
             ControlPlaneError::Unavailable(message) => MetastoreError::Unavailable(message),
+            ControlPlaneError::MaintenanceMode => {
+                MetastoreError::Unavailable("cluster is in maintenance mode".to_string())
+            }
         }
     }
 }
@@ -157,6 +163,24 @@ impl GetOrCreateOpenShardsFailureReason {
             source_id: subrequest.source_id,
             reason: *self as i32,
         }
+    }
+}
+
+impl RpcName for EnableMaintenanceModeRequest {
+    fn rpc_name() -> &'static str {
+        "enable_maintenance_mode"
+    }
+}
+
+impl RpcName for DisableMaintenanceModeRequest {
+    fn rpc_name() -> &'static str {
+        "disable_maintenance_mode"
+    }
+}
+
+impl RpcName for GetMaintenanceModeRequest {
+    fn rpc_name() -> &'static str {
+        "get_maintenance_mode"
     }
 }
 
