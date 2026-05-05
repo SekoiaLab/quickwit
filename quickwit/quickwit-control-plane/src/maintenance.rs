@@ -15,7 +15,7 @@
 //! Maintenance mode management for the Quickwit control plane.
 //!
 //! When maintenance mode is enabled:
-//! - Metadata mutations (index/source CRUD) are rejected with a `MaintenanceMode` error.
+//! - Metadata mutations (index/source CRUD) are allowed but the indexing plan is not rebuilt.
 //! - The indexing plan is frozen: it is not rebuilt when indexers join or leave.
 //! - Shard scaling (up/down) and rebalancing are paused.
 //! - The frozen plan and maintenance metadata are persisted to the metastore `kv` table so they
