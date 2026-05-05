@@ -43,7 +43,7 @@ use quickwit_proto::metastore::{
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::indexing_plan::PhysicalIndexingPlan;
 
@@ -134,7 +134,7 @@ impl MaintenanceState {
 pub trait MaintenancePersistence: Send + Sync + std::fmt::Debug + 'static {
     /// Loads the maintenance state from persistent storage.
     /// Returns `None` if no maintenance state is persisted.
-    async fn load(&self) -> anyhow::Result<Option<MaintenancePersistedState>>;
+    async fn load(&self) -> Option<MaintenancePersistedState>;
 
     /// Persists the maintenance metadata and frozen plan atomically.
     async fn save(
@@ -166,17 +166,15 @@ impl InMemoryPersistence {
 
 #[async_trait]
 impl MaintenancePersistence for InMemoryPersistence {
-    async fn load(&self) -> anyhow::Result<Option<MaintenancePersistedState>> {
+    async fn load(&self) -> Option<MaintenancePersistedState> {
         let state = self.state.lock().unwrap();
         match state.as_deref() {
             Some(bytes) => {
-                let persisted: MaintenancePersistedState =
-                    postcard::from_bytes(bytes).map_err(|err| {
-                        anyhow::anyhow!("failed to deserialize maintenance state: {err}")
-                    })?;
-                Ok(Some(persisted))
+                let persisted: MaintenancePersistedState = postcard::from_bytes(bytes)
+                    .expect("failed to deserialize maintenance state from in-memory bytes");
+                Some(persisted)
             }
-            None => Ok(None),
+            None => None,
         }
     }
 
@@ -220,48 +218,25 @@ impl MetastoreKvPersistence {
 
 #[async_trait]
 impl MaintenancePersistence for MetastoreKvPersistence {
-    async fn load(&self) -> anyhow::Result<Option<MaintenancePersistedState>> {
+    async fn load(&self) -> Option<MaintenancePersistedState> {
         let response = self
             .metastore
             .clone()
             .get_kv(GetKvRequest {
                 key: KV_KEY_MAINTENANCE_STATE.to_string(),
             })
-            .await?;
+            .await
+            .expect("failed to get maintenance state from metastore");
         match response.value {
             Some(encoded) => {
-                let result = base64::engine::general_purpose::STANDARD
+                let decoded = base64::engine::general_purpose::STANDARD
                     .decode(&encoded)
-                    .map_err(|err| anyhow::anyhow!(err))
-                    .and_then(|bytes| {
-                        postcard::from_bytes(&bytes).map_err(|err| anyhow::anyhow!(err))
-                    });
-                match result {
-                    Ok(persisted) => Ok(Some(persisted)),
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            "failed to deserialize maintenance state; clearing corrupted key and \
-                             starting in normal mode"
-                        );
-                        if let Err(delete_err) = self
-                            .metastore
-                            .clone()
-                            .delete_kv(DeleteKvRequest {
-                                key: KV_KEY_MAINTENANCE_STATE.to_string(),
-                            })
-                            .await
-                        {
-                            warn!(
-                                error = %delete_err,
-                                "failed to delete corrupted maintenance state key"
-                            );
-                        }
-                        Ok(None)
-                    }
-                }
+                    .expect("maintenance state in metastore should always be valid base64");
+                let persisted: MaintenancePersistedState = postcard::from_bytes(&decoded)
+                    .expect("failed to deserialize maintenance state from metastore bytes");
+                Some(persisted)
             }
-            None => Ok(None),
+            None => None,
         }
     }
 
@@ -430,7 +405,7 @@ mod tests {
         let persistence = InMemoryPersistence::new();
 
         // Initially empty
-        let loaded = persistence.load().await.unwrap();
+        let loaded = persistence.load().await;
         assert!(loaded.is_none());
 
         // Save
@@ -441,13 +416,13 @@ mod tests {
         persistence.save(&metadata, &plan).await.unwrap();
 
         // Load
-        let loaded = persistence.load().await.unwrap().unwrap();
+        let loaded = persistence.load().await.unwrap();
         assert_eq!(loaded.metadata, metadata);
         assert_eq!(loaded.frozen_plan, plan);
 
         // Clear
         persistence.clear().await.unwrap();
-        let loaded = persistence.load().await.unwrap();
+        let loaded = persistence.load().await;
         assert!(loaded.is_none());
     }
 
@@ -467,7 +442,7 @@ mod tests {
         let plan2 = PhysicalIndexingPlan::with_indexer_ids(&["b".to_string()]);
         persistence.save(&metadata2, &plan2).await.unwrap();
 
-        let loaded = persistence.load().await.unwrap().unwrap();
+        let loaded = persistence.load().await.unwrap();
         assert_eq!(loaded.metadata, metadata2);
         assert_eq!(loaded.frozen_plan, plan2);
     }

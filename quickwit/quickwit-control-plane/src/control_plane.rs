@@ -58,7 +58,7 @@ use quickwit_proto::types::{IndexId, IndexUid, NodeId, ShardId, SourceId, Source
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 use tokio::sync::watch;
-use tracing::{Level, debug, enabled, error, info, warn};
+use tracing::{Level, debug, enabled, error, info};
 
 use crate::IndexerPool;
 use crate::cooldown_map::{CooldownMap, CooldownStatus};
@@ -279,7 +279,6 @@ impl Actor for ControlPlane {
             .await
             .context("failed to initialize control plane model")?;
 
-        // Load maintenance state from persistent storage.
         self.load_maintenance_state_from_persistence().await;
 
         if self.maintenance.is_active() {
@@ -319,7 +318,7 @@ impl ControlPlane {
     /// Called during `initialize()`.
     async fn load_maintenance_state_from_persistence(&mut self) {
         match self.maintenance_persistence.load().await {
-            Ok(Some(persisted)) => {
+            Some(persisted) => {
                 self.maintenance.load_from_metadata(persisted.metadata);
                 if self.maintenance.is_active() {
                     crate::metrics::CONTROL_PLANE_METRICS
@@ -333,14 +332,8 @@ impl ControlPlane {
                         .load_frozen_plan(persisted.frozen_plan);
                 }
             }
-            Ok(None) => {
+            None => {
                 // No maintenance state persisted — normal operation.
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    "failed to load maintenance state from persistence, starting in normal mode"
-                );
             }
         }
     }
