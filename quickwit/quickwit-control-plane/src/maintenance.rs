@@ -24,19 +24,11 @@
 //! # Persistence
 //!
 //! One key is stored in the metastore `kv` table:
-//! - `maintenance_state`: postcard-serialized (then base64-encoded) [`MaintenancePersistedState`]
-//!   (contains both metadata and frozen plan)
-//!
-//! # Integration
-//!
-//! Persistence is abstracted behind the [`MaintenancePersistence`] trait. The production
-//! implementation ([`MetastoreKvPersistence`]) uses the metastore's `GetKv`/`SetKv`/`DeleteKv`
-//! RPCs (which read/write to the PostgreSQL `kv` table). Tests can use [`InMemoryPersistence`].
+//! - `maintenance_state`: a JSON envolope with the binary encoded plan
 
-use std::sync::{Arc, Mutex};
-
-use async_trait::async_trait;
 use base64::Engine as _;
+use prost::Message;
+use quickwit_proto::control_plane::{MaintenanceFrozenPlan, MaintenanceFrozenPlanForNode};
 use quickwit_proto::metastore::{
     DeleteKvRequest, GetKvRequest, MetastoreService, MetastoreServiceClient, SetKvRequest,
 };
@@ -48,7 +40,15 @@ use tracing::info;
 use crate::indexing_plan::PhysicalIndexingPlan;
 
 /// Key in the metastore `kv` table for the combined maintenance state.
-pub const KV_KEY_MAINTENANCE_STATE: &str = "maintenance_state";
+pub const KV_KEY_MAINTENANCE_STATE: &str = "control_plane_maintenance_state";
+
+pub const LATEST_MAINTENANCE_FROZEN_PLAN_VERSION: MaintenanceFrozenPlanVersion =
+    MaintenanceFrozenPlanVersion::V1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MaintenanceFrozenPlanVersion {
+    V1 = 1,
+}
 
 /// Metadata persisted alongside the maintenance mode flag.
 ///
@@ -57,7 +57,9 @@ pub const KV_KEY_MAINTENANCE_STATE: &str = "maintenance_state";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MaintenanceModeMetadata {
     /// RFC 3339 formatted UTC datetime when maintenance mode was enabled.
-    pub enabled_at: String,
+    enabled_at: String,
+    /// The version of the maintenance state schema.
+    version: MaintenanceFrozenPlanVersion,
 }
 
 impl MaintenanceModeMetadata {
@@ -65,14 +67,9 @@ impl MaintenanceModeMetadata {
     pub fn new_now() -> Self {
         Self {
             enabled_at: now_rfc3339(),
+            version: LATEST_MAINTENANCE_FROZEN_PLAN_VERSION,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MaintenancePersistedState {
-    pub metadata: MaintenanceModeMetadata,
-    pub frozen_plan: PhysicalIndexingPlan,
 }
 
 /// In-memory maintenance mode state for the control plane.
@@ -93,14 +90,24 @@ impl MaintenanceState {
         self.metadata.as_ref()
     }
 
+    /// Returns the metadata if maintenance mode is active.
+    pub fn enabled_at(&self) -> Option<String> {
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.enabled_at.clone())
+    }
+
     /// Enables maintenance mode.
     /// Returns the metadata that was set.
     pub fn enable(&mut self) -> MaintenanceModeMetadata {
-        let enabled_at = now_rfc3339();
-        let metadata = MaintenanceModeMetadata { enabled_at };
+        let metadata = MaintenanceModeMetadata {
+            enabled_at: now_rfc3339(),
+            version: LATEST_MAINTENANCE_FROZEN_PLAN_VERSION,
+        };
         self.metadata = Some(metadata.clone());
         info!(
             enabled_at = %metadata.enabled_at,
+            version = ?metadata.version,
             "maintenance mode enabled"
         );
         metadata
@@ -129,82 +136,96 @@ impl MaintenanceState {
 
 // -- Persistence Trait --
 
-/// Persistence abstraction for maintenance mode state.
-#[async_trait]
-pub trait MaintenancePersistence: Send + Sync + std::fmt::Debug + 'static {
-    /// Loads the maintenance state from persistent storage.
-    /// Returns `None` if no maintenance state is persisted.
-    async fn load(&self) -> Option<MaintenancePersistedState>;
-
-    /// Persists the maintenance metadata and frozen plan atomically.
-    async fn save(
-        &self,
-        metadata: &MaintenanceModeMetadata,
-        frozen_plan: &PhysicalIndexingPlan,
-    ) -> anyhow::Result<()>;
-
-    /// Clears all persisted maintenance state.
-    async fn clear(&self) -> anyhow::Result<()>;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaintenancePersistedState {
+    pub metadata: MaintenanceModeMetadata,
+    pub frozen_plan: PhysicalIndexingPlan,
 }
 
-/// In-memory implementation of [`MaintenancePersistence`] for tests.
-///
-/// This implementation stores raw postcard bytes in a thread-safe `Option<Vec<u8>>` and does not
-/// persist across process restarts.
-#[derive(Debug, Clone, Default)]
-pub struct InMemoryPersistence {
-    state: Arc<Mutex<Option<Vec<u8>>>>,
-}
-
-impl InMemoryPersistence {
-    pub fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(None)),
+impl MaintenancePersistedState {
+    pub fn serialize(&self) -> anyhow::Result<String> {
+        match self.metadata.version {
+            MaintenanceFrozenPlanVersion::V1 => self.serialize_v1(),
         }
     }
-}
 
-#[async_trait]
-impl MaintenancePersistence for InMemoryPersistence {
-    async fn load(&self) -> Option<MaintenancePersistedState> {
-        let state = self.state.lock().unwrap();
-        match state.as_deref() {
-            Some(bytes) => {
-                let persisted: MaintenancePersistedState = postcard::from_bytes(bytes)
-                    .expect("failed to deserialize maintenance state from in-memory bytes");
-                Some(persisted)
+    pub fn deserialize(encoded: &str) -> anyhow::Result<Self> {
+        let envelope: serde_json::Value = serde_json::from_str(encoded)?;
+        let metadata: MaintenanceModeMetadata =
+            serde_json::from_value(envelope["metadata"].clone())?;
+        let frozen_plan = match metadata.version {
+            MaintenanceFrozenPlanVersion::V1 => {
+                Self::deserialize_v1_frozen_plan(envelope["frozen_plan"].as_str().ok_or_else(
+                    || anyhow::anyhow!("missing frozen_plan field in maintenance state"),
+                )?)?
             }
-            None => None,
-        }
-    }
-
-    async fn save(
-        &self,
-        metadata: &MaintenanceModeMetadata,
-        frozen_plan: &PhysicalIndexingPlan,
-    ) -> anyhow::Result<()> {
-        let persisted = MaintenancePersistedState {
-            metadata: metadata.clone(),
-            frozen_plan: frozen_plan.clone(),
         };
-        let bytes = postcard::to_allocvec(&persisted)
-            .map_err(|err| anyhow::anyhow!("failed to serialize maintenance state: {err}"))?;
-        let mut state = self.state.lock().unwrap();
-        *state = Some(bytes);
-        Ok(())
+        Ok(Self {
+            metadata,
+            frozen_plan,
+        })
     }
 
-    async fn clear(&self) -> anyhow::Result<()> {
-        let mut state = self.state.lock().unwrap();
-        *state = None;
-        Ok(())
+    fn deserialize_v1_frozen_plan(encoded: &str) -> anyhow::Result<PhysicalIndexingPlan> {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|err| anyhow::anyhow!("failed to base64 decode frozen plan: {err}"))?;
+        let proto_state = MaintenanceFrozenPlan::decode(&decoded[..])
+            .map_err(|err| anyhow::anyhow!("failed to decode protobuf frozen plan: {err}"))?;
+
+        // Collect all indexer node IDs to initialize the plan
+        let indexer_ids: Vec<String> = proto_state
+            .state_per_node
+            .iter()
+            .map(|node_state| node_state.index_id.clone())
+            .collect();
+
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&indexer_ids);
+
+        for node_state in proto_state.state_per_node {
+            for task in node_state.indexing_tasks {
+                plan.add_indexing_task(&node_state.index_id, task);
+            }
+        }
+        Ok(plan)
+    }
+
+    fn serialize_v1(&self) -> anyhow::Result<String> {
+        let proto_state = self.frozen_plan_to_proto();
+
+        // Encode the protobuf message to binary
+        let mut buf = Vec::new();
+        prost::Message::encode(&proto_state, &mut buf)
+            .map_err(|err| anyhow::anyhow!("failed to encode protobuf: {err}"))?;
+
+        // Base64 encode the binary data
+        let base64_encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+
+        let json_value = serde_json::json!({
+            "frozen_plan": base64_encoded,
+            "metadata": serde_json::to_value(&self.metadata)?,
+        });
+        Ok(serde_json::to_string(&json_value)?)
+    }
+
+    /// Converts the frozen plan to the protobuf representation.
+    fn frozen_plan_to_proto(&self) -> MaintenanceFrozenPlan {
+        let state_per_node: Vec<MaintenanceFrozenPlanForNode> = self
+            .frozen_plan
+            .indexing_tasks_per_indexer()
+            .iter()
+            .map(|(node_id, tasks)| MaintenanceFrozenPlanForNode {
+                index_id: node_id.clone(),
+                indexing_tasks: tasks.clone(),
+            })
+            .collect();
+
+        MaintenanceFrozenPlan { state_per_node }
     }
 }
 
-// -- Metastore-backed persistence --
-
-/// Production implementation of [`MaintenancePersistence`] that uses the metastore's
-/// `GetKv`/`SetKv`/`DeleteKv` RPCs to persist maintenance state in the PostgreSQL `kv` table.
+/// Persists maintenance state using the metastore's `GetKv`/`SetKv`/`DeleteKv`
+/// RPCs to the PostgreSQL `kv` table.
 #[derive(Debug, Clone)]
 pub struct MetastoreKvPersistence {
     metastore: MetastoreServiceClient,
@@ -214,11 +235,10 @@ impl MetastoreKvPersistence {
     pub fn new(metastore: MetastoreServiceClient) -> Self {
         Self { metastore }
     }
-}
 
-#[async_trait]
-impl MaintenancePersistence for MetastoreKvPersistence {
-    async fn load(&self) -> Option<MaintenancePersistedState> {
+    /// Loads the maintenance state from persistent storage.
+    /// Returns `None` if no maintenance state is persisted.
+    pub async fn load(&self) -> Option<MaintenancePersistedState> {
         let response = self
             .metastore
             .clone()
@@ -229,18 +249,16 @@ impl MaintenancePersistence for MetastoreKvPersistence {
             .expect("failed to get maintenance state from metastore");
         match response.value {
             Some(encoded) => {
-                let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(&encoded)
-                    .expect("maintenance state in metastore should always be valid base64");
-                let persisted: MaintenancePersistedState = postcard::from_bytes(&decoded)
-                    .expect("failed to deserialize maintenance state from metastore bytes");
+                let persisted = MaintenancePersistedState::deserialize(&encoded)
+                    .expect("failed to deserialize maintenance state from metastore");
                 Some(persisted)
             }
             None => None,
         }
     }
 
-    async fn save(
+    /// Persists the maintenance metadata and frozen plan atomically.
+    pub async fn save(
         &self,
         metadata: &MaintenanceModeMetadata,
         frozen_plan: &PhysicalIndexingPlan,
@@ -249,20 +267,19 @@ impl MaintenancePersistence for MetastoreKvPersistence {
             metadata: metadata.clone(),
             frozen_plan: frozen_plan.clone(),
         };
-        let bytes = postcard::to_allocvec(&persisted)
-            .map_err(|err| anyhow::anyhow!("failed to serialize maintenance state: {err}"))?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let serialized = persisted.serialize()?;
         self.metastore
             .clone()
             .set_kv(SetKvRequest {
                 key: KV_KEY_MAINTENANCE_STATE.to_string(),
-                value: encoded,
+                value: serialized,
             })
             .await?;
         Ok(())
     }
 
-    async fn clear(&self) -> anyhow::Result<()> {
+    /// Clears all persisted maintenance state.
+    pub async fn clear(&self) -> anyhow::Result<()> {
         self.metastore
             .clone()
             .delete_kv(DeleteKvRequest {
@@ -289,6 +306,10 @@ fn now_rfc3339() -> String {
 
 #[cfg(test)]
 mod tests {
+    use quickwit_proto::metastore::{
+        EmptyResponse, GetKvResponse, MetastoreServiceClient, MockMetastoreService,
+    };
+
     use super::*;
 
     #[test]
@@ -324,20 +345,10 @@ mod tests {
     }
 
     #[test]
-    fn test_maintenance_metadata_serde_round_trip() {
+    fn test_current_persisted_state_version_roundtrip() {
         let metadata = MaintenanceModeMetadata {
             enabled_at: "2024-06-15T14:30:00Z".to_string(),
-        };
-        let json = serde_json::to_string(&metadata).unwrap();
-        assert!(json.contains("2024-06-15T14:30:00Z"));
-        let deserialized: MaintenanceModeMetadata = serde_json::from_str(&json).unwrap();
-        assert_eq!(metadata, deserialized);
-    }
-
-    #[test]
-    fn test_serialize_deserialize_maintenance_persisted_state() {
-        let metadata = MaintenanceModeMetadata {
-            enabled_at: "2024-06-15T14:30:00Z".to_string(),
+            version: LATEST_MAINTENANCE_FROZEN_PLAN_VERSION,
         };
         let plan = PhysicalIndexingPlan::with_indexer_ids(&[
             "indexer-1".to_string(),
@@ -347,72 +358,92 @@ mod tests {
             metadata: metadata.clone(),
             frozen_plan: plan.clone(),
         };
-        let bytes = postcard::to_allocvec(&state).unwrap();
-        let deserialized: MaintenancePersistedState = postcard::from_bytes(&bytes).unwrap();
+        let serialized = state
+            .serialize()
+            .expect("failed to serialize maintenance state");
+        let deserialized: MaintenancePersistedState =
+            MaintenancePersistedState::deserialize(&serialized).unwrap();
         assert_eq!(deserialized, state);
     }
 
+    /// Validates that an existing V1 serialization can still be deserialized.
     #[test]
-    fn test_deserialize_maintenance_persisted_state_invalid_bytes() {
-        let result: Result<MaintenancePersistedState, _> =
-            postcard::from_bytes(b"not valid postcard");
-        assert!(result.is_err());
-    }
-
-    /// Validates that a hardcoded postcard serialization of [`MaintenancePersistedState`] can
-    /// always be deserialized without errors.
-    ///
-    /// If this test fails, it means a breaking change was introduced in the binary serialization
-    /// format of [`PhysicalIndexingPlan`] or one of its dependencies. Any such change would
-    /// corrupt persisted maintenance state in existing deployments.
-    ///
-    /// The bytes encode the following value:
-    /// ```text
-    /// MaintenancePersistedState {
-    ///     metadata: MaintenanceModeMetadata { enabled_at: "2024-06-15T14:30:00Z" },
-    ///     frozen_plan: PhysicalIndexingPlan::with_indexer_ids(&["indexer-1"]),
-    /// }
-    /// ```
-    #[test]
-    fn test_postcard_deserialization_stability() {
-        // Layout (postcard wire format):
-        //   varint(20) + b"2024-06-15T14:30:00Z"   -- metadata.enabled_at
-        //   varint(1)                               -- map length (1 entry)
-        //   varint(9)  + b"indexer-1"              -- map key
-        //   varint(0)                               -- map value (empty Vec<IndexingTask>)
-        const HARDCODED_BYTES: &[u8] = &[
-            0x14, b'2', b'0', b'2', b'4', b'-', b'0', b'6', b'-', b'1', b'5', b'T', b'1', b'4',
-            b':', b'3', b'0', b':', b'0', b'0',
-            b'Z', // metadata.enabled_at: "2024-06-15T14:30:00Z"
-            0x01, // 1 entry in the map
-            0x09, b'i', b'n', b'd', b'e', b'x', b'e', b'r', b'-', b'1', // key: "indexer-1"
-            0x00, // empty Vec<IndexingTask>
-        ];
-
-        let state: MaintenancePersistedState = postcard::from_bytes(HARDCODED_BYTES)
-            .expect("hardcoded bytes must deserialize without errors");
-
-        assert_eq!(state.metadata.enabled_at, "2024-06-15T14:30:00Z");
-        assert_eq!(state.frozen_plan.num_indexers(), 1);
-        assert!(
-            state.frozen_plan.indexer("indexer-1").is_some(),
-            "expected 'indexer-1' in the frozen plan"
-        );
+    fn test_postcard_v1_deserialization_stability() {
+        let metadata = MaintenanceModeMetadata {
+            enabled_at: "2024-06-15T14:30:00Z".to_string(),
+            version: MaintenanceFrozenPlanVersion::V1,
+        };
+        let plan = PhysicalIndexingPlan::with_indexer_ids(&["indexer-1".to_string()]);
+        let expected_state = MaintenancePersistedState {
+            metadata: metadata.clone(),
+            frozen_plan: plan.clone(),
+        };
+        // // this was used to generate the `encoded` string
+        // println!(
+        //     "{}",
+        //     expected_state
+        //         .serialize()
+        //         .expect("failed to serialize expected state")
+        // );
+        let encoded = r#"{"frozen_plan":"EgsKCWluZGV4ZXItMQ==","metadata":{"enabled_at":"2024-06-15T14:30:00Z","version":"V1"}}"#;
+        let deserialized = MaintenancePersistedState::deserialize(encoded).unwrap();
+        assert_eq!(deserialized, expected_state);
     }
 
     #[tokio::test]
-    async fn test_in_memory_persistence_save_and_load() {
-        let persistence = InMemoryPersistence::new();
+    async fn test_metastore_persistence_save_and_load() {
+        let mut mock_metastore = MockMetastoreService::new();
+
+        // Initially empty
+        mock_metastore
+            .expect_get_kv()
+            .times(1)
+            .returning(|_| Ok(GetKvResponse { value: None }));
+
+        // Save
+        mock_metastore
+            .expect_set_kv()
+            .times(1)
+            .returning(|_| Ok(EmptyResponse {}));
+
+        // Load
+        let metadata = MaintenanceModeMetadata {
+            enabled_at: "2024-01-15T10:00:00Z".to_string(),
+            version: MaintenanceFrozenPlanVersion::V1,
+        };
+        let plan = PhysicalIndexingPlan::with_indexer_ids(&["indexer-1".to_string()]);
+        let expected_state = MaintenancePersistedState {
+            metadata: metadata.clone(),
+            frozen_plan: plan.clone(),
+        };
+        let expected_encoded = expected_state.serialize().unwrap();
+
+        mock_metastore.expect_get_kv().times(1).returning(move |_| {
+            Ok(GetKvResponse {
+                value: Some(expected_encoded.clone()),
+            })
+        });
+
+        // Clear
+        mock_metastore
+            .expect_delete_kv()
+            .times(1)
+            .returning(|_| Ok(EmptyResponse {}));
+
+        // One final load to verify cleared
+        mock_metastore
+            .expect_get_kv()
+            .times(1)
+            .returning(|_| Ok(GetKvResponse { value: None }));
+
+        let metastore_client = MetastoreServiceClient::from_mock(mock_metastore);
+        let persistence = MetastoreKvPersistence::new(metastore_client);
 
         // Initially empty
         let loaded = persistence.load().await;
         assert!(loaded.is_none());
 
         // Save
-        let metadata = MaintenanceModeMetadata {
-            enabled_at: "2024-01-15T10:00:00Z".to_string(),
-        };
-        let plan = PhysicalIndexingPlan::with_indexer_ids(&["indexer-1".to_string()]);
         persistence.save(&metadata, &plan).await.unwrap();
 
         // Load
@@ -427,19 +458,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_in_memory_persistence_overwrite() {
-        let persistence = InMemoryPersistence::new();
+    async fn test_metastore_persistence_overwrite() {
+        let mut mock_metastore = MockMetastoreService::new();
 
         let metadata1 = MaintenanceModeMetadata {
             enabled_at: "2024-01-01T00:00:00Z".to_string(),
+            version: MaintenanceFrozenPlanVersion::V1,
         };
         let plan1 = PhysicalIndexingPlan::with_indexer_ids(&["a".to_string()]);
-        persistence.save(&metadata1, &plan1).await.unwrap();
 
         let metadata2 = MaintenanceModeMetadata {
             enabled_at: "2024-06-01T12:00:00Z".to_string(),
+            version: MaintenanceFrozenPlanVersion::V1,
         };
         let plan2 = PhysicalIndexingPlan::with_indexer_ids(&["b".to_string()]);
+
+        // First save
+        mock_metastore
+            .expect_set_kv()
+            .times(1)
+            .returning(|_| Ok(EmptyResponse {}));
+
+        // Second save (overwrite)
+        mock_metastore
+            .expect_set_kv()
+            .times(1)
+            .returning(|_| Ok(EmptyResponse {}));
+
+        // Load - return the second state
+        let expected_state2 = MaintenancePersistedState {
+            metadata: metadata2.clone(),
+            frozen_plan: plan2.clone(),
+        };
+        let expected_encoded2 = expected_state2.serialize().unwrap();
+
+        mock_metastore.expect_get_kv().times(1).returning(move |_| {
+            Ok(GetKvResponse {
+                value: Some(expected_encoded2.clone()),
+            })
+        });
+
+        let metastore_client = MetastoreServiceClient::from_mock(mock_metastore);
+        let persistence = MetastoreKvPersistence::new(metastore_client);
+
+        persistence.save(&metadata1, &plan1).await.unwrap();
         persistence.save(&metadata2, &plan2).await.unwrap();
 
         let loaded = persistence.load().await.unwrap();

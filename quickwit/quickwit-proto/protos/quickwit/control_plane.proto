@@ -187,3 +187,12 @@ message GetMaintenanceModeResponse {
   // If maintenance mode is active, the RFC 3339 datetime string when it was enabled.
   optional string enabled_at = 2;
 }
+
+message MaintenanceFrozenPlanForNode {
+  string index_id = 1;
+  repeated quickwit.indexing.IndexingTask indexing_tasks = 2;
+}
+
+message MaintenanceFrozenPlan {
+  repeated MaintenanceFrozenPlanForNode state_per_node = 2;
+}

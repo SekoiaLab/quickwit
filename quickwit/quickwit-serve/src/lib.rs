@@ -1100,20 +1100,15 @@ async fn setup_control_plane(
         shard_throughput_limit: ingest_api_config.shard_throughput_limit,
         shard_scale_up_factor: ingest_api_config.shard_scale_up_factor,
     };
-    let maintenance_persistence = std::sync::Arc::new(
-        quickwit_control_plane::maintenance::MetastoreKvPersistence::new(metastore.clone()),
+    let (control_plane_mailbox, _control_plane_handle, mut readiness_rx) = ControlPlane::spawn(
+        universe,
+        cluster_config,
+        self_node_id,
+        cluster.clone(),
+        indexer_pool,
+        ingester_pool,
+        metastore,
     );
-    let (control_plane_mailbox, _control_plane_handle, mut readiness_rx) =
-        ControlPlane::spawn_with_persistence(
-            universe,
-            cluster_config,
-            self_node_id,
-            cluster.clone(),
-            indexer_pool,
-            ingester_pool,
-            metastore,
-            maintenance_persistence,
-        );
     let subscriber = ControlPlaneEventSubscriber::new(control_plane_mailbox.downgrade());
     event_broker
         .subscribe_without_timeout::<LocalShardsUpdate>(subscriber.clone())

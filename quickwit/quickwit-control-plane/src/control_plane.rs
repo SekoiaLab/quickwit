@@ -16,7 +16,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Formatter;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -66,9 +65,7 @@ use crate::debouncer::Debouncer;
 use crate::indexing_scheduler::{IndexingScheduler, IndexingSchedulerState};
 use crate::ingest::IngestController;
 use crate::ingest::ingest_controller::{IngestControllerStats, RebalanceShardsCallback};
-use crate::maintenance::{
-    InMemoryPersistence, MaintenancePersistence, MaintenanceState, serialize_frozen_plan,
-};
+use crate::maintenance::{MaintenanceState, MetastoreKvPersistence, serialize_frozen_plan};
 use crate::model::ControlPlaneModel;
 
 /// Interval between two controls (or checks) of the desired plan VS running plan.
@@ -109,11 +106,11 @@ pub struct ControlPlane {
     readiness_tx: watch::Sender<bool>,
     // Disables the control loop. This is useful for unit testing.
     disable_control_loop: bool,
-    /// Maintenance mode state. When active, metadata mutations are rejected and the indexing
-    /// plan is frozen (not rebuilt on topology changes).
+    /// Maintenance mode state. When active the indexing plan is frozen (not
+    /// rebuilt on topology changes).
     maintenance: MaintenanceState,
     /// Persistence backend for maintenance mode state (frozen plan + metadata).
-    maintenance_persistence: Arc<dyn MaintenancePersistence>,
+    maintenance_persistence: MetastoreKvPersistence,
 }
 
 impl fmt::Debug for ControlPlane {
@@ -137,40 +134,7 @@ impl ControlPlane {
         watch::Receiver<bool>,
     ) {
         let disable_control_loop = false;
-        let maintenance_persistence = Arc::new(InMemoryPersistence::new());
-        Self::spawn_inner(
-            universe,
-            cluster_config,
-            self_node_id,
-            cluster_change_stream_factory,
-            indexer_pool,
-            ingester_pool,
-            metastore,
-            disable_control_loop,
-            maintenance_persistence,
-        )
-    }
-
-    /// Spawns the control plane with a custom maintenance persistence backend.
-    ///
-    /// Use this in production to provide a durable persistence implementation
-    /// (e.g., `MetastoreKvPersistence` backed by the PostgreSQL `kv` table).
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_persistence(
-        universe: &Universe,
-        cluster_config: ClusterConfig,
-        self_node_id: NodeId,
-        cluster_change_stream_factory: impl ClusterChangeStreamFactory,
-        indexer_pool: IndexerPool,
-        ingester_pool: IngesterPool,
-        metastore: MetastoreServiceClient,
-        maintenance_persistence: Arc<dyn MaintenancePersistence>,
-    ) -> (
-        Mailbox<Self>,
-        ActorHandle<Supervisor<Self>>,
-        watch::Receiver<bool>,
-    ) {
-        let disable_control_loop = false;
+        let maintenance_persistence = MetastoreKvPersistence::new(metastore.clone());
         Self::spawn_inner(
             universe,
             cluster_config,
@@ -194,7 +158,7 @@ impl ControlPlane {
         ingester_pool: IngesterPool,
         metastore: MetastoreServiceClient,
         disable_control_loop: bool,
-        maintenance_persistence: Arc<dyn MaintenancePersistence>,
+        maintenance_persistence: MetastoreKvPersistence,
     ) -> (
         Mailbox<Self>,
         ActorHandle<Supervisor<Self>>,
@@ -1272,20 +1236,6 @@ impl Handler<RebalanceShardsCallback> for ControlPlane {
 
 // -- Maintenance Mode Handlers --
 
-/// Message to enable maintenance mode (internal, used in tests).
-#[derive(Debug)]
-pub struct EnableMaintenance {
-    pub request: EnableMaintenanceModeRequest,
-}
-
-/// Message to disable maintenance mode (internal, used in tests).
-#[derive(Debug)]
-pub struct DisableMaintenance;
-
-/// Message to get maintenance mode status (internal, used in tests).
-#[derive(Debug)]
-pub struct GetMaintenance;
-
 #[async_trait]
 impl Handler<EnableMaintenanceModeRequest> for ControlPlane {
     type Reply = ControlPlaneResult<EnableMaintenanceModeResponse>;
@@ -1319,45 +1269,6 @@ impl Handler<GetMaintenanceModeRequest> for ControlPlane {
     async fn handle(
         &mut self,
         _request: GetMaintenanceModeRequest,
-        _ctx: &ActorContext<Self>,
-    ) -> Result<Self::Reply, ActorExitStatus> {
-        self.handle_get_maintenance()
-    }
-}
-
-#[async_trait]
-impl Handler<EnableMaintenance> for ControlPlane {
-    type Reply = ControlPlaneResult<EnableMaintenanceModeResponse>;
-
-    async fn handle(
-        &mut self,
-        message: EnableMaintenance,
-        _ctx: &ActorContext<Self>,
-    ) -> Result<Self::Reply, ActorExitStatus> {
-        self.handle_enable_maintenance(message.request).await
-    }
-}
-
-#[async_trait]
-impl Handler<DisableMaintenance> for ControlPlane {
-    type Reply = ControlPlaneResult<DisableMaintenanceModeResponse>;
-
-    async fn handle(
-        &mut self,
-        _message: DisableMaintenance,
-        _ctx: &ActorContext<Self>,
-    ) -> Result<Self::Reply, ActorExitStatus> {
-        self.handle_disable_maintenance().await
-    }
-}
-
-#[async_trait]
-impl Handler<GetMaintenance> for ControlPlane {
-    type Reply = ControlPlaneResult<GetMaintenanceModeResponse>;
-
-    async fn handle(
-        &mut self,
-        _message: GetMaintenance,
         _ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
         self.handle_get_maintenance()
@@ -1456,7 +1367,7 @@ impl ControlPlane {
         &self,
     ) -> Result<ControlPlaneResult<GetMaintenanceModeResponse>, ActorExitStatus> {
         let is_maintenance_mode = self.maintenance.is_active();
-        let enabled_at = self.maintenance.metadata().map(|m| m.enabled_at.clone());
+        let enabled_at = self.maintenance.enabled_at();
 
         Ok(Ok(GetMaintenanceModeResponse {
             is_maintenance_mode,
@@ -1531,8 +1442,8 @@ mod tests {
     };
     use quickwit_proto::ingest::{Shard, ShardPKey, ShardState};
     use quickwit_proto::metastore::{
-        DeleteShardsResponse, EntityKind, FindIndexTemplateMatchesResponse,
-        ListIndexesMetadataRequest, ListIndexesMetadataResponse, ListShardsRequest,
+        DeleteShardsResponse, EmptyResponse, EntityKind, FindIndexTemplateMatchesResponse,
+        GetKvResponse, ListIndexesMetadataRequest, ListIndexesMetadataResponse, ListShardsRequest,
         ListShardsResponse, ListShardsSubresponse, MetastoreError, MockMetastoreService,
         OpenShardSubresponse, OpenShardsResponse, SourceType,
     };
@@ -1541,6 +1452,22 @@ mod tests {
 
     use super::*;
     use crate::IndexerNodeInfo;
+    use crate::maintenance::MetastoreKvPersistence;
+
+    fn setup_disabled_maintenance(mock_metastore: &mut MockMetastoreService) {
+        mock_metastore
+            .expect_get_kv()
+            .returning(|_| Ok(GetKvResponse { value: None }));
+    }
+
+    fn setup_maintenance_enable(mock_metastore: &mut MockMetastoreService) {
+        mock_metastore
+            .expect_get_kv()
+            .return_once(|_| Ok(GetKvResponse { value: None }));
+        mock_metastore
+            .expect_set_kv()
+            .return_once(|_| Ok(EmptyResponse {}));
+    }
 
     #[tokio::test]
     async fn test_maintenance_mode_allows_create_index() {
@@ -1552,6 +1479,7 @@ mod tests {
         let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
         let index_uid_clone = index_uid.clone();
         let mut mock_metastore = MockMetastoreService::new();
+        setup_maintenance_enable(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .returning(|_| Ok(ListIndexesMetadataResponse::for_test(Vec::new())));
@@ -1578,9 +1506,7 @@ mod tests {
 
         // Enable maintenance mode.
         let enable_response = control_plane_mailbox
-            .ask(EnableMaintenance {
-                request: EnableMaintenanceModeRequest {},
-            })
+            .ask(EnableMaintenanceModeRequest {})
             .await
             .unwrap();
         assert!(enable_response.is_ok());
@@ -1606,6 +1532,7 @@ mod tests {
         let ingester_pool = IngesterPool::default();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_maintenance_enable(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .returning(|_| Ok(ListIndexesMetadataResponse::for_test(Vec::new())));
@@ -1627,9 +1554,7 @@ mod tests {
 
         // Enable maintenance mode.
         control_plane_mailbox
-            .ask(EnableMaintenance {
-                request: EnableMaintenanceModeRequest {},
-            })
+            .ask(EnableMaintenanceModeRequest {})
             .await
             .unwrap()
             .unwrap();
@@ -1663,6 +1588,7 @@ mod tests {
         ingest_v2_source.enabled = true;
         index_metadata.add_source(ingest_v2_source).unwrap();
         let mut mock_metastore = MockMetastoreService::new();
+        setup_maintenance_enable(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .return_once(move |_| Ok(ListIndexesMetadataResponse::for_test(vec![index_metadata])));
@@ -1687,9 +1613,7 @@ mod tests {
 
         // Enable maintenance mode.
         control_plane_mailbox
-            .ask(EnableMaintenance {
-                request: EnableMaintenanceModeRequest {},
-            })
+            .ask(EnableMaintenanceModeRequest {})
             .await
             .unwrap()
             .unwrap();
@@ -1716,6 +1640,15 @@ mod tests {
 
         let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
+            .expect_get_kv()
+            .returning(|_| Ok(GetKvResponse { value: None }));
+        mock_metastore
+            .expect_set_kv()
+            .returning(|_| Ok(EmptyResponse {}));
+        mock_metastore
+            .expect_delete_kv()
+            .returning(|_| Ok(EmptyResponse {}));
+        mock_metastore
             .expect_list_indexes_metadata()
             .returning(|_| Ok(ListIndexesMetadataResponse::for_test(Vec::new())));
 
@@ -1733,7 +1666,7 @@ mod tests {
 
         // Initially not in maintenance mode.
         let status = control_plane_mailbox
-            .ask(GetMaintenance)
+            .ask(GetMaintenanceModeRequest {})
             .await
             .unwrap()
             .unwrap();
@@ -1741,9 +1674,7 @@ mod tests {
 
         // Enable.
         let enable_resp = control_plane_mailbox
-            .ask(EnableMaintenance {
-                request: EnableMaintenanceModeRequest {},
-            })
+            .ask(EnableMaintenanceModeRequest {})
             .await
             .unwrap()
             .unwrap();
@@ -1751,7 +1682,7 @@ mod tests {
 
         // Check status.
         let status = control_plane_mailbox
-            .ask(GetMaintenance)
+            .ask(GetMaintenanceModeRequest {})
             .await
             .unwrap()
             .unwrap();
@@ -1760,27 +1691,31 @@ mod tests {
 
         // Enable again — should fail.
         let double_enable = control_plane_mailbox
-            .ask(EnableMaintenance {
-                request: EnableMaintenanceModeRequest {},
-            })
+            .ask(EnableMaintenanceModeRequest {})
             .await
             .unwrap();
         assert!(double_enable.is_err());
 
         // Disable.
-        let disable_resp = control_plane_mailbox.ask(DisableMaintenance).await.unwrap();
+        let disable_resp = control_plane_mailbox
+            .ask(DisableMaintenanceModeRequest {})
+            .await
+            .unwrap();
         assert!(disable_resp.is_ok());
 
         // Check status again.
         let status = control_plane_mailbox
-            .ask(GetMaintenance)
+            .ask(GetMaintenanceModeRequest {})
             .await
             .unwrap()
             .unwrap();
         assert!(!status.is_maintenance_mode);
 
         // Disable again — should fail.
-        let double_disable = control_plane_mailbox.ask(DisableMaintenance).await.unwrap();
+        let double_disable = control_plane_mailbox
+            .ask(DisableMaintenanceModeRequest {})
+            .await
+            .unwrap();
         assert!(double_disable.is_err());
 
         universe.assert_quit().await;
@@ -1794,6 +1729,7 @@ mod tests {
         let ingester_pool = IngesterPool::default();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_maintenance_enable(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .returning(|_| Ok(ListIndexesMetadataResponse::for_test(Vec::new())));
@@ -1817,9 +1753,7 @@ mod tests {
 
         // Enable maintenance mode.
         control_plane_mailbox
-            .ask(EnableMaintenance {
-                request: EnableMaintenanceModeRequest {},
-            })
+            .ask(EnableMaintenanceModeRequest {})
             .await
             .unwrap()
             .unwrap();
@@ -1852,6 +1786,7 @@ mod tests {
         index_metadata.add_source(ingest_v2_source).unwrap();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_maintenance_enable(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .return_once(move |_| Ok(ListIndexesMetadataResponse::for_test(vec![index_metadata])));
@@ -1876,9 +1811,7 @@ mod tests {
 
         // Enable maintenance mode.
         control_plane_mailbox
-            .ask(EnableMaintenance {
-                request: EnableMaintenanceModeRequest {},
-            })
+            .ask(EnableMaintenanceModeRequest {})
             .await
             .unwrap()
             .unwrap();
@@ -1906,6 +1839,7 @@ mod tests {
         let ingester_pool = IngesterPool::default();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_maintenance_enable(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .returning(|_| Ok(ListIndexesMetadataResponse::for_test(Vec::new())));
@@ -1926,9 +1860,7 @@ mod tests {
 
         // Enable maintenance mode.
         control_plane_mailbox
-            .ask(EnableMaintenance {
-                request: EnableMaintenanceModeRequest {},
-            })
+            .ask(EnableMaintenanceModeRequest {})
             .await
             .unwrap()
             .unwrap();
@@ -1973,6 +1905,7 @@ mod tests {
         let ingester_pool = IngesterPool::default();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
         let index_uid_clone = index_uid.clone();
         mock_metastore
@@ -2030,6 +1963,7 @@ mod tests {
 
         let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         let index_uid_clone = index_uid.clone();
         mock_metastore
             .expect_delete_index()
@@ -2076,6 +2010,7 @@ mod tests {
             .unwrap();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         mock_metastore
             .expect_add_source()
             .withf(|add_source_request| {
@@ -2173,6 +2108,7 @@ mod tests {
             .unwrap();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         mock_metastore
             .expect_update_source()
             .withf(move |update_source_request| {
@@ -2240,6 +2176,7 @@ mod tests {
         index_metadata.add_source(test_source_config).unwrap();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .return_once(|_| Ok(ListIndexesMetadataResponse::for_test(vec![index_metadata])));
@@ -2310,6 +2247,7 @@ mod tests {
         let ingester_pool = IngesterPool::default();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
         let index_uid_clone = index_uid.clone();
         mock_metastore
@@ -2358,6 +2296,7 @@ mod tests {
         let ingester_pool = IngesterPool::default();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
         mock_metastore
             .expect_list_indexes_metadata()
@@ -2436,6 +2375,7 @@ mod tests {
         let indexer_pool = IndexerPool::default();
         let ingester_pool = IngesterPool::default();
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
 
         let mut index_0 = IndexMetadata::for_test("test-index-0", "ram:///test-index-0");
         let source = SourceConfig::ingest_v2();
@@ -2582,6 +2522,7 @@ mod tests {
         indexer_pool.insert(indexer_node_info.node_id.clone(), indexer_node_info);
         let ingester_pool = IngesterPool::default();
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
 
         let mut index_0 = IndexMetadata::for_test("test-index-0", "ram:///test-index-0");
         let mut source = SourceConfig::ingest_v2();
@@ -2731,6 +2672,7 @@ mod tests {
         indexer_pool.insert(indexer_node_info.node_id.clone(), indexer_node_info);
         let ingester_pool = IngesterPool::default();
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
 
         let mut index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
         let mut source_config = SourceConfig::ingest_v2();
@@ -2809,6 +2751,7 @@ mod tests {
         indexer_pool.insert(indexer_node_info.node_id.clone(), indexer_node_info);
         let ingester_pool = IngesterPool::default();
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
 
         let mut index_0 = IndexMetadata::for_test("test-index-0", "ram:///test-index-0");
         let mut source = SourceConfig::ingest_v2();
@@ -2904,6 +2847,7 @@ mod tests {
         let index_0_clone = index_0.clone();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .times(1)
@@ -3025,6 +2969,7 @@ mod tests {
         let index_uid_clone = index_0.index_uid.clone();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         mock_metastore.expect_delete_source().return_once(
             move |delete_source_request: DeleteSourceRequest| {
                 assert_eq!(delete_source_request.index_uid(), &index_uid_clone);
@@ -3108,6 +3053,7 @@ mod tests {
         let ingester_pool = IngesterPool::default();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
 
         mock_metastore
             .expect_list_indexes_metadata()
@@ -3238,10 +3184,27 @@ mod tests {
         let indexer_pool = IndexerPool::default();
         let ingester_pool = IngesterPool::default();
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .return_once(|_| Ok(ListIndexesMetadataResponse::for_test(Vec::new())));
         let metastore = MetastoreServiceClient::from_mock(mock_metastore);
+
+        // Create mock maintenance persistence metastore
+        let mut mock_persistence_metastore = MockMetastoreService::new();
+        mock_persistence_metastore
+            .expect_get_kv()
+            .returning(|_| Ok(GetKvResponse { value: None }));
+        mock_persistence_metastore
+            .expect_set_kv()
+            .returning(|_| Ok(EmptyResponse {}));
+        mock_persistence_metastore
+            .expect_delete_kv()
+            .returning(|_| Ok(EmptyResponse {}));
+        let maintenance_persistence = MetastoreKvPersistence::new(
+            MetastoreServiceClient::from_mock(mock_persistence_metastore),
+        );
+
         let disable_control_loop = true;
         let (_control_plane_mailbox, control_plane_handle, _readiness_rx) =
             ControlPlane::spawn_inner(
@@ -3253,7 +3216,7 @@ mod tests {
                 ingester_pool,
                 metastore,
                 disable_control_loop,
-                Arc::new(InMemoryPersistence::new()),
+                maintenance_persistence,
             );
         let cluster_change_stream_tx = cluster_change_stream_factory.change_stream_tx();
         let indexer_node =
@@ -3319,6 +3282,7 @@ mod tests {
         ingester_pool.insert(ingester_id, ingester);
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .return_once(|_| Ok(ListIndexesMetadataResponse::for_test(Vec::new())));
@@ -3497,6 +3461,7 @@ mod tests {
         index_b.add_source(SourceConfig::ingest_v2()).unwrap();
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .return_once(move |_| {
@@ -3507,6 +3472,21 @@ mod tests {
         mock_metastore
             .expect_list_shards()
             .return_once(|_| Ok(ListShardsResponse::default()));
+
+        // Create mock maintenance persistence metastore
+        let mut mock_persistence_metastore = MockMetastoreService::new();
+        mock_persistence_metastore
+            .expect_get_kv()
+            .returning(|_| Ok(GetKvResponse { value: None }));
+        mock_persistence_metastore
+            .expect_set_kv()
+            .returning(|_| Ok(EmptyResponse {}));
+        mock_persistence_metastore
+            .expect_delete_kv()
+            .returning(|_| Ok(EmptyResponse {}));
+        let maintenance_persistence = MetastoreKvPersistence::new(
+            MetastoreServiceClient::from_mock(mock_persistence_metastore),
+        );
 
         let cluster_config = ClusterConfig::for_test();
         let (control_plane_mailbox, _control_plane_handle, _readiness_rx) =
@@ -3519,7 +3499,7 @@ mod tests {
                 ingester_pool,
                 MetastoreServiceClient::from_mock(mock_metastore),
                 false, // keep the control loop enabled
-                Arc::new(InMemoryPersistence::new()),
+                maintenance_persistence,
             );
 
         // ── Wait for the initial plan to be built ──────────────────────────
@@ -3699,6 +3679,7 @@ mod tests {
         ingester_pool.insert(ingester_id, ingester);
 
         let mut mock_metastore = MockMetastoreService::new();
+        setup_disabled_maintenance(&mut mock_metastore);
         mock_metastore
             .expect_list_indexes_metadata()
             .return_once(|_| Ok(ListIndexesMetadataResponse::for_test(Vec::new())));

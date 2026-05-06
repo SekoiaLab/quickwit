@@ -136,6 +136,20 @@ pub struct GetMaintenanceModeResponse {
     pub enabled_at: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MaintenanceFrozenPlanForNode {
+    #[prost(string, tag = "1")]
+    pub index_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub indexing_tasks: ::prost::alloc::vec::Vec<super::indexing::IndexingTask>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MaintenanceFrozenPlan {
+    #[prost(message, repeated, tag = "2")]
+    pub state_per_node: ::prost::alloc::vec::Vec<MaintenanceFrozenPlanForNode>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
