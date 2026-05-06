@@ -484,11 +484,8 @@ impl Handler<RebuildPlan> for ControlPlane {
         _message: RebuildPlan,
         _ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
-        if self.maintenance.is_active() {
-            debug!("maintenance mode: skipping indexing plan rebuild");
-            return Ok(());
-        }
-        self.indexing_scheduler.rebuild_plan(&self.model);
+        self.indexing_scheduler
+            .rebuild_plan(&self.model, self.maintenance.is_active());
         Ok(())
     }
 }
@@ -569,22 +566,21 @@ impl Handler<ControlPlanLoop> for ControlPlane {
         if self.disable_control_loop {
             return Ok(());
         }
-
-        if self.maintenance.is_active() {
-            // In maintenance mode: skip shard rebalancing, but keep applying the
-            // frozen running plan so restarted indexers are brought back in sync.
-            self.indexing_scheduler.control_running_plan(&self.model);
-            ctx.schedule_self_msg(CONTROL_PLAN_LOOP_INTERVAL, ControlPlanLoop);
-            return Ok(());
-        }
+        let is_maintenance = self.maintenance.is_active();
         if let Err(metastore_error) = self
             .ingest_controller
-            .rebalance_shards(&mut self.model, ctx.mailbox(), ctx.progress())
+            .rebalance_shards(
+                &mut self.model,
+                ctx.mailbox(),
+                ctx.progress(),
+                is_maintenance,
+            )
             .await
         {
             return convert_metastore_error::<()>(metastore_error).map(|_| ());
         }
-        self.indexing_scheduler.control_running_plan(&self.model);
+        self.indexing_scheduler
+            .control_running_plan(&self.model, is_maintenance);
         ctx.schedule_self_msg(CONTROL_PLAN_LOOP_INTERVAL, ControlPlanLoop);
         Ok(())
     }
@@ -1154,27 +1150,34 @@ impl Handler<IndexerJoined> for ControlPlane {
         message: IndexerJoined,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
-        if self.maintenance.is_active() {
+        let is_maintenance = self.maintenance.is_active();
+        if is_maintenance {
             info!(
-                "indexer `{}` joined the cluster during maintenance mode: plan is frozen, \
-                 skipping rebalance and rebuild",
+                "indexer `{}` joined the cluster during maintenance mode",
                 message.0.node_id()
             );
-            return Ok(());
+        } else {
+            info!(
+                "indexer `{}` joined the cluster: rebalancing shards and rebuilding indexing plan",
+                message.0.node_id()
+            );
         }
-        info!(
-            "indexer `{}` joined the cluster: rebalancing shards and rebuilding indexing plan",
-            message.0.node_id()
-        );
+
         // TODO: Update shard table.
         if let Err(metastore_error) = self
             .ingest_controller
-            .rebalance_shards(&mut self.model, ctx.mailbox(), ctx.progress())
+            .rebalance_shards(
+                &mut self.model,
+                ctx.mailbox(),
+                ctx.progress(),
+                is_maintenance,
+            )
             .await
         {
             return convert_metastore_error::<()>(metastore_error).map(|_| ());
         }
-        self.indexing_scheduler.rebuild_plan(&self.model);
+        self.indexing_scheduler
+            .rebuild_plan(&self.model, is_maintenance);
         Ok(())
     }
 }
@@ -1192,27 +1195,34 @@ impl Handler<IndexerLeft> for ControlPlane {
         message: IndexerLeft,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
-        if self.maintenance.is_active() {
+        let is_maintenance = self.maintenance.is_active();
+        if is_maintenance {
             info!(
-                "indexer `{}` left the cluster during maintenance mode: plan is frozen, skipping \
-                 rebalance and rebuild",
+                "indexer `{}` left the cluster during maintenance mode",
                 message.0.node_id()
             );
             return Ok(());
+        } else {
+            info!(
+                "indexer `{}` left the cluster: rebalancing shards and rebuilding indexing plan",
+                message.0.node_id()
+            );
         }
-        info!(
-            "indexer `{}` left the cluster: rebalancing shards and rebuilding indexing plan",
-            message.0.node_id()
-        );
         // TODO: Update shard table.
         if let Err(metastore_error) = self
             .ingest_controller
-            .rebalance_shards(&mut self.model, ctx.mailbox(), ctx.progress())
+            .rebalance_shards(
+                &mut self.model,
+                ctx.mailbox(),
+                ctx.progress(),
+                is_maintenance,
+            )
             .await
         {
             return convert_metastore_error::<()>(metastore_error).map(|_| ());
         }
-        self.indexing_scheduler.rebuild_plan(&self.model);
+        self.indexing_scheduler
+            .rebuild_plan(&self.model, is_maintenance);
         Ok(())
     }
 }
@@ -1368,7 +1378,7 @@ impl ControlPlane {
 
         // Trigger a full plan rebuild to reconcile the cluster.
         info!("maintenance mode disabled: triggering full indexing plan rebuild");
-        self.indexing_scheduler.rebuild_plan(&self.model);
+        self.indexing_scheduler.rebuild_plan(&self.model, false);
 
         Ok(Ok(DisableMaintenanceModeResponse {}))
     }
@@ -1428,9 +1438,11 @@ mod tests {
     use std::num::NonZero;
     use std::sync::Arc;
 
+    use futures::FutureExt;
     use mockall::Sequence;
     use quickwit_actors::{AskError, Observe, SupervisorMetrics};
     use quickwit_cluster::ClusterChangeStreamFactoryForTest;
+    use quickwit_common::test_utils::wait_until_predicate;
     use quickwit_config::{
         CLI_SOURCE_ID, INGEST_V2_SOURCE_ID, IndexConfig, KafkaSourceParams, SourceParams,
     };
@@ -1462,6 +1474,7 @@ mod tests {
 
     use super::*;
     use crate::IndexerNodeInfo;
+    use crate::indexing_plan::PhysicalIndexingPlan;
     use crate::maintenance::MetastoreKvPersistence;
 
     fn setup_disabled_maintenance(mock_metastore: &mut MockMetastoreService) {
@@ -1479,11 +1492,49 @@ mod tests {
             .return_once(|_| Ok(EmptyResponse {}));
     }
 
+    async fn observe_current_plan(
+        control_plane_handle: &ActorHandle<Supervisor<ControlPlane>>,
+    ) -> Option<PhysicalIndexingPlan> {
+        control_plane_handle
+            .observe()
+            .await
+            .state_opt
+            .as_ref()?
+            .indexing_scheduler
+            .current_targeted_physical_plan
+            .clone()
+    }
+
+    #[must_use]
+    fn add_test_indexer_with_mailbox(
+        universe: &Universe,
+        indexer_pool: &IndexerPool,
+        node_id: NodeId,
+    ) -> quickwit_actors::Inbox<IndexingService> {
+        let (client_mailbox, client_inbox) = universe.create_test_mailbox();
+        let client = IndexingServiceClient::from_mailbox::<IndexingService>(client_mailbox);
+        let indexer_info = IndexerNodeInfo {
+            node_id: node_id.clone(),
+            generation_id: 0,
+            client,
+            indexing_tasks: Vec::new(),
+            indexing_capacity: CpuCapacity::from_cpu_millis(4_000),
+        };
+        indexer_pool.insert(node_id, indexer_info);
+        client_inbox
+    }
+
     #[tokio::test]
-    async fn test_maintenance_mode_allows_create_index() {
+    async fn test_maintenance_mode_allows_create_index_without_rebuild() {
         let universe = Universe::with_accelerated_time();
-        let self_node_id: NodeId = "test-node".into();
+
         let indexer_pool = IndexerPool::default();
+
+        // Add one indexer to the pool
+        let node_1: NodeId = "test-node-1".into();
+        let _indexing_inbox_1 =
+            add_test_indexer_with_mailbox(&universe, &indexer_pool, node_1.clone());
+
         let ingester_pool = IngesterPool::default();
 
         let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
@@ -1493,43 +1544,92 @@ mod tests {
         mock_metastore
             .expect_list_indexes_metadata()
             .returning(|_| Ok(ListIndexesMetadataResponse::for_test(Vec::new())));
-        mock_metastore.expect_create_index().return_once(move |_| {
-            let index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
-            let index_metadata_json = serde_json::to_string(&index_metadata).unwrap();
-            Ok(CreateIndexResponse {
-                index_uid: Some(index_uid_clone),
-                index_metadata_json,
-            })
-        });
+        mock_metastore
+            .expect_create_index()
+            .return_once(move |req| {
+                // re-serialize the received requested config
+                let index_config = req.deserialize_index_config().unwrap();
+                let source_configs = req.deserialize_source_configs().unwrap();
+                let mut index_metadata = IndexMetadata::new(index_config);
+                index_metadata.index_uid = index_uid_clone.clone();
+                for source_config in source_configs {
+                    index_metadata.add_source(source_config).unwrap();
+                }
+                let index_metadata_json = serde_json::to_string(&index_metadata).unwrap();
+                Ok(CreateIndexResponse {
+                    index_uid: Some(index_uid_clone),
+                    index_metadata_json,
+                })
+            });
 
         let cluster_config = ClusterConfig::for_test();
         let cluster_change_stream_factory = ClusterChangeStreamFactoryForTest::default();
-        let (control_plane_mailbox, _control_plane_handle, _readiness_rx) = ControlPlane::spawn(
+        let (control_plane_mailbox, control_plane_handle, _readiness_rx) = ControlPlane::spawn(
             &universe,
             cluster_config,
-            self_node_id,
+            node_1.clone(),
             cluster_change_stream_factory,
-            indexer_pool,
+            indexer_pool.clone(),
             ingester_pool,
             MetastoreServiceClient::from_mock(mock_metastore),
         );
 
+        // Wait for a first (empty) plan to be calculated.
+        wait_until_predicate(
+            || observe_current_plan(&control_plane_handle).map(|plan| plan.is_some()),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+
         // Enable maintenance mode.
-        let enable_response = control_plane_mailbox
+        control_plane_mailbox
             .ask(EnableMaintenanceModeRequest {})
             .await
+            .unwrap()
             .unwrap();
-        assert!(enable_response.is_ok());
 
-        // Create index in maintenance mode — should succeed, but plan rebuild is skipped.
+        let original_physical_plan = observe_current_plan(&control_plane_handle).await;
+
+        // Create index in maintenance mode
         let index_config = IndexConfig::for_test("test-index", "ram:///test-index");
+        let kafka_source = SourceConfig::for_test(
+            "kafka-source",
+            SourceParams::Kafka(KafkaSourceParams {
+                topic: "test-topic".to_string(),
+                client_log_level: None,
+                enable_backfill_mode: false,
+                client_params: json!({}),
+            }),
+        );
         let create_index_request =
-            CreateIndexRequest::try_from_index_config(&index_config).unwrap();
+            CreateIndexRequest::try_from_index_and_source_configs(&index_config, &[kafka_source])
+                .unwrap();
         let create_result = control_plane_mailbox
             .ask_for_res(create_index_request)
             .await;
         assert!(create_result.is_ok());
         assert_eq!(create_result.unwrap().index_uid(), &index_uid);
+        // Check that plan rebuild is skipped
+        universe.sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            original_physical_plan,
+            observe_current_plan(&control_plane_handle).await,
+            "physical plan should not change after creating index in maintenance mode"
+        );
+
+        // Add another node
+        let node_2: NodeId = "test-node-2".into();
+        let _indexing_inbox_2 =
+            add_test_indexer_with_mailbox(&universe, &indexer_pool, node_2.clone());
+        // Check that the rebuild is still skipped
+        universe.sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            original_physical_plan,
+            observe_current_plan(&control_plane_handle).await,
+            "physical plan should not change after adding new node in maintenance mode"
+        );
 
         universe.assert_quit().await;
     }
@@ -2520,16 +2620,11 @@ mod tests {
         let universe = Universe::with_accelerated_time();
         let node_id = NodeId::new("test-control-plane".to_string());
         let indexer_pool = IndexerPool::default();
-        let (client_mailbox, client_inbox) = universe.create_test_mailbox();
-        let client = IndexingServiceClient::from_mailbox::<IndexingService>(client_mailbox);
-        let indexer_node_info = IndexerNodeInfo {
-            node_id: NodeId::new("test-indexer".to_string()),
-            generation_id: 0,
-            client,
-            indexing_tasks: Vec::new(),
-            indexing_capacity: CpuCapacity::from_cpu_millis(4_000),
-        };
-        indexer_pool.insert(indexer_node_info.node_id.clone(), indexer_node_info);
+        let client_inbox = add_test_indexer_with_mailbox(
+            &universe,
+            &indexer_pool,
+            NodeId::new("test-indexer".to_string()),
+        );
         let ingester_pool = IngesterPool::default();
         let mut mock_metastore = MockMetastoreService::new();
         setup_disabled_maintenance(&mut mock_metastore);
@@ -2670,16 +2765,11 @@ mod tests {
         let universe = Universe::with_accelerated_time();
         let node_id = NodeId::new("test-control-plane".to_string());
         let indexer_pool = IndexerPool::default();
-        let (client_mailbox, _client_inbox) = universe.create_test_mailbox();
-        let client = IndexingServiceClient::from_mailbox::<IndexingService>(client_mailbox);
-        let indexer_node_info = IndexerNodeInfo {
-            node_id: NodeId::new("test-indexer".to_string()),
-            generation_id: 0,
-            client,
-            indexing_tasks: Vec::new(),
-            indexing_capacity: CpuCapacity::from_cpu_millis(4_000),
-        };
-        indexer_pool.insert(indexer_node_info.node_id.clone(), indexer_node_info);
+        let _indexing_inbox = add_test_indexer_with_mailbox(
+            &universe,
+            &indexer_pool,
+            NodeId::new("test-indexer".to_string()),
+        );
         let ingester_pool = IngesterPool::default();
         let mut mock_metastore = MockMetastoreService::new();
         setup_disabled_maintenance(&mut mock_metastore);
@@ -2749,16 +2839,11 @@ mod tests {
         let universe = Universe::default();
         let node_id = NodeId::new("test-control-plane".to_string());
         let indexer_pool = IndexerPool::default();
-        let (client_mailbox, _client_inbox) = universe.create_test_mailbox();
-        let client = IndexingServiceClient::from_mailbox::<IndexingService>(client_mailbox);
-        let indexer_node_info = IndexerNodeInfo {
-            node_id: NodeId::new("test-indexer".to_string()),
-            generation_id: 0,
-            client,
-            indexing_tasks: Vec::new(),
-            indexing_capacity: CpuCapacity::from_cpu_millis(4_000),
-        };
-        indexer_pool.insert(indexer_node_info.node_id.clone(), indexer_node_info);
+        let _indexing_inbox = add_test_indexer_with_mailbox(
+            &universe,
+            &indexer_pool,
+            NodeId::new("test-indexer".to_string()),
+        );
         let ingester_pool = IngesterPool::default();
         let mut mock_metastore = MockMetastoreService::new();
         setup_disabled_maintenance(&mut mock_metastore);
