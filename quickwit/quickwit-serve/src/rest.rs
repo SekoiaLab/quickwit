@@ -40,7 +40,7 @@ use warp::hyper::http::HeaderValue;
 use warp::hyper::{Method, StatusCode, http};
 use warp::{Filter, Rejection, Reply, redirect};
 
-use crate::cluster_api::{cluster_handler, maintenance_handler};
+use crate::cluster_api::cluster_handler;
 use crate::decompression::{CorruptedData, UnsupportedEncoding};
 use crate::delete_task_api::delete_task_api_handlers;
 use crate::developer_api::developer_api_routes;
@@ -400,7 +400,10 @@ fn api_v1_routes(
             !disable_ingest_v1(),
             enable_ingest_v2(),
         )
-        .or(cluster_handler(quickwit_services.cluster.clone()))
+        .or(cluster_handler(
+            quickwit_services.cluster.clone(),
+            quickwit_services.control_plane_client.clone(),
+        ))
         .boxed()
         .or(node_info_handler(
             BuildInfo::get(),
@@ -413,10 +416,6 @@ fn api_v1_routes(
         ))
         .boxed()
         .or(swap_pipelines_handler(
-            quickwit_services.control_plane_client.clone(),
-        ))
-        .boxed()
-        .or(maintenance_handler(
             quickwit_services.control_plane_client.clone(),
         ))
         .boxed()

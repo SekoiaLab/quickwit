@@ -826,8 +826,6 @@ impl<'a> MaintenanceClient<'a> {
     }
 
     pub async fn enable(&self) -> Result<EnableMaintenanceResponse, Error> {
-        let body = serde_json::to_vec(&json!({})).expect("JSON serialization should not fail");
-        let body = Bytes::from(body);
         let response = self
             .transport
             .send::<()>(
@@ -835,7 +833,7 @@ impl<'a> MaintenanceClient<'a> {
                 "cluster/maintenance",
                 None,
                 None,
-                Some(body),
+                None,
                 self.timeout,
             )
             .await?;

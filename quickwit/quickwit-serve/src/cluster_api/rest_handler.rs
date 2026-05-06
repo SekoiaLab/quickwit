@@ -46,14 +46,21 @@ pub struct ClusterApi;
 /// Cluster handler.
 pub fn cluster_handler(
     cluster: Cluster,
+    control_plane_client: ControlPlaneServiceClient,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
-    warp::path!("cluster")
+    let cluster_info_handler = warp::path!("cluster")
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::path::end().map(move || cluster.clone()))
         .then(get_cluster)
         .and(extract_format_from_qs())
         .map(into_rest_api_response)
+        .boxed();
+
+    let maintenance_routes = maintenance_handler(control_plane_client);
+
+    cluster_info_handler
+        .or(maintenance_routes)
         .recover(recover_fn)
         .boxed()
 }
@@ -134,12 +141,12 @@ fn maintenance_delete_filter() -> impl Filter<Extract = (), Error = Rejection> +
     warp::path!("cluster" / "maintenance").and(warp::delete())
 }
 
-/// Warp handler for maintenance mode endpoints.
+/// Maintenance mode endpoints handler.
 ///
 /// - `GET /api/v1/cluster/maintenance` — get maintenance status
 /// - `PUT /api/v1/cluster/maintenance` — enable maintenance mode
 /// - `DELETE /api/v1/cluster/maintenance` — disable maintenance mode
-pub fn maintenance_handler(
+fn maintenance_handler(
     control_plane_client: ControlPlaneServiceClient,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     let get_client = control_plane_client.clone();
@@ -151,7 +158,6 @@ pub fn maintenance_handler(
         .then(get_maintenance_endpoint)
         .and(extract_format_from_qs())
         .map(into_rest_api_response)
-        .recover(recover_fn)
         .boxed();
 
     let put_handler = maintenance_put_filter()
@@ -159,7 +165,6 @@ pub fn maintenance_handler(
         .then(enable_maintenance_endpoint)
         .and(extract_format_from_qs())
         .map(into_rest_api_response)
-        .recover(recover_fn)
         .boxed();
 
     let delete_handler = maintenance_delete_filter()
@@ -167,7 +172,6 @@ pub fn maintenance_handler(
         .then(disable_maintenance_endpoint)
         .and(extract_format_from_qs())
         .map(into_rest_api_response)
-        .recover(recover_fn)
         .boxed();
 
     get_handler.or(put_handler).or(delete_handler).boxed()
