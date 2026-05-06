@@ -320,10 +320,6 @@ impl IndexingScheduler {
     /// `control_running_plan` loop can re-apply it to indexers that restart during the
     /// maintenance window.
     pub(crate) fn load_frozen_plan(&mut self, plan: crate::indexing_plan::PhysicalIndexingPlan) {
-        info!(
-            num_indexers = plan.num_indexers(),
-            "loading frozen indexing plan (maintenance mode)"
-        );
         self.state.current_targeted_physical_plan = Some(plan);
     }
 

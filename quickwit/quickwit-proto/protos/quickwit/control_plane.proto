@@ -76,7 +76,7 @@ service ControlPlaneService {
   // Maintenance Mode API
 
   // Enables maintenance mode on the cluster. When active, the indexing plan is frozen,
-  // metadata mutations (index/source CRUD) are rejected, and shard scaling/rebalancing is paused.
+  // metadata mutations (index/source CRUD) are accepted but the plan is not rebuilt, and shard scaling/rebalancing is paused.
   rpc EnableMaintenanceMode(EnableMaintenanceModeRequest) returns (EnableMaintenanceModeResponse);
 
   // Disables maintenance mode. Triggers a full indexing plan rebuild to reconcile the cluster.

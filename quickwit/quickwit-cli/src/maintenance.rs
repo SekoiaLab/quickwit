@@ -25,7 +25,8 @@ pub fn build_maintenance_command() -> Command {
         .about("Manages cluster maintenance mode for safe rolling upgrades.")
         .args(client_args())
         .subcommand(Command::new("enable").about(
-            "Enables maintenance mode. Freezes the indexing plan and rejects metadata mutations.",
+            "Enables maintenance mode. Freezes the indexing plan; metadata mutations are accepted \
+             but the plan is not rebuilt.",
         ))
         .subcommand(
             Command::new("disable")

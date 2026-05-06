@@ -23,8 +23,9 @@
 //!
 //! # Persistence
 //!
-//! One key is stored in the metastore `kv` table:
-//! - `maintenance_state`: a JSON envolope with the binary encoded plan
+//! The state is persisted in the metastore `kv` table under the
+//! [`KV_KEY_MAINTENANCE_STATE`] key. The value is a JSON envelope with the
+//! with some basic metadata and the binary encoded plan.
 
 use base64::Engine as _;
 use prost::Message;
@@ -47,6 +48,8 @@ pub const LATEST_MAINTENANCE_FROZEN_PLAN_VERSION: MaintenanceFrozenPlanVersion =
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MaintenanceFrozenPlanVersion {
+    /// The frozen plan is encoded as protobuf and stored under the
+    /// "frozen_plan" key as a base64 string.
     V1 = 1,
 }
 
@@ -236,8 +239,10 @@ impl MetastoreKvPersistence {
         Self { metastore }
     }
 
-    /// Loads the maintenance state from persistent storage.
-    /// Returns `None` if no maintenance state is persisted.
+    /// Loads the maintenance state from persistent storage. Returns `None` if
+    /// no maintenance state is persisted.
+    ///
+    /// Panics if the state can't be fetched or deserialized.
     pub async fn load(&self) -> Option<MaintenancePersistedState> {
         let response = self
             .metastore
@@ -247,14 +252,10 @@ impl MetastoreKvPersistence {
             })
             .await
             .expect("failed to get maintenance state from metastore");
-        match response.value {
-            Some(encoded) => {
-                let persisted = MaintenancePersistedState::deserialize(&encoded)
-                    .expect("failed to deserialize maintenance state from metastore");
-                Some(persisted)
-            }
-            None => None,
-        }
+        let encoded = response.value?; // return None if no value is set
+        let persisted = MaintenancePersistedState::deserialize(&encoded)
+            .expect("failed to deserialize maintenance state from metastore");
+        Some(persisted)
     }
 
     /// Persists the maintenance metadata and frozen plan atomically.

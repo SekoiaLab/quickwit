@@ -247,7 +247,10 @@ impl Actor for ControlPlane {
 
         if self.maintenance.is_active() {
             // In maintenance mode: restore the frozen plan without triggering a rebuild.
-            info!("control plane starting in maintenance mode: indexing plan is frozen");
+            info!(
+                enabled_at = self.maintenance.enabled_at().unwrap_or_default(),
+                "control plane starting in maintenance mode: indexing plan is frozen"
+            );
         } else {
             let _rebuild_plan_waiter = self.rebuild_plan_debounced(ctx);
         }
@@ -278,9 +281,16 @@ impl ControlPlane {
                     crate::metrics::CONTROL_PLANE_METRICS
                         .maintenance_mode
                         .set(1);
+                    let num_indexers = persisted.frozen_plan.num_indexers();
+                    let num_pipelines: usize = persisted
+                        .frozen_plan
+                        .indexing_tasks_per_indexer()
+                        .values()
+                        .map(|tasks| tasks.len())
+                        .sum();
                     info!(
-                        num_indexers = persisted.frozen_plan.num_indexers(),
-                        "restored frozen indexing plan from persistence"
+                        num_indexers,
+                        num_pipelines, "restored frozen indexing plan from persistence"
                     );
                     self.indexing_scheduler
                         .load_frozen_plan(persisted.frozen_plan);

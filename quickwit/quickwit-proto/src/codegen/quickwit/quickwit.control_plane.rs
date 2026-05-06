@@ -263,7 +263,7 @@ pub trait ControlPlaneService: std::fmt::Debug + Send + Sync + 'static {
         request: SwapIndexingPipelinesRequest,
     ) -> crate::control_plane::ControlPlaneResult<SwapIndexingPipelinesResponse>;
     ///Enables maintenance mode on the cluster. When active, the indexing plan is frozen,
-    ///metadata mutations (index/source CRUD) are rejected, and shard scaling/rebalancing is paused.
+    ///metadata mutations (index/source CRUD) are accepted but the plan is not rebuilt, and shard scaling/rebalancing is paused.
     async fn enable_maintenance_mode(
         &self,
         request: EnableMaintenanceModeRequest,
@@ -3187,7 +3187,7 @@ pub mod control_plane_service_grpc_client {
             self.inner.unary(req, path, codec).await
         }
         /// Enables maintenance mode on the cluster. When active, the indexing plan is frozen,
-        /// metadata mutations (index/source CRUD) are rejected, and shard scaling/rebalancing is paused.
+        /// metadata mutations (index/source CRUD) are accepted but the plan is not rebuilt, and shard scaling/rebalancing is paused.
         pub async fn enable_maintenance_mode(
             &mut self,
             request: impl tonic::IntoRequest<super::EnableMaintenanceModeRequest>,
@@ -3382,7 +3382,7 @@ pub mod control_plane_service_grpc_server {
             tonic::Status,
         >;
         /// Enables maintenance mode on the cluster. When active, the indexing plan is frozen,
-        /// metadata mutations (index/source CRUD) are rejected, and shard scaling/rebalancing is paused.
+        /// metadata mutations (index/source CRUD) are accepted but the plan is not rebuilt, and shard scaling/rebalancing is paused.
         async fn enable_maintenance_mode(
             &self,
             request: tonic::Request<super::EnableMaintenanceModeRequest>,
