@@ -68,6 +68,27 @@ impl grpc::SearchService for GrpcSearchAdapter {
         convert_to_grpc_result(fetch_docs_result)
     }
 
+    type StreamFetchDocsStream =
+        quickwit_proto::tonic::codegen::BoxStream<quickwit_proto::search::FetchDocsResponse>;
+
+    #[instrument(skip(self, request))]
+    async fn stream_fetch_docs(
+        &self,
+        request: tonic::Request<quickwit_proto::search::FetchDocsRequest>,
+    ) -> Result<tonic::Response<Self::StreamFetchDocsStream>, tonic::Status> {
+        use futures::TryStreamExt;
+
+        set_parent_span_from_request_metadata(request.metadata());
+        let fetch_docs_request = request.into_inner();
+        let stream = self.0.stream_fetch_docs(fetch_docs_request);
+
+        // Convert SearchError to tonic::Status
+        let grpc_stream = stream
+            .map_err(|err| tonic::Status::internal(format!("Stream fetch docs error: {}", err)));
+
+        Ok(tonic::Response::new(Box::pin(grpc_stream)))
+    }
+
     #[instrument(skip(self, request))]
     async fn root_list_terms(
         &self,

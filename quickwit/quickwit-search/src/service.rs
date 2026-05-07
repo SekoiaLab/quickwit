@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::future::Either;
+use futures::{Stream, StreamExt};
 use quickwit_common::uri::Uri;
 use quickwit_config::SearcherConfig;
 use quickwit_doc_mapper::DocMapper;
@@ -43,7 +46,7 @@ use crate::metrics_trackers::LeafSearchMetricsFuture;
 use crate::root::fetch_docs_phase;
 use crate::scroll_context::{MiniKV, ScrollContext, ScrollKeyAndStartOffset};
 use crate::search_permit_provider::SearchPermitProvider;
-use crate::{ClusterClient, SearchError, fetch_docs, root_search, search_plan};
+use crate::{ClusterClient, SearchError, fetch_docs, fetch_docs_stream, root_search, search_plan};
 
 #[derive(Clone)]
 /// The search service implementation.
@@ -83,6 +86,14 @@ pub trait SearchService: 'static + Send + Sync {
     /// Fetches the documents contents from the document store.
     /// This methods takes `PartialHit`s and returns `Hit`s.
     async fn fetch_docs(&self, request: FetchDocsRequest) -> crate::Result<FetchDocsResponse>;
+
+    /// Streams document contents from the document store in batches.
+    /// This method takes `PartialHit`s and streams back `FetchDocsResponse`s
+    /// to avoid hitting gRPC message size limits.
+    fn stream_fetch_docs(
+        &self,
+        request: FetchDocsRequest,
+    ) -> Pin<Box<dyn Stream<Item = crate::Result<FetchDocsResponse>> + Send>>;
 
     /// Root search API.
     /// This RPC identifies the set of splits on which the query should run on,
@@ -238,6 +249,53 @@ impl SearchService for SearchServiceImpl {
         .await?;
 
         Ok(fetch_docs_response)
+    }
+
+    fn stream_fetch_docs(
+        &self,
+        fetch_docs_request: FetchDocsRequest,
+    ) -> Pin<Box<dyn Stream<Item = crate::Result<FetchDocsResponse>> + Send>> {
+        let index_uri_result = Uri::from_str(&fetch_docs_request.index_uri);
+        let storage_resolver = self.storage_resolver.clone();
+        let searcher_context = self.searcher_context.clone();
+        let doc_mapper_str = fetch_docs_request.doc_mapper.clone();
+        let partial_hits = fetch_docs_request.partial_hits;
+        let split_offsets = fetch_docs_request.split_offsets;
+        let snippet_request_opt = fetch_docs_request.snippet_request;
+
+        Box::pin(
+            futures::stream::once(async move {
+                let index_uri = match index_uri_result {
+                    Ok(uri) => uri,
+                    Err(e) => return Err(SearchError::from(e)),
+                };
+
+                let storage = match storage_resolver.resolve(&index_uri).await {
+                    Ok(s) => s,
+                    Err(e) => return Err(SearchError::Internal(e.to_string())),
+                };
+
+                let doc_mapper = match deserialize_doc_mapper(&doc_mapper_str) {
+                    Ok(dm) => dm,
+                    Err(e) => return Err(e),
+                };
+
+                Ok(fetch_docs_stream(
+                    searcher_context,
+                    partial_hits,
+                    storage,
+                    split_offsets,
+                    doc_mapper,
+                    snippet_request_opt,
+                ))
+            })
+            .flat_map(|result| match result {
+                std::result::Result::Ok(stream) => Either::Left(
+                    stream.map(|r| r.map_err(|e| SearchError::Internal(e.to_string()))),
+                ),
+                Err(e) => Either::Right(futures::stream::once(async move { Err(e) })),
+            }),
+        )
     }
 
     async fn root_list_terms(

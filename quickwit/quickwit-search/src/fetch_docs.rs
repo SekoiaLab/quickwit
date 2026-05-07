@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, HashMap};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Ok};
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use quickwit_common::shared_consts::SCROLL_BATCH_LEN;
 use quickwit_doc_mapper::DocMapper;
 use quickwit_proto::search::{
     FetchDocsResponse, PartialHit, SnippetRequest, SplitIdAndFooterOffsets,
@@ -145,6 +147,77 @@ pub async fn fetch_docs(
         })
         .collect();
     Ok(FetchDocsResponse { hits })
+}
+
+/// Creates a stream of `FetchDocsResponse` that yields documents in batches
+/// to avoid hitting gRPC message size limits.
+///
+/// This is the streaming version of `fetch_docs` that processes partial hits
+/// and yields them in configurable batch sizes (default: SCROLL_BATCH_LEN).
+pub fn fetch_docs_stream(
+    searcher_context: Arc<SearcherContext>,
+    partial_hits: Vec<PartialHit>,
+    index_storage: Arc<dyn Storage>,
+    splits: Vec<SplitIdAndFooterOffsets>,
+    doc_mapper: Arc<DocMapper>,
+    snippet_request_opt: Option<SnippetRequest>,
+) -> Pin<Box<dyn Stream<Item = anyhow::Result<FetchDocsResponse>> + Send>> {
+    Box::pin(
+        futures::stream::once(async move {
+            let global_doc_addrs: Vec<GlobalDocAddress> = partial_hits
+                .iter()
+                .map(GlobalDocAddress::from_partial_hit)
+                .collect();
+
+            let mut global_doc_addr_to_doc_json = fetch_docs_to_map(
+                searcher_context,
+                global_doc_addrs,
+                index_storage,
+                &splits,
+                doc_mapper,
+                snippet_request_opt.as_ref(),
+            )
+            .await?;
+
+            // Yield hits in batches to avoid gRPC size limits
+            let batches: Vec<anyhow::Result<FetchDocsResponse>> = partial_hits
+                .chunks(SCROLL_BATCH_LEN)
+                .map(|partial_hits_batch| {
+                    let hits: Vec<quickwit_proto::search::LeafHit> = partial_hits_batch
+                        .iter()
+                        .flat_map(|partial_hit| {
+                            let global_doc_addr = GlobalDocAddress::from_partial_hit(partial_hit);
+                            if let Some((_, document)) =
+                                global_doc_addr_to_doc_json.remove_entry(&global_doc_addr)
+                            {
+                                Some(quickwit_proto::search::LeafHit {
+                                    leaf_json: document.content_json,
+                                    partial_hit: Some(partial_hit.clone()),
+                                    leaf_snippet_json: document.snippet_json,
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    if !hits.is_empty() {
+                        Ok(FetchDocsResponse { hits })
+                    } else {
+                        // Skip empty batches
+                        Err(anyhow::anyhow!("empty batch"))
+                    }
+                })
+                .filter(|r| r.is_ok())
+                .collect();
+
+            anyhow::Ok(batches)
+        })
+        .flat_map(|result| match result {
+            std::result::Result::Ok(batches) => futures::stream::iter(batches),
+            Err(e) => futures::stream::iter(vec![Err(e)]),
+        }),
+    )
 }
 
 // number of concurrent fetch allowed for a single split.
