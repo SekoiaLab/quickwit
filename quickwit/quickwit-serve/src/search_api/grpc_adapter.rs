@@ -36,17 +36,6 @@ impl From<Arc<dyn SearchService>> for GrpcSearchAdapter {
 #[async_trait]
 impl grpc::SearchService for GrpcSearchAdapter {
     #[instrument(skip(self, request))]
-    async fn root_search(
-        &self,
-        request: tonic::Request<quickwit_proto::search::SearchRequest>,
-    ) -> Result<tonic::Response<quickwit_proto::search::SearchResponse>, tonic::Status> {
-        set_parent_span_from_request_metadata(request.metadata());
-        let search_request = request.into_inner();
-        let search_result = self.0.root_search(search_request).await;
-        convert_to_grpc_result(search_result)
-    }
-
-    #[instrument(skip(self, request))]
     async fn leaf_search(
         &self,
         request: tonic::Request<quickwit_proto::search::LeafSearchRequest>,
@@ -90,17 +79,6 @@ impl grpc::SearchService for GrpcSearchAdapter {
     }
 
     #[instrument(skip(self, request))]
-    async fn root_list_terms(
-        &self,
-        request: tonic::Request<quickwit_proto::search::ListTermsRequest>,
-    ) -> Result<tonic::Response<quickwit_proto::search::ListTermsResponse>, tonic::Status> {
-        set_parent_span_from_request_metadata(request.metadata());
-        let search_request = request.into_inner();
-        let search_result = self.0.root_list_terms(search_request).await;
-        convert_to_grpc_result(search_result)
-    }
-
-    #[instrument(skip(self, request))]
     async fn leaf_list_terms(
         &self,
         request: tonic::Request<quickwit_proto::search::LeafListTermsRequest>,
@@ -109,15 +87,6 @@ impl grpc::SearchService for GrpcSearchAdapter {
         let leaf_search_request = request.into_inner();
         let leaf_search_result = self.0.leaf_list_terms(leaf_search_request).await;
         convert_to_grpc_result(leaf_search_result)
-    }
-
-    async fn scroll(
-        &self,
-        request: tonic::Request<quickwit_proto::search::ScrollRequest>,
-    ) -> Result<tonic::Response<quickwit_proto::search::SearchResponse>, tonic::Status> {
-        let scroll_request = request.into_inner();
-        let scroll_result = self.0.scroll(scroll_request).await;
-        convert_to_grpc_result(scroll_result)
     }
 
     #[instrument(skip(self, request))]
@@ -165,6 +134,7 @@ impl grpc::SearchService for GrpcSearchAdapter {
         let resp = self.0.root_list_fields(request.into_inner()).await;
         convert_to_grpc_result(resp)
     }
+
     #[instrument(skip(self, request))]
     async fn leaf_list_fields(
         &self,
@@ -173,16 +143,5 @@ impl grpc::SearchService for GrpcSearchAdapter {
         set_parent_span_from_request_metadata(request.metadata());
         let resp = self.0.leaf_list_fields(request.into_inner()).await;
         convert_to_grpc_result(resp)
-    }
-
-    #[instrument(skip(self, request))]
-    async fn search_plan(
-        &self,
-        request: tonic::Request<quickwit_proto::search::SearchRequest>,
-    ) -> Result<tonic::Response<quickwit_proto::search::SearchPlanResponse>, tonic::Status> {
-        set_parent_span_from_request_metadata(request.metadata());
-        let search_request = request.into_inner();
-        let search_result = self.0.search_plan(search_request).await;
-        convert_to_grpc_result(search_result)
     }
 }

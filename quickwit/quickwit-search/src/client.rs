@@ -96,21 +96,6 @@ impl SearchServiceClient {
         matches!(self.client_impl, SearchServiceClientImpl::Local(_))
     }
 
-    /// Perform root search.
-    pub async fn root_search(
-        &mut self,
-        request: quickwit_proto::search::SearchRequest,
-    ) -> crate::Result<quickwit_proto::search::SearchResponse> {
-        match &mut self.client_impl {
-            SearchServiceClientImpl::Grpc(grpc_client) => grpc_client
-                .root_search(request)
-                .await
-                .map(|tonic_response| tonic_response.into_inner())
-                .map_err(|tonic_error| parse_grpc_error(&tonic_error)),
-            SearchServiceClientImpl::Local(service) => service.root_search(request).await,
-        }
-    }
-
     /// Perform leaf search.
     pub async fn leaf_search(
         &mut self,

@@ -17,13 +17,6 @@ syntax = "proto3";
 package quickwit.search;
 
 service SearchService {
-  // Root search API.
-  // This RPC identifies the set of splits on which the query should run on,
-  // and dispatch the several calls to `LeafSearch`.
-  //
-  // It is also in charge of merging back the results.
-  rpc RootSearch(SearchRequest) returns (SearchResponse);
-
   // Perform a leaf search on a given set of splits.
   //
   // It is like a regular search except that:
@@ -42,13 +35,6 @@ service SearchService {
   /// to avoid hitting gRPC message size limits.
   rpc StreamFetchDocs(FetchDocsRequest) returns (stream FetchDocsResponse);
 
-  // Root list terms API.
-  // This RPC identifies the set of splits on which the query should run on,
-  // and dispatches the several calls to `LeafListTerms`.
-  //
-  // It is also in charge of merging back the results.
-  rpc RootListTerms(ListTermsRequest) returns (ListTermsResponse);
-
   // Performs a leaf list terms on a given set of splits.
   //
   // It is like a regular list term except that:
@@ -56,9 +42,6 @@ service SearchService {
   //   it to other nodes.
   // - it should be applied on the given subset of splits
   rpc LeafListTerms(LeafListTermsRequest) returns (LeafListTermsResponse);
-
-  // Performs a scroll request.
-  rpc Scroll(ScrollRequest) returns (SearchResponse);
 
   // gRPC request used to store a key in the local storage of the targeted node.
   // This RPC is used in the mini distributed immutable KV store embedded in quickwit.
@@ -73,9 +56,6 @@ service SearchService {
   rpc ListFields(ListFieldsRequest) returns (ListFieldsResponse);
 
   rpc LeafListFields(LeafListFieldsRequest) returns (ListFieldsResponse);
-
-  // Describe how a search would be processed.
-  rpc SearchPlan(SearchRequest) returns (SearchPlanResponse);
 }
 
 /// Scroll Request

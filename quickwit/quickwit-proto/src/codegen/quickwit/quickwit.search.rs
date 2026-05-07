@@ -809,32 +809,6 @@ pub mod search_service_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
-        /// Root search API.
-        /// This RPC identifies the set of splits on which the query should run on,
-        /// and dispatch the several calls to `LeafSearch`.
-        ///
-        /// It is also in charge of merging back the results.
-        pub async fn root_search(
-            &mut self,
-            request: impl tonic::IntoRequest<super::SearchRequest>,
-        ) -> std::result::Result<tonic::Response<super::SearchResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/quickwit.search.SearchService/RootSearch",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("quickwit.search.SearchService", "RootSearch"));
-            self.inner.unary(req, path, codec).await
-        }
         /// Perform a leaf search on a given set of splits.
         ///
         /// It is like a regular search except that:
@@ -922,37 +896,6 @@ pub mod search_service_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
-        /// Root list terms API.
-        /// This RPC identifies the set of splits on which the query should run on,
-        /// and dispatches the several calls to `LeafListTerms`.
-        ///
-        /// It is also in charge of merging back the results.
-        pub async fn root_list_terms(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ListTermsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ListTermsResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/quickwit.search.SearchService/RootListTerms",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("quickwit.search.SearchService", "RootListTerms"),
-                );
-            self.inner.unary(req, path, codec).await
-        }
         /// Performs a leaf list terms on a given set of splits.
         ///
         /// It is like a regular list term except that:
@@ -984,28 +927,6 @@ pub mod search_service_client {
                 .insert(
                     GrpcMethod::new("quickwit.search.SearchService", "LeafListTerms"),
                 );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Performs a scroll request.
-        pub async fn scroll(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ScrollRequest>,
-        ) -> std::result::Result<tonic::Response<super::SearchResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/quickwit.search.SearchService/Scroll",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("quickwit.search.SearchService", "Scroll"));
             self.inner.unary(req, path, codec).await
         }
         /// gRPC request used to store a key in the local storage of the targeted node.
@@ -1130,31 +1051,6 @@ pub mod search_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        /// Describe how a search would be processed.
-        pub async fn search_plan(
-            &mut self,
-            request: impl tonic::IntoRequest<super::SearchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::SearchPlanResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/quickwit.search.SearchService/SearchPlan",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("quickwit.search.SearchService", "SearchPlan"));
-            self.inner.unary(req, path, codec).await
-        }
     }
 }
 /// Generated server implementations.
@@ -1170,15 +1066,6 @@ pub mod search_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with SearchServiceServer.
     #[async_trait]
     pub trait SearchService: std::marker::Send + std::marker::Sync + 'static {
-        /// Root search API.
-        /// This RPC identifies the set of splits on which the query should run on,
-        /// and dispatch the several calls to `LeafSearch`.
-        ///
-        /// It is also in charge of merging back the results.
-        async fn root_search(
-            &self,
-            request: tonic::Request<super::SearchRequest>,
-        ) -> std::result::Result<tonic::Response<super::SearchResponse>, tonic::Status>;
         /// Perform a leaf search on a given set of splits.
         ///
         /// It is like a regular search except that:
@@ -1219,18 +1106,6 @@ pub mod search_service_server {
             tonic::Response<Self::StreamFetchDocsStream>,
             tonic::Status,
         >;
-        /// Root list terms API.
-        /// This RPC identifies the set of splits on which the query should run on,
-        /// and dispatches the several calls to `LeafListTerms`.
-        ///
-        /// It is also in charge of merging back the results.
-        async fn root_list_terms(
-            &self,
-            request: tonic::Request<super::ListTermsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ListTermsResponse>,
-            tonic::Status,
-        >;
         /// Performs a leaf list terms on a given set of splits.
         ///
         /// It is like a regular list term except that:
@@ -1245,11 +1120,6 @@ pub mod search_service_server {
             tonic::Response<super::LeafListTermsResponse>,
             tonic::Status,
         >;
-        /// Performs a scroll request.
-        async fn scroll(
-            &self,
-            request: tonic::Request<super::ScrollRequest>,
-        ) -> std::result::Result<tonic::Response<super::SearchResponse>, tonic::Status>;
         /// gRPC request used to store a key in the local storage of the targeted node.
         /// This RPC is used in the mini distributed immutable KV store embedded in quickwit.
         async fn put_kv(
@@ -1281,14 +1151,6 @@ pub mod search_service_server {
             request: tonic::Request<super::LeafListFieldsRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ListFieldsResponse>,
-            tonic::Status,
-        >;
-        /// Describe how a search would be processed.
-        async fn search_plan(
-            &self,
-            request: tonic::Request<super::SearchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::SearchPlanResponse>,
             tonic::Status,
         >;
     }
@@ -1368,51 +1230,6 @@ pub mod search_service_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/quickwit.search.SearchService/RootSearch" => {
-                    #[allow(non_camel_case_types)]
-                    struct RootSearchSvc<T: SearchService>(pub Arc<T>);
-                    impl<
-                        T: SearchService,
-                    > tonic::server::UnaryService<super::SearchRequest>
-                    for RootSearchSvc<T> {
-                        type Response = super::SearchResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::SearchRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as SearchService>::root_search(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = RootSearchSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/quickwit.search.SearchService/LeafSearch" => {
                     #[allow(non_camel_case_types)]
                     struct LeafSearchSvc<T: SearchService>(pub Arc<T>);
@@ -1550,51 +1367,6 @@ pub mod search_service_server {
                     };
                     Box::pin(fut)
                 }
-                "/quickwit.search.SearchService/RootListTerms" => {
-                    #[allow(non_camel_case_types)]
-                    struct RootListTermsSvc<T: SearchService>(pub Arc<T>);
-                    impl<
-                        T: SearchService,
-                    > tonic::server::UnaryService<super::ListTermsRequest>
-                    for RootListTermsSvc<T> {
-                        type Response = super::ListTermsResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ListTermsRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as SearchService>::root_list_terms(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = RootListTermsSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/quickwit.search.SearchService/LeafListTerms" => {
                     #[allow(non_camel_case_types)]
                     struct LeafListTermsSvc<T: SearchService>(pub Arc<T>);
@@ -1625,51 +1397,6 @@ pub mod search_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = LeafListTermsSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/quickwit.search.SearchService/Scroll" => {
-                    #[allow(non_camel_case_types)]
-                    struct ScrollSvc<T: SearchService>(pub Arc<T>);
-                    impl<
-                        T: SearchService,
-                    > tonic::server::UnaryService<super::ScrollRequest>
-                    for ScrollSvc<T> {
-                        type Response = super::SearchResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ScrollRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as SearchService>::scroll(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ScrollSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -1894,51 +1621,6 @@ pub mod search_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = LeafListFieldsSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/quickwit.search.SearchService/SearchPlan" => {
-                    #[allow(non_camel_case_types)]
-                    struct SearchPlanSvc<T: SearchService>(pub Arc<T>);
-                    impl<
-                        T: SearchService,
-                    > tonic::server::UnaryService<super::SearchRequest>
-                    for SearchPlanSvc<T> {
-                        type Response = super::SearchPlanResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::SearchRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as SearchService>::search_plan(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = SearchPlanSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
