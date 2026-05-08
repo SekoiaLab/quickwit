@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream;
+use itertools::Itertools;
 use quickwit_proto::error::convert_to_grpc_result;
 use quickwit_proto::search::{
     GetKvRequest, GetKvResponse, LeafListFieldsRequest, ListFieldsRequest, ListFieldsResponse,
@@ -85,30 +86,22 @@ impl grpc::SearchService for GrpcSearchAdapter {
         // Call the regular fetch_docs method
         let fetch_docs_result = self.0.fetch_docs(fetch_docs_request).await;
 
-        if let Err(err) = fetch_docs_result {
-            return Err(err.into_grpc_status());
-        }
-
         let fetch_docs_response = match fetch_docs_result {
             Ok(response) => response,
             Err(err) => return Err(err.into_grpc_status()),
         };
 
-        let batches = if fetch_docs_response.hits.is_empty() {
-            vec![Ok(quickwit_proto::search::FetchDocsResponse {
-                hits: vec![],
-            })]
-        } else {
-            fetch_docs_response
-                .hits
-                .chunks(FETCH_DOCS_BATCH_SIZE)
-                .map(|chunk| {
-                    Ok(quickwit_proto::search::FetchDocsResponse {
-                        hits: chunk.to_vec(),
-                    })
+        let batches: Vec<_> = fetch_docs_response
+            .hits
+            .into_iter()
+            .chunks(FETCH_DOCS_BATCH_SIZE)
+            .into_iter()
+            .map(|chunk| {
+                Ok(quickwit_proto::search::FetchDocsResponse {
+                    hits: chunk.collect(),
                 })
-                .collect()
-        };
+            })
+            .collect();
 
         let grpc_stream = stream::iter(batches);
 
