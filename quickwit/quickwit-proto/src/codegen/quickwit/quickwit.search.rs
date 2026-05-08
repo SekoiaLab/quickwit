@@ -893,9 +893,9 @@ pub mod search_service_client {
                 .insert(GrpcMethod::new("quickwit.search.SearchService", "FetchDocs"));
             self.inner.unary(req, path, codec).await
         }
-        /// / Streams document contents from the document store.
-        /// / This method takes `PartialHit`s and streams back `LeafHit`s in batches
-        /// / to avoid hitting gRPC message size limits.
+        /// Streams document contents from the document store.
+        /// This method takes `PartialHit`s and streams back `LeafHit`s in batches
+        /// to avoid hitting gRPC message size limits.
         pub async fn stream_fetch_docs(
             &mut self,
             request: impl tonic::IntoRequest<super::FetchDocsRequest>,
@@ -1209,9 +1209,9 @@ pub mod search_service_server {
             >
             + std::marker::Send
             + 'static;
-        /// / Streams document contents from the document store.
-        /// / This method takes `PartialHit`s and streams back `LeafHit`s in batches
-        /// / to avoid hitting gRPC message size limits.
+        /// Streams document contents from the document store.
+        /// This method takes `PartialHit`s and streams back `LeafHit`s in batches
+        /// to avoid hitting gRPC message size limits.
         async fn stream_fetch_docs(
             &self,
             request: tonic::Request<super::FetchDocsRequest>,
