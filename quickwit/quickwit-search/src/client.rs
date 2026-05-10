@@ -152,6 +152,7 @@ impl SearchServiceClient {
         match &mut self.client_impl {
             SearchServiceClientImpl::Grpc(grpc_client) => {
                 let tonic_request = Request::new(request);
+                // let nb_docs_fetched = request.partial_hits.len();
 
                 // get all in one shot
                 let tonic_response = grpc_client
@@ -167,8 +168,8 @@ impl SearchServiceClient {
                 //     .map_err(|tonic_error| parse_grpc_error(&tonic_error))?
                 //     .into_inner()
                 //     .map_err(|tonic_error| parse_grpc_error(&tonic_error))
-                //     .try_fold(Vec::new(), |mut acc, response| async move {
-                //         acc.extend(response.hits);
+                //     .try_fold(Vec::with_capacity(nb_docs_fetched), |mut acc, response| async move
+                // {         acc.extend(response.hits);
                 //         Ok(acc)
                 //     })
                 //     .await?;

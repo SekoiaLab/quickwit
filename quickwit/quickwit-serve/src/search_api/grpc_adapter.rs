@@ -15,8 +15,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream;
-use itertools::Itertools;
+use futures::stream::{self, StreamExt};
 use quickwit_proto::error::convert_to_grpc_result;
 use quickwit_proto::search::{
     GetKvRequest, GetKvResponse, LeafListFieldsRequest, ListFieldsRequest, ListFieldsResponse,
@@ -26,7 +25,7 @@ use quickwit_proto::{GrpcServiceError, set_parent_span_from_request_metadata, to
 use quickwit_search::SearchService;
 use tracing::instrument;
 
-const FETCH_DOCS_BATCH_SIZE: usize = 100;
+const FETCH_DOCS_BATCH_SIZE: usize = 500;
 
 #[derive(Clone)]
 pub struct GrpcSearchAdapter(Arc<dyn SearchService>);
@@ -91,21 +90,20 @@ impl grpc::SearchService for GrpcSearchAdapter {
             Err(err) => return Err(err.into_grpc_status()),
         };
 
-        let batches: Vec<_> = fetch_docs_response
-            .hits
-            .into_iter()
+        // If there is only one batch, return it directly to avoid copying to a new vec.
+        if fetch_docs_response.hits.len() <= FETCH_DOCS_BATCH_SIZE {
+            let batch = quickwit_proto::search::FetchDocsResponse {
+                hits: fetch_docs_response.hits,
+            };
+            let batch_stream = stream::iter([Ok(batch)]);
+            return Ok(tonic::Response::new(Box::pin(batch_stream)));
+        }
+
+        let batch_stream = stream::iter(fetch_docs_response.hits)
             .chunks(FETCH_DOCS_BATCH_SIZE)
-            .into_iter()
-            .map(|chunk| {
-                Ok(quickwit_proto::search::FetchDocsResponse {
-                    hits: chunk.collect(),
-                })
-            })
-            .collect();
+            .map(|batch| Ok(quickwit_proto::search::FetchDocsResponse { hits: batch }));
 
-        let grpc_stream = stream::iter(batches);
-
-        Ok(tonic::Response::new(Box::pin(grpc_stream)))
+        Ok(tonic::Response::new(Box::pin(batch_stream)))
     }
 
     #[instrument(skip(self, request))]
