@@ -159,6 +159,7 @@ impl SearchServiceClient {
                     .await
                     .map_err(|tonic_error| parse_grpc_error(&tonic_error))?
                     .into_inner()
+                    // TODO stream item errors are all collapsed into SearchError::Internal
                     .map_err(|tonic_error| parse_grpc_error(&tonic_error))
                     .try_fold(
                         Vec::with_capacity(nb_docs_fetched),
