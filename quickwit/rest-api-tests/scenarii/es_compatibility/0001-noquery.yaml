@@ -3,4 +3,4 @@ expected:
   hits:
     total:
       value: 100
-      relation: "eq"
+      relation: "gte"

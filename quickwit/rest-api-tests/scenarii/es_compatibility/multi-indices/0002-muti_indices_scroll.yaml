@@ -18,7 +18,7 @@ expected:
       - _source: {actor: {login: "trinity"}}
     total:
       value: 4
-      relation: "eq"
+      relation: "gte"
 ---
 method: GET
 endpoint: "_search/scroll"

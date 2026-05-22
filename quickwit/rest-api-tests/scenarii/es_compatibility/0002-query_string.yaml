@@ -4,7 +4,7 @@ expected:
   hits:
     total:
       value: 60
-      relation: "eq"
+      relation: "gte"
     hits:
       $expect: "len(val) == 10"
 ---
@@ -16,7 +16,7 @@ expected:
   hits:
     total:
       value: 60
-      relation: "eq"
+      relation: "gte"
     hits:
       $expect: "len(val) == 3"
 ---
@@ -34,7 +34,7 @@ expected:
   hits:
     total:
       value: 60
-      relation: "eq"
+      relation: "gte"
     hits:
       $expect: "len(val) == 3"
 ---

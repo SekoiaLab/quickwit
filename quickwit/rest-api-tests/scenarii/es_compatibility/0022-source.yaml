@@ -9,10 +9,10 @@ expected:
   hits:
     total:
       value: 100
-      relation: eq
+      relation: gte
     hits:
       - _source:
-          $expect: "not 'actor' in val" 
+          $expect: "not 'actor' in val"
 --- # _source_includes
 params:
   _source_includes: ["actor"]
@@ -24,7 +24,7 @@ expected:
   hits:
     total:
       value: 100
-      relation: eq
+      relation: gte
     hits:
       - _source:
           $expect: "len(val) == 1" # Contains only 'actor'
@@ -42,7 +42,7 @@ expected:
   hits:
     total:
       value: 100
-      relation: eq
+      relation: gte
     hits:
       - _source:
           $expect: "len(val) == 1" # Contains only 'actor'
@@ -58,10 +58,9 @@ expected:
   hits:
     total:
       value: 100
-      relation: eq
+      relation: gte
     hits:
       - _source:
-          actor: 
+          actor:
             $expect: "len(val) == 1" # Contains only 'actor'
             id: 5688
-

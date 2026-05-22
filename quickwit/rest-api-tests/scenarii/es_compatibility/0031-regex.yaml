@@ -104,4 +104,4 @@ expected:
   hits:
     total:
       value: 60
-      relation: "eq"
+      relation: "gte"

@@ -9,7 +9,7 @@ expected:
   hits:
     total:
       value: 100
-      relation: eq
+      relation: gte
     hits:
       - sort: [10791502]
 ---
@@ -25,7 +25,7 @@ expected:
   hits:
     total:
       value: 100
-      relation: eq
+      relation: gte
     hits:
       - sort: [10791466]
 ---
@@ -41,7 +41,7 @@ expected:
   hits:
     total:
       value: 100
-      relation: eq
+      relation: gte
     hits:
       - sort: [9018]
 ---
@@ -57,7 +57,7 @@ expected:
   hits:
     total:
       value: 100
-      relation: eq
+      relation: gte
     hits:
       - sort: [9018]
 ---

@@ -56,7 +56,7 @@ expected:
   hits:
     total:
       value: 4
-      relation: "eq"
+      relation: "gte"
     hits:
       - _source:
           actor:
@@ -135,6 +135,6 @@ expected:
   hits:
     total:
       value: 104
-      relation: "eq"
+      relation: "gte"
     hits:
       $expect: "len(val) == 2"

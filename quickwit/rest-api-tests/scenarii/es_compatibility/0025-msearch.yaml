@@ -40,7 +40,7 @@ expected:
     - hits:
         total:
           value: 100
-          relation: eq
+          relation: gte
         hits:
           - _source:
               $expect: "not 'actor' in val"
@@ -60,7 +60,7 @@ expected:
     - hits:
         total:
           value: 100
-          relation: eq
+          relation: gte
         hits:
           - _source:
               $expect: "len(val) == 1" # Contains only 'actor'
@@ -81,7 +81,7 @@ expected:
     - hits:
         total:
           value: 100
-          relation: eq
+          relation: gte
         hits:
           - _source:
               $expect: "not 'actor' in val"
@@ -98,7 +98,7 @@ expected:
     - hits:
         total:
           value: 100
-          relation: eq
+          relation: gte
         hits:
           - _source:
               $expect: "len(val) == 1" # Contains only 'actor'
