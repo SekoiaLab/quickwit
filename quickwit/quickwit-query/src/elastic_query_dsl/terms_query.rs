@@ -16,6 +16,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 use serde::Deserialize;
+use tracing::error;
 
 use crate::elastic_query_dsl::one_field_map::OneFieldMap;
 use crate::elastic_query_dsl::{ConvertibleToQueryAst, ElasticQueryDslInner};
@@ -97,9 +98,14 @@ impl ConvertibleToQueryAst for TermsQuery {
     fn convert_to_query_ast(self) -> anyhow::Result<QueryAst> {
         let max_terms = *MAX_TERMS_QUERY_SIZE;
         if self.values.len() > max_terms {
+            error!(
+                field = self.field,
+                nb_values = self.values.len(),
+                "terms query exceeds maximum allowed values"
+            );
             anyhow::bail!(
-                "`terms` query on field `{}` contains {} values, which exceeds the maximum \
-                 allowed ({max_terms})",
+                "terms query on field `{}` contains {} values, which exceeds the maximum allowed \
+                 ({max_terms})",
                 self.field,
                 self.values.len()
             );
