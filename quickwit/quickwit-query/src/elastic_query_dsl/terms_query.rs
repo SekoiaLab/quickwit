@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::LazyLock;
 
 use serde::Deserialize;
 
@@ -85,8 +86,24 @@ impl TryFrom<TermsQueryForSerialization> for TermsQuery {
     }
 }
 
+/// Maximum number of terms allowed in a `terms` query.
+/// Large term sets generate a SQL condition that grows linearly with the number of values,
+/// which can cause PostgreSQL to OOM while parsing/planning the query.
+/// Can be overridden via the `QW_MAX_TERMS_QUERY_SIZE` environment variable.
+static MAX_TERMS_QUERY_SIZE: LazyLock<usize> =
+    LazyLock::new(|| quickwit_common::get_from_env("QW_MAX_TERMS_QUERY_SIZE", 100usize, false));
+
 impl ConvertibleToQueryAst for TermsQuery {
     fn convert_to_query_ast(self) -> anyhow::Result<QueryAst> {
+        let max_terms = *MAX_TERMS_QUERY_SIZE;
+        if self.values.len() > max_terms {
+            anyhow::bail!(
+                "`terms` query on field `{}` contains {} values, which exceeds the maximum \
+                 allowed ({max_terms})",
+                self.field,
+                self.values.len()
+            );
+        }
         let mut terms_per_field = HashMap::new();
         let values_set: BTreeSet<String> = self.values.into_iter().collect();
         terms_per_field.insert(self.field, values_set);
@@ -133,6 +150,18 @@ mod tests {
         let terms_query: TermsQuery = serde_json::from_str(terms_query_json).unwrap();
         assert_eq!(&terms_query.field, "user.id");
         assert_eq!(&terms_query.values[..], &["1".to_string(), "2".to_string()]);
+    }
+
+    #[test]
+    fn test_terms_query_too_many_values() {
+        let values: Vec<String> = (0..=*MAX_TERMS_QUERY_SIZE).map(|i| i.to_string()).collect();
+        let terms_query = TermsQuery {
+            boost: None,
+            field: "my_field".to_string(),
+            values,
+        };
+        let err = terms_query.convert_to_query_ast().unwrap_err();
+        assert!(err.to_string().contains("exceeds the maximum allowed"));
     }
 
     #[test]
