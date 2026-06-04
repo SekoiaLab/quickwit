@@ -1172,9 +1172,9 @@ async fn refine_and_list_matches(
     }
 
     // We might miss some pruning opportunities by restricting the tag filter
-    // AST to the tag fields of the current doc mappings, but sending all tags
-    // to the metastore is too expensive for large queries (e.g TermSet queries
-    // with thousands of terms).
+    // AST to the tag fields of the current doc mappings, but sending all
+    // possible filters to the metastore is too expensive for large queries (e.g
+    // TermSet queries with thousands of terms).
     let tag_field_names: std::collections::BTreeSet<String> = indexes_metadata
         .iter()
         .flat_map(|meta| meta.index_config.doc_mapping.tag_fields.iter().cloned())

@@ -32,14 +32,19 @@ pub fn match_tag_field_name(field_name: &str, tag: &str) -> bool {
 /// If the predicate evaluates to false for a given set of tags associated with
 /// a split, we are guaranteed that no documents in the split matches the query.
 ///
-/// Setting `tag_fields` to None will return all create an AST with all possible
-/// tag filters in the query. This ensures that all pruning oportunities are
+/// Setting `tag_fields` to `None` will create an AST with all possible tag
+/// filters from the query. This ensures that all pruning opportunities are
 /// considered, but it can also lead to very large tag filter ASTs. This can put
 /// a lot of pressure on the metastore.
 pub fn extract_tags_from_query(
     query_ast: QueryAst,
     tag_fields: Option<&BTreeSet<String>>,
 ) -> Option<TagFilterAst> {
+    if let Some(tag_fields) = tag_fields
+        && tag_fields.is_empty()
+    {
+        return None;
+    }
     let mut unsimplified = extract_unsimplified_tags_filter_ast(query_ast);
     if let Some(tag_fields) = tag_fields {
         unsimplified = prune_unsimplified_tag_filter_ast(unsimplified, tag_fields);
