@@ -55,6 +55,16 @@ pub(super) fn convert_sqlx_err(index_id: &str, sqlx_error: sqlx::Error) -> Metas
                 }
             }
         }
+        // Socket-level failures and pool exhaustion are transient: the statement either never
+        // reached the server or failed while no transaction was committing. Classify them as the
+        // retryable `Connection` variant (rather than the opaque `Db`) so the gRPC client's retry
+        // layer treats them as transient and error reporting/metrics stay accurate.
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => {
+            error!(error=?sqlx_error, "postgresql-connection-error");
+            MetastoreError::Connection {
+                message: sqlx_error.to_string(),
+            }
+        }
         _ => {
             error!(error=?sqlx_error, "an error has occurred in the database operation");
             MetastoreError::Db {
