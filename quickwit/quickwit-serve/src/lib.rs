@@ -504,8 +504,21 @@ pub async fn serve_quickwit(
             {
                 bail!("could not find any metastore node in the cluster");
             }
+            // Some calls to the metastore happen once a lot of work has already been done. Retry
+            // harder in that case.
+            let retry_harder_on_critical_call_params = RetryParams {
+                base_delay: Duration::from_secs(1),
+                max_delay: Duration::from_secs(20),
+                max_attempts: 5,
+            };
             MetastoreServiceClient::tower()
                 .stack_layer(RetryLayer::new(RetryPolicy::from(RetryParams::standard())))
+                .stack_publish_splits_layer(RetryLayer::new(RetryPolicy::from(
+                    retry_harder_on_critical_call_params,
+                )))
+                .stack_stage_splits_layer(RetryLayer::new(RetryPolicy::from(
+                    retry_harder_on_critical_call_params,
+                )))
                 .stack_layer(TimeoutLayer::new(GRPC_METASTORE_SERVICE_TIMEOUT))
                 .stack_layer(METASTORE_GRPC_CLIENT_METRICS_LAYER.clone())
                 .stack_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
