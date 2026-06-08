@@ -116,13 +116,13 @@ async fn fetch_splits_and_plan(
         .list_splits(list_splits_request)
         .await
         .inspect_err(|error| {
-            error!(%error, index_uid=%index_metadata.index_uid, "failed to list splits from the metastore");
+            error!(%error, index_id=%index_metadata.index_uid.index_id, "failed to list splits from the metastore");
         })?;
     let splits = splits_stream
         .collect_splits_metadata()
         .await
         .inspect_err(|error| {
-            error!(%error, index_uid=%index_metadata.index_uid, "failed to collect splits metadata from the metastore");
+            error!(%error, index_id=%index_metadata.index_uid.index_id, "failed to collect splits metadata from the metastore");
         })?;
 
     if splits.iter().any(|s| !s.tags.is_empty()) {

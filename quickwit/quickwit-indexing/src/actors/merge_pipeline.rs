@@ -462,7 +462,7 @@ impl MergePipeline {
             .inspect_err(|error| {
                 error!(
                     %error,
-                    index_uid=%self.params.pipeline_id.index_uid,
+                    index_id=%self.params.pipeline_id.index_uid.index_id,
                     source_id=%self.params.pipeline_id.source_id,
                     "failed to list immature splits from the metastore"
                 );
@@ -473,7 +473,7 @@ impl MergePipeline {
             .inspect_err(|error| {
                 error!(
                     %error,
-                    index_uid=%self.params.pipeline_id.index_uid,
+                    index_id=%self.params.pipeline_id.index_uid.index_id,
                     source_id=%self.params.pipeline_id.source_id,
                     "failed to collect immature splits metadata from the metastore"
                 );

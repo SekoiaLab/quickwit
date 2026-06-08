@@ -216,7 +216,8 @@ impl IndexerState {
             .inspect_err(|error| {
                 error!(
                     %error,
-                    index_uid=%self.pipeline_id.index_uid,
+                    index_id=%self.pipeline_id.index_uid.index_id,
+                    source_id=%self.pipeline_id.source_id,
                     "failed to fetch last delete opstamp from the metastore"
                 );
             })?;
