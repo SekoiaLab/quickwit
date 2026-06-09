@@ -68,7 +68,7 @@ use quickwit_common::rate_limiter::RateLimiterSettings;
 use quickwit_common::retry::RetryParams;
 use quickwit_common::runtimes::RuntimesConfig;
 use quickwit_common::tower::{
-    BalanceChannel, BoxFutureInfaillible, BufferLayer, Change, CircuitBreakerEvaluator,
+    BalanceChannel, BoxFutureInfaillible, BoxLayer, BufferLayer, Change, CircuitBreakerEvaluator,
     ConstantRate, EstimateRateLayer, EventListenerLayer, GrpcMetricsLayer, LoadShedLayer,
     RateLimitLayer, RetryLayer, RetryPolicy, SmaRateEstimator, TimeoutLayer,
 };
@@ -103,7 +103,7 @@ use quickwit_proto::ingest::router::IngestRouterServiceClient;
 use quickwit_proto::ingest::{IngestV2Error, RateLimitingCause};
 use quickwit_proto::metastore::{
     EntityKind, ListIndexesMetadataRequest, MetastoreError, MetastoreService,
-    MetastoreServiceClient,
+    MetastoreServiceClient, MetastoreServiceTowerLayerStack,
 };
 use quickwit_proto::search::ReportSplitsRequest;
 use quickwit_proto::types::NodeId;
@@ -152,6 +152,30 @@ fn get_metastore_client_max_concurrency() -> usize {
         DEFAULT_METASTORE_CLIENT_MAX_CONCURRENCY,
         false,
     )
+}
+
+/// Configures per-method retry layers on a metastore tower layer stack.
+///
+/// All methods get a standard retry. `stage_splits` and `publish_splits` replace it
+/// with a harder retry because those calls happen after significant indexing work and
+/// losing them to a transient failure is particularly costly.
+fn stack_metastore_retry_layer(
+    tower: MetastoreServiceTowerLayerStack,
+) -> MetastoreServiceTowerLayerStack {
+    let mut tower = tower.stack_layer(RetryLayer::new(RetryPolicy::from(RetryParams::standard())));
+    let harder_retry_params = RetryParams {
+        base_delay: Duration::from_secs(1),
+        max_delay: Duration::from_secs(20),
+        // adding just 2 more retries bumps the retry duration from ~2s to ~12s
+        max_attempts: 5,
+    };
+    tower.stage_splits_layers = vec![BoxLayer::new(RetryLayer::new(RetryPolicy::from(
+        harder_retry_params,
+    )))];
+    tower.publish_splits_layers = vec![BoxLayer::new(RetryLayer::new(RetryPolicy::from(
+        harder_retry_params,
+    )))];
+    tower
 }
 
 static CP_GRPC_CLIENT_METRICS_LAYER: Lazy<GrpcMetricsLayer> =
@@ -504,21 +528,8 @@ pub async fn serve_quickwit(
             {
                 bail!("could not find any metastore node in the cluster");
             }
-            // Some calls to the metastore happen once a lot of work has already been done. Retry
-            // harder in that case.
-            let retry_harder_on_critical_call_params = RetryParams {
-                base_delay: Duration::from_secs(1),
-                max_delay: Duration::from_secs(20),
-                max_attempts: 5,
-            };
-            MetastoreServiceClient::tower()
-                .stack_layer(RetryLayer::new(RetryPolicy::from(RetryParams::standard())))
-                .stack_publish_splits_layer(RetryLayer::new(RetryPolicy::from(
-                    retry_harder_on_critical_call_params,
-                )))
-                .stack_stage_splits_layer(RetryLayer::new(RetryPolicy::from(
-                    retry_harder_on_critical_call_params,
-                )))
+
+            stack_metastore_retry_layer(MetastoreServiceClient::tower())
                 .stack_layer(TimeoutLayer::new(GRPC_METASTORE_SERVICE_TIMEOUT))
                 .stack_layer(METASTORE_GRPC_CLIENT_METRICS_LAYER.clone())
                 .stack_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
@@ -1623,5 +1634,41 @@ mod tests {
             .await
             .unwrap();
         assert!(!searcher_client.is_local());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stack_metastore_retry_layer() {
+        use quickwit_proto::metastore::{ListIndexesMetadataRequest, MetastoreError};
+
+        let mut mock = MockMetastoreService::new();
+        mock.expect_list_indexes_metadata()
+            .times(3)
+            .returning(|_| Err(MetastoreError::Unavailable("transient".to_string())));
+
+        let client =
+            stack_metastore_retry_layer(MetastoreServiceClient::tower()).build_from_mock(mock);
+        let err = client
+            .list_indexes_metadata(ListIndexesMetadataRequest::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetastoreError::Unavailable(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stack_metastore_retry_layer_harder_retry() {
+        use quickwit_proto::metastore::{MetastoreError, StageSplitsRequest};
+
+        let mut mock = MockMetastoreService::new();
+        mock.expect_stage_splits()
+            .times(5)
+            .returning(|_| Err(MetastoreError::Unavailable("transient".to_string())));
+
+        let client =
+            stack_metastore_retry_layer(MetastoreServiceClient::tower()).build_from_mock(mock);
+        let err = client
+            .stage_splits(StageSplitsRequest::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetastoreError::Unavailable(_)));
     }
 }
