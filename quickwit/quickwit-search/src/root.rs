@@ -633,11 +633,7 @@ async fn search_partial_hits_phase_with_scroll(
             cached_partial_hits,
             failed_splits: leaf_search_resp.failed_splits.clone(),
             num_successful_splits: leaf_search_resp.num_successful_splits,
-            splits_by_outcome: leaf_search_resp
-                .resource_stats
-                .as_ref()
-                .map(|s| s.splits_by_outcome)
-                .flatten(),
+            splits_by_outcome: leaf_search_resp.splits_by_outcome,
         };
         let scroll_key_and_start_offset: ScrollKeyAndStartOffset =
             ScrollKeyAndStartOffset::new_with_start_offset(
@@ -718,6 +714,7 @@ pub fn get_count_from_metadata(split_metadatas: &[SplitMetadata]) -> Vec<LeafSea
             num_successful_splits: 1,
             intermediate_aggregation_result: None,
             resource_stats: None,
+            splits_by_outcome: None,
         })
         .collect()
 }
@@ -798,7 +795,7 @@ pub(crate) async fn search_partial_hits_phase(
     let leaf_search_results: Vec<tantivy::Result<LeafSearchResponse>> =
         leaf_search_responses.into_iter().map(Ok).collect_vec();
     let span = info_span!("merge_fruits");
-    let leaf_search_response = crate::search_thread_pool()
+    let mut leaf_search_response = crate::search_thread_pool()
         .run_cpu_intensive(move || {
             let _span_guard = span.enter();
             merge_collector.merge_fruits(leaf_search_results)
@@ -827,6 +824,10 @@ pub(crate) async fn search_partial_hits_phase(
             short_lived_cached_num_bytes = resource_stats.short_lived_cache_num_bytes,
             "memory intensive query"
         );
+    }
+
+    if leaf_search_response.splits_by_outcome.is_none() {
+        leaf_search_response.splits_by_outcome = Some(Default::default());
     }
 
     Ok(leaf_search_response)
@@ -1045,10 +1046,7 @@ async fn root_search_aux(
             .map(ToString::to_string),
         failed_splits: first_phase_result.failed_splits,
         num_successful_splits: first_phase_result.num_successful_splits,
-        splits_by_outcome: first_phase_result
-            .resource_stats
-            .map(|s| s.splits_by_outcome)
-            .flatten(),
+        splits_by_outcome: first_phase_result.splits_by_outcome,
     })
 }
 

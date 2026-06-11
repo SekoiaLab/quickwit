@@ -120,10 +120,7 @@ impl ScrollContext {
         .await?;
         self.cached_partial_hits_start_offset = start_offset;
         self.cached_partial_hits = leaf_search_response.partial_hits;
-        self.splits_by_outcome = leaf_search_response
-            .resource_stats
-            .map(|s| s.splits_by_outcome)
-            .flatten();
+        self.splits_by_outcome = leaf_search_response.splits_by_outcome;
         Ok(true)
     }
 }

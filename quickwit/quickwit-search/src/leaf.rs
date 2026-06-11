@@ -392,6 +392,7 @@ fn get_leaf_resp_from_count(count: u64) -> LeafSearchResponse {
         num_successful_splits: 1,
         intermediate_aggregation_result: None,
         resource_stats: None,
+        splits_by_outcome: None,
     }
 }
 
@@ -570,10 +571,10 @@ async fn leaf_search_single_split(
                     warmup_microsecs: warmup_duration.as_micros() as u64,
                     cpu_thread_pool_wait_microsecs: cpu_thread_pool_wait_microsecs.as_micros()
                         as u64,
-                    // split status breakdown is estimated at the (doc mapping)
-                    // leaf response level to account for all early returns
-                    splits_by_outcome: None,
                 });
+                // splits by outcome are estimated at the (doc mapping) leaf
+                // response level to account for all early returns, so it is
+                // left None here
                 leaf_search_state_guard.set_state(SplitSearchState::Processed);
                 Result::<_, TantivyError>::Ok(Some((
                     simplified_search_request,
@@ -1460,13 +1461,11 @@ pub async fn single_doc_mapping_leaf_search(
             .context("failed to merge split search responses");
 
     let mut leaf_response = leaf_search_response_reresult??;
-    if let Some(stats) = &mut leaf_response.resource_stats {
-        stats.splits_by_outcome = Some(
-            leaf_search_context
-                .split_outcome_counters
-                .split_by_outcome(),
-        );
-    }
+    leaf_response.splits_by_outcome = Some(
+        leaf_search_context
+            .split_outcome_counters
+            .split_by_outcome(),
+    );
     Ok(leaf_response)
 }
 

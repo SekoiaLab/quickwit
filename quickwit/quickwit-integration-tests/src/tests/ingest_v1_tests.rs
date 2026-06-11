@@ -26,7 +26,6 @@ use crate::test_utils::{ClusterSandboxBuilder, ingest};
 /// This tests checks our happy path for ingesting one doc.
 #[tokio::test]
 async fn test_ingest_v1_happy_path() {
-    quickwit_common::setup_logging_for_tests();
     let sandbox = ClusterSandboxBuilder::default()
         .use_legacy_ingest()
         .add_node([QuickwitService::Indexer])

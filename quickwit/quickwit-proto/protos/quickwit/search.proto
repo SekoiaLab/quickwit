@@ -386,7 +386,6 @@ message ResourceStats {
     uint64 warmup_microsecs = 3;
     uint64 cpu_thread_pool_wait_microsecs = 4;
     uint64 cpu_microsecs = 5;
-    SplitsByOutcome splits_by_outcome = 6;
 }
 
 /// LeafRequestRef references data in LeafSearchRequest to deduplicate data.
@@ -527,6 +526,9 @@ message LeafSearchResponse {
   optional bytes intermediate_aggregation_result = 6;
 
   ResourceStats resource_stats = 8;
+
+  // Split outcome counters for all splits targeted by this leaf request.
+  optional SplitsByOutcome splits_by_outcome = 9;
 }
 
 message SnippetRequest {

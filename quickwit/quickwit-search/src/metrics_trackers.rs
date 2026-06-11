@@ -129,18 +129,29 @@ struct SplitsByOutcomeDisp(SplitsByOutcome);
 
 impl std::fmt::Display for SplitsByOutcomeDisp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = &self.0;
+        // Destructure to make sure we update this if a state is added
+        let SplitsByOutcome {
+            pruned_before_warmup,
+            pruned_after_warmup,
+            cancel_before_warmup,
+            cancel_warmup,
+            cancel_cpu_queue,
+            cancel_cpu,
+            processed,
+            processed_from_metadata,
+            cache_hit,
+        } = self.0;
         let mut sep = "{";
         for (name, val) in [
-            ("pruned_before_warmup", s.pruned_before_warmup),
-            ("pruned_after_warmup", s.pruned_after_warmup),
-            ("cancel_before_warmup", s.cancel_before_warmup),
-            ("cancel_warmup", s.cancel_warmup),
-            ("cancel_cpu_queue", s.cancel_cpu_queue),
-            ("cancel_cpu", s.cancel_cpu),
-            ("processed", s.processed),
-            ("processed_from_metadata", s.processed_from_metadata),
-            ("cache_hit", s.cache_hit),
+            ("pruned_before_warmup", pruned_before_warmup),
+            ("pruned_after_warmup", pruned_after_warmup),
+            ("cancel_before_warmup", cancel_before_warmup),
+            ("cancel_warmup", cancel_warmup),
+            ("cancel_cpu_queue", cancel_cpu_queue),
+            ("cancel_cpu", cancel_cpu),
+            ("processed", processed),
+            ("processed_from_metadata", processed_from_metadata),
+            ("cache_hit", cache_hit),
         ] {
             if val > 0 {
                 write!(f, "{sep}{name}={val}")?;

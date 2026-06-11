@@ -39,7 +39,7 @@ fn print_if_not_null(
 
 /// Counters to track the outcome of leaf search splits.
 ///
-/// Cancellation counters cover to scenarii: errors in splits and timeouts /
+/// Cancellation counters cover two scenarios: errors in splits and timeouts.
 pub struct SplitSearchOutcomeCounters {
     pub cancel_before_warmup: IntCounter,
     pub cache_hit: IntCounter,
