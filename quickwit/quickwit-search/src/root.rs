@@ -633,6 +633,11 @@ async fn search_partial_hits_phase_with_scroll(
             cached_partial_hits,
             failed_splits: leaf_search_resp.failed_splits.clone(),
             num_successful_splits: leaf_search_resp.num_successful_splits,
+            splits_by_outcome: leaf_search_resp
+                .resource_stats
+                .as_ref()
+                .map(|s| s.splits_by_outcome)
+                .flatten(),
         };
         let scroll_key_and_start_offset: ScrollKeyAndStartOffset =
             ScrollKeyAndStartOffset::new_with_start_offset(
@@ -1040,6 +1045,10 @@ async fn root_search_aux(
             .map(ToString::to_string),
         failed_splits: first_phase_result.failed_splits,
         num_successful_splits: first_phase_result.num_successful_splits,
+        splits_by_outcome: first_phase_result
+            .resource_stats
+            .map(|s| s.splits_by_outcome)
+            .flatten(),
     })
 }
 
