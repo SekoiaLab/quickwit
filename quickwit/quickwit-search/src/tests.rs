@@ -2642,9 +2642,7 @@ async fn test_single_node_splits_by_outcome() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(response.num_hits, 6);
-    let outcomes = response
-        .splits_by_outcome
-        .expect("splits_by_outcome should be present");
+    let outcomes = response.splits_by_outcome.unwrap();
     assert_eq!(outcomes.processed, 3, "all 3 splits should be processed");
     assert_eq!(outcomes.pruned_before_warmup, 0);
     assert_eq!(outcomes.cancel_before_warmup, 0);
@@ -2672,11 +2670,52 @@ async fn test_single_node_splits_by_outcome() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(response.num_hits, 2);
-    let outcomes = response
-        .splits_by_outcome
-        .expect("splits_by_outcome should be present");
+    let outcomes = response.splits_by_outcome.unwrap();
     assert_eq!(outcomes.processed, 1);
     assert_eq!(outcomes.pruned_before_warmup, 2);
+
+    // MatchAll + max_hits=0 + CountAll triggers the metadata-count fast path: the split's
+    // stored num_docs is used directly without opening the tantivy index.
+    let response = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: serde_json::to_string(&QueryAst::MatchAll).unwrap(),
+            max_hits: 0,
+            count_hits: CountHits::CountAll as i32,
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(response.num_hits, 6);
+    let outcomes = response.splits_by_outcome.unwrap();
+    assert_eq!(outcomes.processed_from_metadata, 3);
+    assert_eq!(outcomes.processed, 0);
+    assert_eq!(outcomes.pruned_before_warmup, 0);
+
+    // MatchAll with a time range that fully covers 1 split but only partially
+    // overlaps the 2 others
+    let response = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: serde_json::to_string(&QueryAst::MatchAll).unwrap(),
+            max_hits: 0,
+            count_hits: CountHits::CountAll as i32,
+            start_timestamp: Some(base_ts - 1_999_999),
+            end_timestamp: Some(base_ts + 1),
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    // split 1: 1 doc (base_ts-1_999_999), split 2: 2 docs, split 3: 1 doc (base_ts)
+    assert_eq!(response.num_hits, 4);
+    let outcomes = response.splits_by_outcome.unwrap();
+    assert_eq!(outcomes.processed_from_metadata, 1);
+    assert_eq!(outcomes.processed, 2);
+    assert_eq!(outcomes.pruned_before_warmup, 0);
 
     test_sandbox.assert_quit().await;
     Ok(())

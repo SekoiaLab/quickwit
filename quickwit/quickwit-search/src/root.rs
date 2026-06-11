@@ -714,7 +714,10 @@ pub fn get_count_from_metadata(split_metadatas: &[SplitMetadata]) -> Vec<LeafSea
             num_successful_splits: 1,
             intermediate_aggregation_result: None,
             resource_stats: None,
-            splits_by_outcome: None,
+            splits_by_outcome: Some(quickwit_proto::search::SplitsByOutcome {
+                processed_from_metadata: 1,
+                ..Default::default()
+            }),
         })
         .collect()
 }
