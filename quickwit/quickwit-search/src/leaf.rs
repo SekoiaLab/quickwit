@@ -338,9 +338,12 @@ async fn warm_up_automatons(
                 let inv_idx_clone = inv_idx.clone();
                 warm_up_futures.push(async move {
                     match automaton {
-                        Automaton::Regex(path, regex_str) => {
-                            let regex = tantivy_fst::Regex::new(regex_str)
-                                .context("failed to parse regex during warmup")?;
+                        Automaton::Regex(path, patterns) => {
+                            // Combine all patterns so the term dictionary is
+                            // traversed once instead of once per regex.
+                            let regex = tantivy_fst::Regex::from_patterns(patterns).context(
+                                "failed to build combined regex automaton during warmup",
+                            )?;
                             inv_idx_clone
                                 .warm_postings_automaton(
                                     quickwit_query::query_ast::JsonPathPrefix {
@@ -2158,5 +2161,51 @@ mod tests {
 
         assert!(directory_size_larger > directory_size_smaller + 100);
         assert!(larger_size > smaller_size + 100);
+    }
+
+    #[tokio::test]
+    async fn test_warm_up_automatons_errors_when_combined_regex_unbuildable() {
+        let indexing_options =
+            TextOptions::default().set_indexing_options(TextFieldIndexing::default());
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", indexing_options);
+        let schema = schema_builder.build();
+
+        let ram_directory = RamDirectory::create();
+        let index = Index::open_or_create(ram_directory, schema).unwrap();
+        let mut index_writer = index.writer(15_000_000).unwrap();
+        let mut doc = TantivyDocument::default();
+        doc.add_field_value(text_field, "hello");
+        index_writer.add_document(doc).unwrap();
+        index_writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+
+        // Several valid regexes targeting the same field combine into a single
+        // automaton and warm up successfully.
+        let valid: HashMap<Field, HashSet<Automaton>> = std::iter::once((
+            text_field,
+            HashSet::from([Automaton::Regex(
+                None,
+                vec!["h.*".to_string(), "x.*".to_string()],
+            )]),
+        ))
+        .collect();
+        assert!(warm_up_automatons(&searcher, &valid).await.is_ok());
+
+        // An unbuildable regex (here, invalid syntax) must cause warmup to fail
+        // rather than fall back to warming the patterns individually.
+        let invalid: HashMap<Field, HashSet<Automaton>> = std::iter::once((
+            text_field,
+            HashSet::from([Automaton::Regex(None, vec!["(".to_string()])]),
+        ))
+        .collect();
+        let error = warm_up_automatons(&searcher, &invalid)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("failed to build combined regex automaton during warmup"),
+            "unexpected error: {error}"
+        );
     }
 }
