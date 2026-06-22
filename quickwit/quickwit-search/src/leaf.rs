@@ -332,18 +332,30 @@ async fn warm_up_automatons(
             .map_err(|_| std::io::Error::other("task panicked"))?
     };
     for (field, automatons) in terms_grouped_by_field {
+        let field_name = searcher.schema().get_field_name(*field).to_string();
         for segment_reader in searcher.segment_readers() {
             let inv_idx = segment_reader.inverted_index(*field)?;
             for automaton in automatons {
                 let inv_idx_clone = inv_idx.clone();
+                let field_name = field_name.clone();
                 warm_up_futures.push(async move {
                     match automaton {
                         Automaton::Regex(path, patterns) => {
+                            let path_str = path
+                                .as_deref()
+                                .map(|path| String::from_utf8_lossy(path).into_owned())
+                                .unwrap_or_default();
                             // Combine all patterns so the term dictionary is
                             // traversed once instead of once per regex.
-                            let regex = tantivy_fst::Regex::from_patterns(patterns).context(
-                                "failed to build combined regex automaton during warmup",
-                            )?;
+                            let regex =
+                                tantivy_fst::Regex::from_patterns(patterns).with_context(|| {
+                                    format!(
+                                        "failed to build combined regex automaton during warmup \
+                                         for field `{field_name}` (path: `{path_str}`, {} \
+                                         patterns)",
+                                        patterns.len(),
+                                    )
+                                })?;
                             inv_idx_clone
                                 .warm_postings_automaton(
                                     quickwit_query::query_ast::JsonPathPrefix {
@@ -353,7 +365,13 @@ async fn warm_up_automatons(
                                     cpu_intensive_executor,
                                 )
                                 .await
-                                .context("failed to load automaton")
+                                .with_context(|| {
+                                    format!(
+                                        "failed to load automaton for field `{field_name}` (path: \
+                                         `{path_str}`, {} patterns)",
+                                        patterns.len(),
+                                    )
+                                })
                         }
                         Automaton::TermSet(automaton) => inv_idx_clone
                             .warm_postings_automaton(automaton.clone(), cpu_intensive_executor)

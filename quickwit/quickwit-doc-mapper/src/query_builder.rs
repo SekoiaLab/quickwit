@@ -241,7 +241,11 @@ pub(crate) fn build_query(
             "query targets {} distinct fields with regexes, but at most {} are allowed",
             regex_field_count, *MAX_REGEX_QUERY_FIELDS,
         );
-        warn!("{}", error_msg);
+        warn!(
+            count = regex_field_count,
+            max = *MAX_REGEX_QUERY_FIELDS,
+            "too many regexes on distinct paths"
+        );
         return Err(InvalidQuery::Other(anyhow::anyhow!(error_msg)).into());
     }
 
