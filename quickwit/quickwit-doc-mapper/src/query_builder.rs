@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use quickwit_proto::types::SplitId;
 use quickwit_query::query_ast::{
@@ -34,7 +34,8 @@ use crate::{Automaton, ExactSetAutomaton, QueryParserError, TermRange, WarmupInf
 
 /// Maximum number of distinct fields that can be targeted by regex queries in a
 /// single query. Multiple regexes targeting the same field count as one field.
-const MAX_REGEX_QUERY_FIELDS: usize = 20;
+static MAX_REGEX_QUERY_FIELDS: LazyLock<usize> =
+    LazyLock::new(|| quickwit_common::get_from_env("QW_MAX_REGEX_QUERY_FIELDS", 20, false));
 
 #[derive(Default)]
 struct RangeQueryFields {
@@ -235,10 +236,10 @@ pub(crate) fn build_query(
         .flatten()
         .filter(|automaton| matches!(automaton, Automaton::Regex(_, _)))
         .count();
-    if regex_field_count > MAX_REGEX_QUERY_FIELDS {
+    if regex_field_count > *MAX_REGEX_QUERY_FIELDS {
         let error_msg = format!(
             "query targets {} distinct fields with regexes, but at most {} are allowed",
-            regex_field_count, MAX_REGEX_QUERY_FIELDS,
+            regex_field_count, *MAX_REGEX_QUERY_FIELDS,
         );
         warn!("{}", error_msg);
         return Err(InvalidQuery::Other(anyhow::anyhow!(error_msg)).into());
