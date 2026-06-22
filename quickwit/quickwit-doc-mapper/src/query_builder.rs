@@ -27,10 +27,14 @@ use quickwit_query::{InvalidQuery, find_field_or_hit_dynamic};
 use tantivy::Term;
 use tantivy::query::Query;
 use tantivy::schema::{Field, Schema};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::doc_mapper::FastFieldWarmupInfo;
 use crate::{Automaton, ExactSetAutomaton, QueryParserError, TermRange, WarmupInfo};
+
+/// Maximum number of distinct fields that can be targeted by regex queries in a
+/// single query. Multiple regexes targeting the same field count as one field.
+const MAX_REGEX_QUERY_FIELDS: usize = 20;
 
 #[derive(Default)]
 struct RangeQueryFields {
@@ -225,6 +229,20 @@ pub(crate) fn build_query(
     )?;
 
     coalesce_regexes_by_field(&mut automatons_grouped_by_field);
+
+    let regex_field_count = automatons_grouped_by_field
+        .values()
+        .flatten()
+        .filter(|automaton| matches!(automaton, Automaton::Regex(_, _)))
+        .count();
+    if regex_field_count > MAX_REGEX_QUERY_FIELDS {
+        let error_msg = format!(
+            "query targets {} distinct fields with regexes, but at most {} are allowed",
+            regex_field_count, MAX_REGEX_QUERY_FIELDS,
+        );
+        warn!("{}", error_msg);
+        return Err(InvalidQuery::Other(anyhow::anyhow!(error_msg)).into());
+    }
 
     let warmup_info = WarmupInfo {
         terms_grouped_by_field,
@@ -476,7 +494,8 @@ mod test {
     use quickwit_common::shared_consts::FIELD_PRESENCE_FIELD_NAME;
     use quickwit_query::query_ast::{
         BoolQuery, BuildTantivyAstContext, FullTextMode, FullTextParams, PhrasePrefixQuery,
-        QueryAst, QueryAstVisitor, RegexQuery, UserInputQuery, query_ast_from_user_text,
+        QueryAst, QueryAstVisitor, RegexQuery, UserInputQuery, WildcardQuery,
+        query_ast_from_user_text,
     };
     use quickwit_query::{
         BooleanOperand, MatchAllOrNone, create_default_quickwit_tokenizer_manager,
@@ -1143,5 +1162,122 @@ mod test {
                 Automaton::Regex(None, patterns) if patterns.len() == 1
             ));
         }
+    }
+
+    #[test]
+    fn test_build_query_rejects_too_many_regex_fields() {
+        let schema = make_schema(true);
+
+        // 21 distinct fields targeted by regexes: rejected.
+        let clauses: Vec<(String, &str)> =
+            (0..21).map(|i| (format!("field_{i}"), "abc.*")).collect();
+        let query_ast = regex_bool_query(&clauses);
+        let err = build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("distinct fields with regexes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_query_accepts_exactly_twenty_regex_fields() {
+        let schema = make_schema(true);
+
+        // Exactly 20 distinct fields: accepted.
+        let clauses: Vec<(String, &str)> =
+            (0..20).map(|i| (format!("field_{i}"), "abc.*")).collect();
+        let query_ast = regex_bool_query(&clauses);
+        assert!(build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None).is_ok());
+    }
+
+    #[test]
+    fn test_build_query_accepts_many_regexes_on_same_field() {
+        let schema = make_schema(false);
+
+        // 50 regexes all targeting the same field: accepted, since only one
+        // distinct field is involved.
+        let clauses: Vec<(String, &str)> =
+            (0..50).map(|_| ("title".to_string(), "abc.*")).collect();
+        let query_ast = regex_bool_query(&clauses);
+        assert!(build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None).is_ok());
+    }
+
+    /// Builds a bool query made of wildcards.
+    fn wildcard_bool_query(clauses: &[(String, &str)]) -> QueryAst {
+        let must = clauses
+            .iter()
+            .map(|(field, value)| {
+                QueryAst::Wildcard(WildcardQuery {
+                    field: field.clone(),
+                    value: value.to_string(),
+                    lenient: false,
+                    case_insensitive: false,
+                })
+            })
+            .collect();
+        QueryAst::Bool(BoolQuery {
+            must,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_build_query_rejects_too_many_wilcard_fields() {
+        let schema = make_schema(true);
+
+        // 21 distinct fields targeted by wilcards: rejected.
+        let clauses: Vec<(String, &str)> =
+            (0..21).map(|i| (format!("field_{i}"), "abc*")).collect();
+        let query_ast = wildcard_bool_query(&clauses);
+        let err = build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("distinct fields with regexes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Builds a bool query made of both regexes and wildcards.
+    fn regex_wildcard_bool_query(clauses: &[(String, &str)]) -> QueryAst {
+        let must = clauses
+            .iter()
+            .flat_map(|(field, value)| {
+                let wildcard = QueryAst::Wildcard(WildcardQuery {
+                    field: format!("{}_wild", field),
+                    value: value.to_string(),
+                    lenient: false,
+                    case_insensitive: false,
+                });
+                let regex = QueryAst::Regex(RegexQuery {
+                    field: format!("{}_re", field),
+                    regex: value.to_string(),
+                });
+                vec![wildcard, regex]
+            })
+            .collect();
+        QueryAst::Bool(BoolQuery {
+            must,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_build_query_rejects_too_many_wilcard_or_regex_fields() {
+        let schema = make_schema(true);
+
+        // 21 distinct fields targeted by wilcards: rejected.
+        let clauses: Vec<(String, &str)> =
+            (0..11).map(|i| (format!("field_{i}"), "abc*")).collect();
+        let query_ast = regex_wildcard_bool_query(&clauses);
+        let err = build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("distinct fields with regexes"),
+            "unexpected error: {err}"
+        );
     }
 }
