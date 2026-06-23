@@ -293,6 +293,13 @@ pub async fn run_index_checklist(
         .deserialize_index_metadata()?;
     let index_storage = storage_resolver.resolve(index_metadata.index_uri()).await?;
     checks.push(("index storage", index_storage.check_connectivity().await));
+    for extra_uri in &index_metadata.index_config.extra_index_uris {
+        let extra_storage = storage_resolver.resolve(extra_uri).await?;
+        checks.push((
+            "extra index storage",
+            extra_storage.check_connectivity().await,
+        ));
+    }
 
     if let Some(source_config) = source_config_opt {
         checks.push((

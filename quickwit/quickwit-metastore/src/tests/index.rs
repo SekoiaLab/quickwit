@@ -127,6 +127,7 @@ pub async fn test_metastore_update_retention_policy<
             &index_config.ingest_settings,
             &index_config.search_settings,
             &loop_retention_policy_opt,
+            &index_config.extra_index_uris,
         )
         .unwrap();
         let response_metadata = metastore
@@ -170,6 +171,7 @@ pub async fn test_metastore_update_ingest_settings<
         &ingest_settings,
         &index_config.search_settings,
         &index_config.retention_policy_opt,
+        &index_config.extra_index_uris,
     )
     .unwrap();
 
@@ -225,6 +227,7 @@ pub async fn test_metastore_update_search_settings<
             &index_config.ingest_settings,
             &search_settings,
             &index_config.retention_policy_opt,
+            &index_config.extra_index_uris,
         )
         .unwrap();
         let response_metadata = metastore
@@ -284,6 +287,7 @@ pub async fn test_metastore_update_indexing_settings<
             &index_config.ingest_settings,
             &index_config.search_settings,
             &index_config.retention_policy_opt,
+            &index_config.extra_index_uris,
         )
         .unwrap();
         let resp_metadata = metastore
@@ -354,6 +358,7 @@ pub async fn test_metastore_update_doc_mapping<
             &index_config.ingest_settings,
             &index_config.search_settings,
             &index_config.retention_policy_opt,
+            &index_config.extra_index_uris,
         )
         .unwrap();
         let resp_metadata = metastore

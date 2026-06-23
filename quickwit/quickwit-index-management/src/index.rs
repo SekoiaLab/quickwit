@@ -178,6 +178,9 @@ impl IndexService {
         index_uid: IndexUid,
         index_config: IndexConfig,
     ) -> Result<IndexMetadata, IndexServiceError> {
+        validate_storage_uri(&self.storage_resolver, &index_config)
+            .await
+            .map_err(IndexServiceError::InvalidConfig)?;
         let update_index_request = UpdateIndexRequest::try_from_updates(
             index_uid,
             &index_config.doc_mapping,
@@ -185,6 +188,7 @@ impl IndexService {
             &index_config.ingest_settings,
             &index_config.search_settings,
             &index_config.retention_policy_opt,
+            &index_config.extra_index_uris,
         )?;
         let update_index_response = self.metastore.update_index(update_index_request).await?;
         let index_metadata = update_index_response.deserialize_index_metadata()?;
@@ -258,6 +262,7 @@ impl IndexService {
             self.metastore.clone(),
             splits_metadata_to_delete,
             None,
+            &self.storage_resolver,
         )
         .await?;
         let delete_index_request = DeleteIndexRequest {
@@ -399,6 +404,7 @@ impl IndexService {
             dry_run,
             None,
             None,
+            &self.storage_resolver,
         )
         .await?;
 
@@ -449,6 +455,7 @@ impl IndexService {
             self.metastore.clone(),
             splits_metadata,
             None,
+            &self.storage_resolver,
         )
         .await
         {
@@ -582,6 +589,9 @@ pub async fn validate_storage_uri(
     index_config: &IndexConfig,
 ) -> anyhow::Result<()> {
     storage_resolver.resolve(&index_config.index_uri).await?;
+    for extra_uri in &index_config.extra_index_uris {
+        storage_resolver.resolve(extra_uri).await?;
+    }
     Ok(())
 }
 

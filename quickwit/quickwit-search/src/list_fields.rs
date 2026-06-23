@@ -34,7 +34,7 @@ use quickwit_proto::types::{IndexId, IndexUid};
 use quickwit_storage::Storage;
 
 use crate::leaf::open_split_bundle;
-use crate::search_job_placer::group_jobs_by_index_id;
+use crate::search_job_placer::group_jobs_by_index_and_storage;
 use crate::service::SearcherContext;
 use crate::{
     ClusterClient, SearchError, SearchJob, list_relevant_splits, resolve_index_patterns,
@@ -432,7 +432,21 @@ pub async fn root_list_fields(
     .await?;
 
     // Build requests for each index id
-    let jobs: Vec<SearchJob> = split_metadatas.iter().map(SearchJob::from).collect();
+    let jobs: Vec<SearchJob> = split_metadatas
+        .iter()
+        .map(|split_metadata| {
+            let index_uri = &index_uid_to_index_meta
+                .get(&split_metadata.index_uid)
+                .ok_or_else(|| {
+                    SearchError::Internal(format!(
+                        "index {} not found in metadata map",
+                        split_metadata.index_uid
+                    ))
+                })?
+                .index_uri;
+            Ok(SearchJob::from_split_metadata(split_metadata, index_uri))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
     let assigned_leaf_search_jobs = cluster_client
         .search_job_placer
         .assign_jobs(jobs, &HashSet::default())
@@ -461,7 +475,8 @@ pub async fn root_list_fields(
     Ok(ListFieldsResponse { fields })
 }
 
-/// Builds a list of [`LeafListFieldsRequest`], one per index, from a list of [`SearchJob`].
+/// Builds a list of [`LeafListFieldsRequest`], one per `(index, storage_uri)` group,
+/// from a list of [`SearchJob`].
 pub fn jobs_to_leaf_requests(
     request: &ListFieldsRequest,
     index_uid_to_id: &HashMap<IndexUid, IndexMetasForLeafSearch>,
@@ -469,9 +484,10 @@ pub fn jobs_to_leaf_requests(
 ) -> crate::Result<Vec<LeafListFieldsRequest>> {
     let search_request_for_leaf = request.clone();
     let mut leaf_search_requests = Vec::new();
-    // Group jobs by index uid.
-    group_jobs_by_index_id(jobs, |job_group| {
+    // Group by (index_uid, storage_uri) so splits in different buckets get separate requests.
+    group_jobs_by_index_and_storage(jobs, |job_group| {
         let index_uid = &job_group[0].index_uid;
+        let storage_uri = &job_group[0].storage_uri;
         let index_meta = index_uid_to_id.get(index_uid).ok_or_else(|| {
             SearchError::Internal(format!(
                 "received list fields job for an unknown index {index_uid}. it should never happen"
@@ -480,7 +496,7 @@ pub fn jobs_to_leaf_requests(
 
         let leaf_search_request = LeafListFieldsRequest {
             index_id: index_meta.index_id.to_string(),
-            index_uri: index_meta.index_uri.to_string(),
+            index_uri: storage_uri.to_string(),
             fields: search_request_for_leaf.fields.clone(),
             split_offsets: job_group.into_iter().map(|job| job.offsets).collect(),
         };

@@ -1358,7 +1358,14 @@ async fn check_cluster_configuration(
         .deserialize_indexes_metadata()
         .await?
         .into_iter()
-        .filter(|index_metadata| index_metadata.index_uri().protocol().is_file_storage())
+        .filter(|index_metadata| {
+            index_metadata.index_uri().protocol().is_file_storage()
+                || index_metadata
+                    .index_config
+                    .extra_index_uris
+                    .iter()
+                    .any(|uri| uri.protocol().is_file_storage())
+        })
         .collect::<Vec<_>>();
     if !file_backed_indexes.is_empty() {
         let index_ids = file_backed_indexes

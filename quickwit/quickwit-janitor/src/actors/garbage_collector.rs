@@ -147,6 +147,7 @@ impl GarbageCollector {
                     .with_label_values(["error"])
                     .clone(),
             }),
+            &self.storage_resolver,
         )
         .await;
 
@@ -275,6 +276,11 @@ mod tests {
         let index_uid = IndexUid::for_test("test-index", 0);
         let mut mock_storage = MockStorage::default();
         mock_storage
+            .expect_uri()
+            .return_const(quickwit_common::uri::Uri::for_test(
+                "ram://indexes/test-index",
+            ));
+        mock_storage
             .expect_bulk_delete()
             .times(1)
             .returning(|paths: &[&Path]| {
@@ -368,6 +374,7 @@ mod tests {
             false,
             None,
             None,
+            &StorageResolver::unconfigured(),
         )
         .await;
         assert!(result.is_ok());

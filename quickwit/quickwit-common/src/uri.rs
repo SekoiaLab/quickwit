@@ -25,7 +25,7 @@ use regex::Regex;
 use serde::de::Error;
 use serde::{Deserialize, Serialize, Serializer};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Protocol {
@@ -114,6 +114,18 @@ const PROTOCOL_SEPARATOR: &str = "://";
 pub struct Uri {
     uri: String,
     protocol: Protocol,
+}
+
+impl Ord for Uri {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.uri.cmp(&other.uri)
+    }
+}
+
+impl PartialOrd for Uri {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Uri {

@@ -35,6 +35,8 @@ pub struct UpdateIndexRequest {
     pub retention_policy_json_opt: ::core::option::Option<
         ::prost::alloc::string::String,
     >,
+    #[prost(string, repeated, tag = "7")]
+    pub extra_index_uris: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

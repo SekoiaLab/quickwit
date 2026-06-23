@@ -311,6 +311,9 @@ pub struct IndexConfig {
     pub ingest_settings: IngestSettings,
     pub search_settings: SearchSettings,
     pub retention_policy_opt: Option<RetentionPolicy>,
+    /// Additional storage URIs for multi-bucket split sharding.
+    /// The effective list of all storage URIs is `[index_uri] + extra_index_uris`.
+    pub extra_index_uris: Vec<Uri>,
 }
 
 impl IndexConfig {
@@ -323,6 +326,7 @@ impl IndexConfig {
         let mut hasher = SipHasher::new();
         self.doc_mapping.doc_mapping_uid.hash(&mut hasher);
         self.indexing_settings.hash(&mut hasher);
+        self.extra_index_uris.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -334,6 +338,16 @@ impl IndexConfig {
     /// [`crate::indexing_pipeline_params_fingerprint()`]).
     pub fn equals_fingerprint(&self, other: &Self) -> bool {
         self.indexing_params_fingerprint() == other.indexing_params_fingerprint()
+    }
+
+    /// Returns the full list of storage URIs: the primary `index_uri` followed
+    /// by any additional URIs from `extra_index_uris`.
+    ///
+    /// The primary `index_uri` is always the first element.
+    pub fn all_index_uris(&self) -> Vec<&Uri> {
+        let mut uris = vec![&self.index_uri];
+        uris.extend(self.extra_index_uris.iter());
+        uris
     }
 
     #[cfg(any(test, feature = "testsuite"))]
@@ -420,6 +434,7 @@ impl IndexConfig {
             ingest_settings: IngestSettings::default(),
             search_settings,
             retention_policy_opt: None,
+            extra_index_uris: Vec::new(),
         }
     }
 }
@@ -533,6 +548,7 @@ impl crate::TestableForRegression for IndexConfig {
             ingest_settings,
             search_settings,
             retention_policy_opt,
+            extra_index_uris: Vec::new(),
         }
     }
 
@@ -544,6 +560,7 @@ impl crate::TestableForRegression for IndexConfig {
         assert_eq!(self.ingest_settings, other.ingest_settings);
         assert_eq!(self.search_settings, other.search_settings);
         assert_eq!(self.retention_policy_opt, other.retention_policy_opt);
+        assert_eq!(self.extra_index_uris, other.extra_index_uris);
     }
 }
 
@@ -1180,5 +1197,86 @@ mod tests {
         assert!(mutation_occurred);
         assert_eq!(updated_doc_mapping.doc_mapping_uid, new_doc_mapping_uid);
         assert_eq!(updated_doc_mapping.mode, Mode::Strict);
+    }
+
+    #[test]
+    fn test_extra_index_uris_parsed_from_yaml() {
+        let config_yaml = r#"
+            version: 0.8
+            index_id: test-index
+            index_uri: s3://bucket-a/test-index
+            extra_index_uris:
+              - s3://bucket-b/test-index
+              - s3://bucket-c/test-index
+            doc_mapping: {}
+        "#;
+        let index_config = load_index_config_from_user_config(
+            ConfigFormat::Yaml,
+            config_yaml.as_bytes(),
+            &Uri::for_test("s3://bucket-a"),
+        )
+        .unwrap();
+        assert_eq!(index_config.extra_index_uris.len(), 2);
+        assert_eq!(
+            index_config.extra_index_uris[0].as_str(),
+            "s3://bucket-b/test-index"
+        );
+        assert_eq!(
+            index_config.extra_index_uris[1].as_str(),
+            "s3://bucket-c/test-index"
+        );
+    }
+
+    #[test]
+    fn test_extra_index_uris_defaults_to_empty() {
+        let config_yaml = r#"
+            version: 0.8
+            index_id: test-index
+            index_uri: s3://bucket-a/test-index
+            doc_mapping: {}
+        "#;
+        let index_config = load_index_config_from_user_config(
+            ConfigFormat::Yaml,
+            config_yaml.as_bytes(),
+            &Uri::for_test("s3://bucket-a"),
+        )
+        .unwrap();
+        assert!(index_config.extra_index_uris.is_empty());
+    }
+
+    #[test]
+    fn test_extra_index_uris_rejects_duplicate_of_index_uri() {
+        let config_yaml = r#"
+            version: 0.8
+            index_id: test-index
+            index_uri: s3://bucket-a/test-index
+            extra_index_uris:
+              - s3://bucket-a/test-index
+            doc_mapping: {}
+        "#;
+        let result = load_index_config_from_user_config(
+            ConfigFormat::Yaml,
+            config_yaml.as_bytes(),
+            &Uri::for_test("s3://bucket-a"),
+        );
+        assert!(result.is_err());
+        let error_msg = format!("{:?}", result.unwrap_err());
+        assert!(error_msg.contains("extra_index_uris"));
+    }
+
+    #[test]
+    fn test_all_index_uris() {
+        let mut index_config = IndexConfig::for_test("test-index", "s3://bucket-a/test-index");
+        assert_eq!(index_config.all_index_uris().len(), 1);
+        assert_eq!(
+            index_config.all_index_uris()[0].as_str(),
+            "s3://bucket-a/test-index"
+        );
+
+        index_config.extra_index_uris = vec![Uri::for_test("s3://bucket-b/test-index")];
+        let uris = index_config.all_index_uris();
+        assert_eq!(uris.len(), 2);
+        assert_eq!(uris[0].as_str(), "s3://bucket-a/test-index");
+        assert_eq!(uris[1].as_str(), "s3://bucket-b/test-index");
     }
 }

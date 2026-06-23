@@ -295,7 +295,9 @@ impl DeleteTaskPlanner {
         index_uri: &str,
         ctx: &ActorContext<Self>,
     ) -> anyhow::Result<bool> {
-        let search_job = SearchJob::from(&stale_split.split_metadata);
+        let index_uri_parsed = Uri::from_str(index_uri).context("invalid index URI")?;
+        let search_job =
+            SearchJob::from_split_metadata(&stale_split.split_metadata, &index_uri_parsed);
         let mut search_client = self
             .search_job_placer
             .assign_job(search_job.clone(), &HashSet::new())

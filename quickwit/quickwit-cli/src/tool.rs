@@ -940,11 +940,34 @@ async fn extract_split_cli(args: ExtractSplitArgs) -> anyhow::Result<()> {
         .index_metadata(IndexMetadataRequest::for_index_id(args.index_id))
         .await?
         .deserialize_index_metadata()?;
-    let index_storage = storage_resolver.resolve(index_metadata.index_uri()).await?;
+    // Resolve the storage URI for this specific split.
+    // The split may live in a different bucket than the primary index_uri.
+    let index_uri = index_metadata.index_uri().clone();
+    let split_metadata = {
+        use quickwit_metastore::{
+            ListSplitsQuery, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt,
+        };
+        use quickwit_proto::metastore::ListSplitsRequest;
+        let query = ListSplitsQuery::for_index(index_metadata.index_uid.clone())
+            .with_split_ids(vec![args.split_id.clone()]);
+        let list_splits_request = ListSplitsRequest::try_from_list_splits_query(&query)?;
+        let splits = metastore
+            .list_splits(list_splits_request)
+            .await?
+            .collect_splits_metadata()
+            .await?;
+        splits.into_iter().next()
+    };
+    let effective_uri = match &split_metadata {
+        Some(meta) => meta.effective_storage_uri(&index_uri),
+        None => &index_uri,
+    };
+    let split_storage = storage_resolver.resolve(effective_uri).await?;
+
     let split_file = PathBuf::from(format!("{}.split", args.split_id));
-    let split_data = index_storage.get_all(split_file.as_path()).await?;
+    let split_data = split_storage.get_all(split_file.as_path()).await?;
     let (_hotcache_bytes, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
-        index_storage,
+        split_storage,
         split_file,
         split_data,
     )?;

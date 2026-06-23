@@ -32,7 +32,7 @@ use quickwit_proto::metastore::{
     MetastoreService, MetastoreServiceClient,
 };
 use quickwit_proto::types::{IndexUid, SplitId};
-use quickwit_storage::{BulkDeleteError, Storage};
+use quickwit_storage::{BulkDeleteError, Storage, StorageResolver};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tracing::{error, instrument};
@@ -66,7 +66,7 @@ impl RecordGcMetrics for Option<GcMetrics> {
 #[error("failed to delete splits from storage and/or metastore")]
 pub struct DeleteSplitsError {
     successes: Vec<SplitInfo>,
-    storage_error: Option<BulkDeleteError>,
+    storage_errors: Vec<BulkDeleteError>,
     storage_failures: Vec<SplitInfo>,
     metastore_error: Option<MetastoreError>,
     metastore_failures: Vec<SplitInfo>,
@@ -103,6 +103,7 @@ pub struct SplitRemovalInfo {
 ///   safely deleted.
 /// * `dry_run` - Should this only return a list of affected files without performing deletion.
 /// * `progress` - For reporting progress (useful when called from within a quickwit actor).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_garbage_collect(
     indexes: HashMap<IndexUid, Arc<dyn Storage>>,
     metastore: MetastoreServiceClient,
@@ -111,6 +112,7 @@ pub async fn run_garbage_collect(
     dry_run: bool,
     progress_opt: Option<&Progress>,
     metrics: Option<GcMetrics>,
+    storage_resolver: &StorageResolver,
 ) -> anyhow::Result<SplitRemovalInfo> {
     let grace_period_timestamp =
         OffsetDateTime::now_utc().unix_timestamp() - staged_grace_period.as_secs() as i64;
@@ -187,6 +189,7 @@ pub async fn run_garbage_collect(
         indexes,
         progress_opt,
         metrics,
+        storage_resolver,
     )
     .await)
 }
@@ -198,6 +201,7 @@ async fn delete_splits(
     progress_opt: Option<&Progress>,
     metrics: &Option<GcMetrics>,
     split_removal_info: &mut SplitRemovalInfo,
+    storage_resolver: &StorageResolver,
 ) -> Result<(), ()> {
     let mut delete_split_from_index_res_stream =
         futures::stream::iter(splits_metadata_to_delete_per_index)
@@ -212,6 +216,7 @@ async fn delete_splits(
                             metastore,
                             splits_metadata_to_delete,
                             progress_opt,
+                            storage_resolver,
                         )
                         .await
                     } else {
@@ -310,13 +315,14 @@ fn get_index_gc_concurrency() -> Option<usize> {
 ///
 /// The aim of this is to spread the load out across a longer period
 /// rather than short, heavy bursts on the metastore and storage system itself.
-#[instrument(skip(storages, metastore, progress_opt, metrics), fields(num_indexes=%storages.len()))]
+#[instrument(skip(storages, metastore, progress_opt, metrics, storage_resolver), fields(num_indexes=%storages.len()))]
 async fn delete_splits_marked_for_deletion_several_indexes(
     updated_before_timestamp: i64,
     metastore: MetastoreServiceClient,
     storages: HashMap<IndexUid, Arc<dyn Storage>>,
     progress_opt: Option<&Progress>,
     metrics: Option<GcMetrics>,
+    storage_resolver: &StorageResolver,
 ) -> SplitRemovalInfo {
     let mut split_removal_info = SplitRemovalInfo::default();
 
@@ -393,6 +399,7 @@ async fn delete_splits_marked_for_deletion_several_indexes(
             progress_opt,
             &metrics,
             &mut split_removal_info,
+            storage_resolver,
         )
         .await;
 
@@ -422,53 +429,97 @@ pub async fn delete_splits_from_storage_and_metastore(
     metastore: MetastoreServiceClient,
     splits: Vec<SplitMetadata>,
     progress_opt: Option<&Progress>,
+    storage_resolver: &StorageResolver,
 ) -> Result<Vec<SplitInfo>, DeleteSplitsError> {
-    let mut split_infos: HashMap<PathBuf, SplitInfo> = HashMap::with_capacity(splits.len());
+    let index_uri = storage.uri().clone();
 
+    // Group splits by their effective storage URI so we can bulk-delete per bucket.
+    let mut splits_by_uri: HashMap<quickwit_common::uri::Uri, Vec<SplitMetadata>> = HashMap::new();
     for split in splits {
-        let split_info = split.as_split_info();
-        split_infos.insert(split_info.file_name.clone(), split_info);
+        let effective_uri = split.effective_storage_uri(&index_uri).clone();
+        splits_by_uri.entry(effective_uri).or_default().push(split);
     }
-    let split_paths = split_infos
-        .keys()
-        .map(|split_path_buf| split_path_buf.as_path())
-        .collect::<Vec<&Path>>();
-    let delete_result = protect_future(progress_opt, storage.bulk_delete(&split_paths)).await;
 
-    if let Some(progress) = progress_opt {
-        progress.record_progress();
-    }
-    let mut successes = Vec::with_capacity(split_infos.len());
-    let mut storage_error: Option<BulkDeleteError> = None;
-    let mut storage_failures = Vec::new();
+    let total_split_count: usize = splits_by_uri.values().map(|v| v.len()).sum();
+    let mut all_successes: Vec<SplitInfo> = Vec::with_capacity(total_split_count);
+    let mut all_storage_failures: Vec<SplitInfo> = Vec::new();
+    let mut combined_storage_errors: Vec<BulkDeleteError> = Vec::new();
 
-    match delete_result {
-        Ok(_) => successes.extend(split_infos.into_values()),
-        Err(bulk_delete_error) => {
-            let success_split_paths: HashSet<&PathBuf> =
-                bulk_delete_error.successes.iter().collect();
-            for (split_path, split_info) in split_infos {
-                if success_split_paths.contains(&split_path) {
-                    successes.push(split_info);
-                } else {
-                    storage_failures.push(split_info);
+    for (uri, group_splits) in splits_by_uri {
+        // Resolve the storage for this group of splits.
+        let group_storage = if uri == index_uri {
+            storage.clone()
+        } else {
+            match storage_resolver.resolve(&uri).await {
+                Ok(resolved) => resolved,
+                Err(resolve_err) => {
+                    error!(
+                        storage_uri=%uri,
+                        index_id=%index_uid.index_id,
+                        error=?resolve_err,
+                        "failed to resolve storage URI for split group, marking splits as failed"
+                    );
+                    let failed: Vec<SplitInfo> = group_splits
+                        .into_iter()
+                        .map(|s| s.as_split_info())
+                        .collect();
+                    all_storage_failures.extend(failed);
+                    continue;
                 }
             }
-            let failed_split_paths = storage_failures
-                .iter()
-                .map(|split_info| split_info.file_name.as_path())
-                .collect::<Vec<_>>();
-            error!(
-                error=?bulk_delete_error.error,
-                index_id=index_uid.index_id,
-                "failed to delete split file(s) {:?} from storage",
-                PrettySample::new(&failed_split_paths, 5),
-            );
-            storage_error = Some(bulk_delete_error);
+        };
+
+        let mut split_infos: HashMap<PathBuf, SplitInfo> =
+            HashMap::with_capacity(group_splits.len());
+        for split in group_splits {
+            let split_info = split.as_split_info();
+            split_infos.insert(split_info.file_name.clone(), split_info);
         }
-    };
-    if !successes.is_empty() {
-        let split_ids: Vec<SplitId> = successes
+        let split_paths: Vec<&Path> = split_infos
+            .keys()
+            .map(|split_path_buf| split_path_buf.as_path())
+            .collect();
+
+        let delete_result =
+            protect_future(progress_opt, group_storage.bulk_delete(&split_paths)).await;
+
+        if let Some(progress) = progress_opt {
+            progress.record_progress();
+        }
+
+        match delete_result {
+            Ok(_) => all_successes.extend(split_infos.into_values()),
+            Err(bulk_delete_error) => {
+                let success_split_paths: HashSet<&PathBuf> =
+                    bulk_delete_error.successes.iter().collect();
+                let mut current_uri_failures: Vec<SplitInfo> = Vec::new();
+                for (split_path, split_info) in split_infos {
+                    if success_split_paths.contains(&split_path) {
+                        all_successes.push(split_info);
+                    } else {
+                        current_uri_failures.push(split_info);
+                    }
+                }
+                let failed_split_paths = current_uri_failures
+                    .iter()
+                    .map(|split_info| split_info.file_name.as_path())
+                    .collect::<Vec<_>>();
+                error!(
+                    error=?bulk_delete_error.error,
+                    index_id=index_uid.index_id,
+                    storage_uri=%uri,
+                    "failed to delete split file(s) {:?} from storage",
+                    PrettySample::new(&failed_split_paths, 5),
+                );
+                all_storage_failures.extend(current_uri_failures);
+                combined_storage_errors.push(bulk_delete_error);
+            }
+        }
+    }
+
+    // Delete successful splits from the metastore.
+    if !all_successes.is_empty() {
+        let split_ids: Vec<SplitId> = all_successes
             .iter()
             .map(|split_info| split_info.split_id.to_string())
             .collect();
@@ -488,25 +539,25 @@ pub async fn delete_splits_from_storage_and_metastore(
             );
             let delete_splits_error = DeleteSplitsError {
                 successes: Vec::new(),
-                storage_error,
-                storage_failures,
+                storage_errors: combined_storage_errors,
+                storage_failures: all_storage_failures,
                 metastore_error: Some(metastore_error),
-                metastore_failures: successes,
+                metastore_failures: all_successes,
             };
             return Err(delete_splits_error);
         }
     }
-    if !storage_failures.is_empty() {
+    if !all_storage_failures.is_empty() {
         let delete_splits_error = DeleteSplitsError {
-            successes,
-            storage_error,
-            storage_failures,
+            successes: all_successes,
+            storage_errors: combined_storage_errors,
+            storage_failures: all_storage_failures,
             metastore_error: None,
             metastore_failures: Vec::new(),
         };
         return Err(delete_splits_error);
     }
-    Ok(successes)
+    Ok(all_successes)
 }
 
 #[cfg(test)]
@@ -589,6 +640,7 @@ mod tests {
             false,
             None,
             None,
+            &StorageResolver::unconfigured(),
         )
         .await
         .unwrap();
@@ -617,6 +669,7 @@ mod tests {
             false,
             None,
             None,
+            &StorageResolver::unconfigured(),
         )
         .await
         .unwrap();
@@ -695,6 +748,7 @@ mod tests {
             false,
             None,
             None,
+            &StorageResolver::unconfigured(),
         )
         .await
         .unwrap();
@@ -723,6 +777,7 @@ mod tests {
             false,
             None,
             None,
+            &StorageResolver::unconfigured(),
         )
         .await
         .unwrap();
@@ -762,6 +817,7 @@ mod tests {
             false,
             None,
             None,
+            &StorageResolver::unconfigured(),
         )
         .await
         .unwrap();
@@ -822,6 +878,7 @@ mod tests {
             metastore.clone(),
             vec![split_metadata],
             None,
+            &StorageResolver::unconfigured(),
         )
         .await
         .unwrap();
@@ -848,6 +905,11 @@ mod tests {
     #[tokio::test]
     async fn test_delete_splits_from_storage_and_metastore_storage_error() {
         let mut mock_storage = MockStorage::new();
+        mock_storage
+            .expect_uri()
+            .return_const(quickwit_common::uri::Uri::for_test(
+                "ram:///indexes/test-delete-splits-storage-error--index",
+            ));
         mock_storage
             .expect_bulk_delete()
             .return_once(|split_paths| {
@@ -922,6 +984,7 @@ mod tests {
             metastore.clone(),
             vec![split_metadata_0, split_metadata_1],
             None,
+            &StorageResolver::unconfigured(),
         )
         .await
         .unwrap_err();
@@ -944,6 +1007,11 @@ mod tests {
     #[tokio::test]
     async fn test_delete_splits_from_storage_and_metastore_metastore_error() {
         let mut mock_storage = MockStorage::new();
+        mock_storage
+            .expect_uri()
+            .return_const(quickwit_common::uri::Uri::for_test(
+                "ram:///indexes/test-delete-splits-storage-error--index",
+            ));
         mock_storage
             .expect_bulk_delete()
             .return_once(|split_paths| {
@@ -995,6 +1063,7 @@ mod tests {
             MetastoreServiceClient::from_mock(mock_metastore),
             vec![split_metadata_0, split_metadata_1],
             None,
+            &StorageResolver::unconfigured(),
         )
         .await
         .unwrap_err();

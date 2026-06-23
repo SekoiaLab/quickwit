@@ -269,34 +269,40 @@ impl PartialEq for CandidateNode {
 
 impl Eq for CandidateNode {}
 
-/// Groups jobs by index id and returns a list of `SearchJob` per index
-pub fn group_jobs_by_index_id(
+/// Groups jobs by `(index_uid, storage_uri)`.
+pub fn group_jobs_by_index_and_storage(
     jobs: Vec<SearchJob>,
     cb: impl FnMut(Vec<SearchJob>) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    // Group jobs by index uid.
-    group_by(jobs, |job| &job.index_uid, cb)?;
-    Ok(())
+    group_by(
+        jobs,
+        |a, b| {
+            a.index_uid
+                .cmp(&b.index_uid)
+                .then_with(|| a.storage_uri.cmp(&b.storage_uri))
+        },
+        cb,
+    )
 }
 
 /// Note: The data will be sorted.
 ///
-/// Returns slices of the input data grouped by passed closure.
-pub fn group_by<T, K: Ord, F>(
+/// Returns slices of the input data grouped by the comparator closure.
+pub fn group_by<T, F>(
     mut data: Vec<T>,
-    compare_by: impl Fn(&T) -> &K,
+    cmp: impl Fn(&T, &T) -> Ordering,
     mut callback: F,
 ) -> crate::Result<()>
 where
     F: FnMut(Vec<T>) -> crate::Result<()>,
 {
-    data.sort_by(|job1, job2| compare_by(job2).cmp(compare_by(job1)));
+    data.sort_by(|a, b| cmp(b, a));
     while !data.is_empty() {
         let last_element = data.last().unwrap();
         let count = data
             .iter()
             .rev()
-            .take_while(|&x| compare_by(x) == compare_by(last_element))
+            .take_while(|&x| cmp(x, last_element) == Ordering::Equal)
             .count();
 
         let group = data.split_off(data.len() - count);
@@ -317,7 +323,7 @@ mod tests {
         let mut outputs: Vec<Vec<i32>> = Vec::new();
         group_by(
             data,
-            |el| el,
+            |a, b| a.cmp(b),
             |group| {
                 outputs.push(group);
                 Ok(())
@@ -337,7 +343,7 @@ mod tests {
         let mut outputs: Vec<Vec<i32>> = Vec::new();
         group_by(
             data,
-            |el| el,
+            |a, b| a.cmp(b),
             |group| {
                 outputs.push(group);
                 Ok(())
@@ -353,7 +359,7 @@ mod tests {
         let mut outputs: Vec<Vec<i32>> = Vec::new();
         group_by(
             data,
-            |el| el,
+            |a: &i32, b| a.cmp(b),
             |group| {
                 outputs.push(group);
                 Ok(())

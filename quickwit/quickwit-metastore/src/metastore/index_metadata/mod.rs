@@ -106,6 +106,7 @@ impl IndexMetadata {
         ingest_settings: IngestSettings,
         search_settings: SearchSettings,
         retention_policy_opt: Option<RetentionPolicy>,
+        extra_index_uris: Vec<Uri>,
     ) -> MetastoreResult<bool> {
         let (updated_doc_mapping, mut mutation_occurred) = prepare_doc_mapping_update(
             doc_mapping,
@@ -130,6 +131,10 @@ impl IndexMetadata {
         }
         if retention_policy_opt != self.index_config.retention_policy_opt {
             self.index_config.retention_policy_opt = retention_policy_opt;
+            mutation_occurred = true;
+        }
+        if extra_index_uris != self.index_config.extra_index_uris {
+            self.index_config.extra_index_uris = extra_index_uris;
             mutation_occurred = true;
         }
         Ok(mutation_occurred)
@@ -257,6 +262,7 @@ mod tests {
                 current_index_config.ingest_settings.clone(),
                 current_index_config.search_settings.clone(),
                 current_index_config.retention_policy_opt.clone(),
+                Vec::new(),
             )
             .unwrap();
         assert!(!mutation_occurred);
@@ -271,6 +277,7 @@ mod tests {
                 current_index_config.ingest_settings.clone(),
                 new_search_settings,
                 current_index_config.retention_policy_opt.clone(),
+                Vec::new(),
             )
             .unwrap();
         assert!(mutation_occurred);
@@ -299,6 +306,7 @@ mod tests {
                 current_index_config.ingest_settings.clone(),
                 current_index_config.search_settings.clone(),
                 current_index_config.retention_policy_opt.clone(),
+                Vec::new(),
             )
             .unwrap_err();
 
@@ -314,6 +322,7 @@ mod tests {
                 current_index_config.ingest_settings,
                 current_index_config.search_settings,
                 current_index_config.retention_policy_opt,
+                Vec::new(),
             )
             .unwrap();
         assert!(mutation_occurred);
@@ -327,6 +336,77 @@ mod tests {
         assert_eq!(
             current_index_metadata.index_config().doc_mapping.mode,
             Mode::Strict
+        );
+    }
+
+    #[test]
+    fn test_update_extra_index_uris() {
+        let current_index_config = IndexConfig::for_test("test-index", "s3://test-index");
+        let mut current_index_metadata = IndexMetadata::new(current_index_config.clone());
+
+        // No mutation when extra_index_uris stays empty.
+        let mutation_occurred = current_index_metadata
+            .update_index_config(
+                current_index_config.doc_mapping.clone(),
+                current_index_config.indexing_settings.clone(),
+                current_index_config.ingest_settings.clone(),
+                current_index_config.search_settings.clone(),
+                current_index_config.retention_policy_opt.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(!mutation_occurred);
+
+        // Adding extra URIs triggers a mutation.
+        let extra_uris = vec![Uri::for_test("s3://bucket-b/test-index")];
+        let mutation_occurred = current_index_metadata
+            .update_index_config(
+                current_index_config.doc_mapping.clone(),
+                current_index_config.indexing_settings.clone(),
+                current_index_config.ingest_settings.clone(),
+                current_index_config.search_settings.clone(),
+                current_index_config.retention_policy_opt.clone(),
+                extra_uris.clone(),
+            )
+            .unwrap();
+        assert!(mutation_occurred);
+        assert_eq!(
+            current_index_metadata.index_config().extra_index_uris,
+            extra_uris
+        );
+
+        // Same value again does not trigger a mutation.
+        let mutation_occurred = current_index_metadata
+            .update_index_config(
+                current_index_config.doc_mapping.clone(),
+                current_index_config.indexing_settings.clone(),
+                current_index_config.ingest_settings.clone(),
+                current_index_config.search_settings.clone(),
+                current_index_config.retention_policy_opt.clone(),
+                extra_uris.clone(),
+            )
+            .unwrap();
+        assert!(!mutation_occurred);
+
+        // Adding a second URI triggers a mutation.
+        let extra_uris_expanded = vec![
+            Uri::for_test("s3://bucket-b/test-index"),
+            Uri::for_test("s3://bucket-c/test-index"),
+        ];
+        let mutation_occurred = current_index_metadata
+            .update_index_config(
+                current_index_config.doc_mapping.clone(),
+                current_index_config.indexing_settings.clone(),
+                current_index_config.ingest_settings.clone(),
+                current_index_config.search_settings.clone(),
+                current_index_config.retention_policy_opt.clone(),
+                extra_uris_expanded.clone(),
+            )
+            .unwrap();
+        assert!(mutation_occurred);
+        assert_eq!(
+            current_index_metadata.index_config().extra_index_uris,
+            extra_uris_expanded
         );
     }
 }

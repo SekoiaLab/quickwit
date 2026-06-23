@@ -20,7 +20,7 @@ Storage URIs refer to different storage providers identified by a URI "protocol"
 - `gs://` for Google Cloud Storage
 
 In general, you can use a storage URI or a file path anywhere you would intuitively expect a file path. For instance:
-- when setting the `index_uri` of an index to specify the storage provider and location;
+- when setting the `index_uri` or `extra_index_uris` of an index to specify the storage provider(s) and location(s);
 - when setting the `metastore_uri` in a node config to set up a file-backed metastore;
 - when passing a file path as a command line argument.
 
