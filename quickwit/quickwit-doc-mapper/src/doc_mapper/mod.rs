@@ -39,6 +39,7 @@ pub(crate) use field_mapping_entry::{
 #[cfg(test)]
 pub(crate) use field_mapping_entry::{QuickwitNumericOptions, QuickwitTextOptions};
 pub use field_mapping_type::FieldMappingType;
+use quickwit_query::JsonPath;
 use serde_json::Value as JsonValue;
 use tantivy::Term;
 use tantivy::schema::{Field, FieldType};
@@ -82,7 +83,7 @@ pub enum Automaton {
     /// targeting the same field and json path. They are warmed up as a single combined automaton
     /// matching the union of the patterns. The optional path is the json path prefix when the
     /// field is a json field.
-    Regex(Option<Vec<u8>>, Vec<String>),
+    Regex(Option<JsonPath>, Vec<String>),
     /// An exact-match automaton for a TermSet query.
     TermSet(ExactSetAutomaton),
 }

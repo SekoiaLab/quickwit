@@ -17,13 +17,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use tantivy::Term;
 use tantivy::schema::{Field, FieldType, Schema as TantivySchema};
 
 use super::{BuildTantivyAst, QueryAst};
 use crate::query_ast::{AutomatonQuery, BuildTantivyAstContext, JsonPathPrefix, TantivyQueryAst};
 use crate::tokenizers::TokenizerManager;
-use crate::{InvalidQuery, find_field_or_hit_dynamic};
+use crate::{InvalidQuery, JsonPath, find_field_or_hit_dynamic};
 
 /// A Wildcard query allows to match 'bond' with a query like 'b*d'.
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
@@ -112,7 +111,7 @@ impl WildcardQuery {
         &self,
         schema: &TantivySchema,
         tokenizer_manager: &TokenizerManager,
-    ) -> Result<(Field, Option<Vec<u8>>, String), InvalidQuery> {
+    ) -> Result<(Field, Option<JsonPath>, String), InvalidQuery> {
         let Some((field, field_entry, json_path)) = find_field_or_hit_dynamic(&self.field, schema)
         else {
             return Err(InvalidQuery::FieldDoesNotExist {
@@ -161,17 +160,8 @@ impl WildcardQuery {
                         regex
                     };
 
-                let mut term_for_path = Term::from_field_json_path(
-                    field,
-                    json_path,
-                    json_options.is_expand_dots_enabled(),
-                );
-                term_for_path.append_type_and_str("");
-
-                let value = term_for_path.value();
-                // We skip the 1st byte which is a marker to tell this is json. This isn't present
-                // in the dictionary
-                let byte_path_prefix = value.as_serialized()[1..].to_owned();
+                let byte_path_prefix =
+                    JsonPath::from_json_path(json_path, json_options.is_expand_dots_enabled());
 
                 Ok((field, Some(byte_path_prefix), regex))
             }
@@ -328,7 +318,7 @@ mod tests {
 
             let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
             assert_eq!(regex, "MyString Wh1ch.a\\.nOrMal Tokenizer would.*cut");
-            assert_eq!(path.unwrap(), "Inner\u{1}Fie*ld\0s".as_bytes());
+            assert_eq!(path.unwrap().0, "Inner\u{1}Fie*ld\0s".as_bytes());
         }
 
         for tokenizer in [
@@ -347,7 +337,7 @@ mod tests {
 
             let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
             assert_eq!(regex, "mystring wh1ch.a\\.normal tokenizer would.*cut");
-            assert_eq!(path.unwrap(), "Inner\u{1}Fie*ld\0s".as_bytes());
+            assert_eq!(path.unwrap().0, "Inner\u{1}Fie*ld\0s".as_bytes());
         }
     }
 

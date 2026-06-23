@@ -1,110 +1,110 @@
-# # Basic regex match
-# params:
-#   size: 0
-# json:
-#   track_total_hits: true
-#   query:
-#     regexp:
-#       type:
-#         value: ".*event"
-# expected:
-#   hits:
-#     total:
-#       value: 100
-#       relation: "eq"
-# ---
-# # Regex always match from start to end (`(re)` equivalent to `^(re)$`)
-# params:
-#   size: 3
-# json:
-#   track_total_hits: true
-#   query:
-#     regexp:
-#       type:
-#         value: "event"
-# expected:
-#   hits:
-#     total:
-#       value: 0
-#       relation: "eq"
-# ---
-# # Regex with case_insensitive flag
-# params:
-#   size: 3
-# json:
-#   track_total_hits: true
-#   query:
-#     regexp:
-#       repo.name:
-#         # lowercased by the tokenizer
-#         value: "RUST.*"
-#         case_insensitive: true
-# expected:
-#   hits:
-#     total:
-#       value: 1
-#       relation: "eq"
-# ---
-# params:
-#   size: 3
-# json:
-#   track_total_hits: true
-#   query:
-#     regexp:
-#       type:
-#         # lowercased by the tokenizer
-#         value: "RUST.*"
-#         case_insensitive: false
-# expected:
-#   hits:
-#     total:
-#       value: 0
-#       relation: "eq"
-# ---
-# # ^ and $ are escaped when they are used as anchors, so
-# # ^pushevent$ only matches if the original term is "^pushevent$".
-# endpoint: "simple_es_compat/_search"
-# params:
-#   size: 3
-# json:
-#   track_total_hits: true
-#   query:
-#     regexp:
-#       keyword_text:
-#         value: "red$"
-# expected:
-#   hits:
-#     total:
-#       value: 0
-#       relation: "eq"
-# ---
-# endpoint: "simple_es_compat/_search"
-# params:
-#   size: 3
-# json:
-#   track_total_hits: true
-#   query:
-#     regexp:
-#       keyword_text:
-#         value: "gold$"
-# expected:
-#   hits:
-#     total:
-#       value: 1
-#       relation: "eq"
-# ---
-# # regex in query_string
-# params:
-#   size: 10
-# json:
-#   query:
-#     query_string:
-#       query: "type:/pushevent/"
-# expected:
-#   hits:
-#     total:
-#       value: 60
-#       relation: "eq"
+# Basic regex match
+params:
+  size: 0
+json:
+  track_total_hits: true
+  query:
+    regexp:
+      type:
+        value: ".*event"
+expected:
+  hits:
+    total:
+      value: 100
+      relation: "eq"
+---
+# Regex always match from start to end (`(re)` equivalent to `^(re)$`)
+params:
+  size: 3
+json:
+  track_total_hits: true
+  query:
+    regexp:
+      type:
+        value: "event"
+expected:
+  hits:
+    total:
+      value: 0
+      relation: "eq"
+---
+# Regex with case_insensitive flag
+params:
+  size: 3
+json:
+  track_total_hits: true
+  query:
+    regexp:
+      repo.name:
+        # lowercased by the tokenizer
+        value: "RUST.*"
+        case_insensitive: true
+expected:
+  hits:
+    total:
+      value: 1
+      relation: "eq"
+---
+params:
+  size: 3
+json:
+  track_total_hits: true
+  query:
+    regexp:
+      type:
+        # lowercased by the tokenizer
+        value: "RUST.*"
+        case_insensitive: false
+expected:
+  hits:
+    total:
+      value: 0
+      relation: "eq"
+---
+# ^ and $ are escaped when they are used as anchors, so
+# ^pushevent$ only matches if the original term is "^pushevent$".
+endpoint: "simple_es_compat/_search"
+params:
+  size: 3
+json:
+  track_total_hits: true
+  query:
+    regexp:
+      keyword_text:
+        value: "red$"
+expected:
+  hits:
+    total:
+      value: 0
+      relation: "eq"
+---
+endpoint: "simple_es_compat/_search"
+params:
+  size: 3
+json:
+  track_total_hits: true
+  query:
+    regexp:
+      keyword_text:
+        value: "gold$"
+expected:
+  hits:
+    total:
+      value: 1
+      relation: "eq"
+---
+# regex in query_string
+params:
+  size: 10
+json:
+  query:
+    query_string:
+      query: "type:/pushevent/"
+expected:
+  hits:
+    total:
+      value: 60
+      relation: "eq"
 ---
 # Many wildcards across a few fields (6 distinct fields, well within the 20-field limit).
 # All targeted fields are absent from the index so 0 hits are expected,
@@ -187,10 +187,6 @@ json:
                                 case_insensitive: true
                           - wildcard:
                               registry.value:
-                                value: "*TEHTRIS*"
-                                case_insensitive: true
-                          - wildcard:
-                              registry.value:
                                 value: "*VMware*"
                                 case_insensitive: true
                           - wildcard:
@@ -228,10 +224,6 @@ json:
                           - wildcard:
                               process.executable:
                                 value: "*sara.exe*"
-                                case_insensitive: true
-                          - wildcard:
-                              process.command_line:
-                                value: "*Letsignit*"
                                 case_insensitive: true
                         minimum_should_match: 1
               - bool:

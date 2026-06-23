@@ -17,12 +17,11 @@ use std::sync::Arc;
 use anyhow::Context;
 pub use prefix::{AutomatonQuery, JsonPathPrefix};
 use serde::{Deserialize, Serialize};
-use tantivy::Term;
 use tantivy::schema::{Field, FieldType, Schema as TantivySchema};
 
 use super::{BuildTantivyAst, BuildTantivyAstContext, QueryAst};
 use crate::query_ast::TantivyQueryAst;
-use crate::{InvalidQuery, find_field_or_hit_dynamic};
+use crate::{InvalidQuery, JsonPath, find_field_or_hit_dynamic};
 
 /// A Regex query
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
@@ -51,7 +50,7 @@ impl RegexQuery {
     pub fn to_field_and_regex(
         &self,
         schema: &TantivySchema,
-    ) -> Result<(Field, Option<Vec<u8>>, String), InvalidQuery> {
+    ) -> Result<(Field, Option<JsonPath>, String), InvalidQuery> {
         let Some((field, field_entry, json_path)) = find_field_or_hit_dynamic(&self.field, schema)
         else {
             return Err(InvalidQuery::FieldDoesNotExist {
@@ -79,17 +78,8 @@ impl RegexQuery {
                     ))
                 })?;
 
-                let mut term_for_path = Term::from_field_json_path(
-                    field,
-                    json_path,
-                    json_options.is_expand_dots_enabled(),
-                );
-                term_for_path.append_type_and_str("");
-
-                let value = term_for_path.value();
-                // We skip the 1st byte which is a marker to tell this is json. This isn't present
-                // in the dictionary
-                let byte_path_prefix = value.as_serialized()[1..].to_owned();
+                let byte_path_prefix =
+                    JsonPath::from_json_path(json_path, json_options.is_expand_dots_enabled());
                 Ok((field, Some(byte_path_prefix), self.regex.clone()))
             }
             _ => Err(InvalidQuery::SchemaError(
@@ -125,8 +115,10 @@ mod prefix {
     use tantivy::schema::Field;
     use tantivy_fst::Automaton;
 
+    use crate::JsonPath;
+
     pub struct JsonPathPrefix<A> {
-        pub prefix: Vec<u8>,
+        pub prefix: JsonPath,
         pub automaton: Arc<A>,
     }
 
@@ -246,6 +238,7 @@ mod prefix {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
     use std::sync::Arc;
 
     use tantivy::schema::{Schema as TantivySchema, TEXT};
@@ -253,6 +246,7 @@ mod tests {
 
     use super::prefix::JsonPathPrefixState;
     use super::{JsonPathPrefix, RegexQuery};
+    use crate::JsonPath;
 
     #[test]
     fn test_regex_query_text_field() {
@@ -282,7 +276,7 @@ mod tests {
         };
         let (field, path, regex) = query.to_field_and_regex(&schema).unwrap();
         assert_eq!(field, schema.get_field("field").unwrap());
-        assert_eq!(path.unwrap(), b"sub\x01field\0s");
+        assert_eq!(path.unwrap().deref(), b"sub\x01field\0s");
         assert_eq!(regex, query.regex);
 
         // i believe this is how concatenated field behave
@@ -292,7 +286,7 @@ mod tests {
         };
         let (field, path, regex) = query_empty_path.to_field_and_regex(&schema).unwrap();
         assert_eq!(field, schema.get_field("field").unwrap());
-        assert_eq!(path.unwrap(), b"\0s");
+        assert_eq!(path.unwrap().deref(), b"\0s");
         assert_eq!(regex, query_empty_path.regex);
     }
 
@@ -300,7 +294,7 @@ mod tests {
     fn test_json_prefix_automaton_empty_path() {
         let regex = Arc::new(Regex::new("e(f|g.*)").unwrap());
         let empty_path_automaton = JsonPathPrefix {
-            prefix: Vec::new(),
+            prefix: JsonPath::default(),
             automaton: regex.clone(),
         };
 
@@ -312,7 +306,7 @@ mod tests {
     fn test_json_prefix_automaton() {
         let regex = Arc::new(Regex::new("e(f|g.*)").unwrap());
         let automaton = JsonPathPrefix {
-            prefix: b"ab".to_vec(),
+            prefix: JsonPath::from_json_path("ab", false),
             automaton: regex.clone(),
         };
 
