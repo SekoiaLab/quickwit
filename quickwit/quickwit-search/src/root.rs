@@ -33,7 +33,7 @@ use quickwit_proto::metastore::{
 use quickwit_proto::search::{
     FetchDocsRequest, FetchDocsResponse, Hit, LeafHit, LeafRequestRef, LeafSearchRequest,
     LeafSearchResponse, PartialHit, SearchPlanResponse, SearchRequest, SearchResponse,
-    SnippetRequest, SortDatetimeFormat, SortField, SortValue, SplitIdAndFooterOffsets,
+    SnippetRequest, SortDatetimeFormat, SortField, SortOrder, SortValue, SplitIdAndFooterOffsets,
 };
 use quickwit_proto::types::{IndexUid, SplitId};
 use quickwit_query::query_ast::{
@@ -1168,6 +1168,7 @@ async fn refine_and_list_matches(
             &mut search_request.start_timestamp,
             &mut search_request.end_timestamp,
         );
+        refine_timestamps_from_search_after(search_request, timestamp_field);
     }
 
     let mut start_secondary_timestamp_opt: Option<i64> = None;
@@ -1550,6 +1551,43 @@ fn convert_sort_datetime_value_into_nanos(
     };
     *sort_value = SortValue::Datetime(nanos);
     Ok(())
+}
+
+/// Refines the search request's `start_timestamp` / `end_timestamp` from the `search_after`
+/// cursor when the primary sort field is the timestamp field.
+fn refine_timestamps_from_search_after(search_request: &mut SearchRequest, timestamp_field: &str) {
+    let Some(sort_field) = search_request.sort_fields.first() else {
+        return;
+    };
+    if sort_field.field_name != timestamp_field {
+        return;
+    }
+    let sort_order = sort_field.sort_order();
+    let Some(SortValue::Datetime(cursor_nanos)) = search_request
+        .search_after
+        .as_ref()
+        .and_then(|partial_hit| partial_hit.sort_value())
+    else {
+        return;
+    };
+    match sort_order {
+        SortOrder::Desc => {
+            // Subsequent pages only contain documents strictly equal or older than the cursor.
+            // `end_timestamp` is an exclusive upper bound; only ever tighten it (take the min).
+            let end_secs = cursor_nanos / 1_000_000_000 + 1;
+            search_request.end_timestamp = Some(match search_request.end_timestamp {
+                Some(end_timestamp) => end_timestamp.min(end_secs),
+                None => end_secs,
+            });
+        }
+        SortOrder::Asc => {
+            // Subsequent pages only contain documents strictly newer than the cursor.
+            // `start_timestamp` is an inclusive lower bound; only ever tighten it (take the max).
+            // `Option::max` treats `None` as the least restrictive bound.
+            let start_secs = cursor_nanos / 1_000_000_000;
+            search_request.start_timestamp = search_request.start_timestamp.max(Some(start_secs));
+        }
+    }
 }
 
 /// Converts a `Datetime` sort value (nanoseconds, tantivy's internal representation) into the
@@ -4540,6 +4578,143 @@ mod tests {
         assert_eq!(timestamp_range_extractor.start_timestamp, Some(1671184857));
         // When we have <= 1671184857.149001, we should get < 1671184858
         assert_eq!(timestamp_range_extractor.end_timestamp, Some(1671184858));
+    }
+
+    #[test]
+    fn test_refine_timestamps_from_search_after() {
+        const TS_FIELD: &str = "timestamp";
+
+        // Builds a request sorted by `field` with a datetime `search_after` cursor (in nanos).
+        fn request_with_cursor(
+            field: &str,
+            order: SortOrder,
+            cursor_nanos: Option<i64>,
+        ) -> SearchRequest {
+            SearchRequest {
+                sort_fields: vec![SortField {
+                    field_name: field.to_string(),
+                    sort_order: order as i32,
+                    sort_datetime_format: None,
+                }],
+                search_after: cursor_nanos.map(|nanos| PartialHit {
+                    sort_value: Some(SortByValue {
+                        sort_value: Some(SortValue::Datetime(nanos)),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        // DESC: end_timestamp is an exclusive upper bound, rounded up (div_ceil).
+        // Cursor 1_700_000_000.5s -> end = 1_700_000_001 so splits whose floor-second is
+        // 1_700_000_000 are still searched (they may hold sub-second docs before the cursor).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Desc, Some(1_700_000_000_500_000_000));
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, Some(1_700_000_001));
+            assert_eq!(request.start_timestamp, None);
+        }
+
+        // DESC: cursor exactly on a second boundary -> end = that second (exclusive).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Desc, Some(1_700_000_000_000_000_000));
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, Some(1_700_000_001));
+        }
+
+        // ASC: start_timestamp is an inclusive lower bound, rounded down (floor).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Asc, Some(1_700_000_000_500_000_000));
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.start_timestamp, Some(1_700_000_000));
+            assert_eq!(request.end_timestamp, None);
+        }
+
+        // DESC: an existing, more restrictive end_timestamp is preserved (never widened).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Desc, Some(1_700_000_000_500_000_000));
+            request.end_timestamp = Some(1_600_000_000);
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, Some(1_600_000_000));
+        }
+
+        // DESC: an existing, less restrictive end_timestamp is tightened to the cursor bound.
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Desc, Some(1_700_000_000_500_000_000));
+            request.end_timestamp = Some(1_800_000_000);
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, Some(1_700_000_001));
+        }
+
+        // ASC: an existing, more restrictive start_timestamp is preserved (max).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Asc, Some(1_700_000_000_500_000_000));
+            request.start_timestamp = Some(1_800_000_000);
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.start_timestamp, Some(1_800_000_000));
+        }
+
+        // No-op: the primary sort field is not the timestamp field.
+        {
+            let mut request = request_with_cursor(
+                "other_field",
+                SortOrder::Desc,
+                Some(1_700_000_000_500_000_000),
+            );
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, None);
+            assert_eq!(request.start_timestamp, None);
+        }
+
+        // No-op: no search_after cursor.
+        {
+            let mut request = request_with_cursor(TS_FIELD, SortOrder::Desc, None);
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, None);
+        }
+
+        // No-op: the cursor value is not a datetime (e.g. it was never normalised to nanos).
+        {
+            let mut request = SearchRequest {
+                sort_fields: vec![SortField {
+                    field_name: TS_FIELD.to_string(),
+                    sort_order: SortOrder::Desc as i32,
+                    sort_datetime_format: None,
+                }],
+                search_after: Some(PartialHit {
+                    sort_value: Some(SortByValue {
+                        sort_value: Some(SortValue::I64(1_700_000_000_500_000_000)),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, None);
+        }
+
+        // No-op: empty sort fields.
+        {
+            let mut request = SearchRequest {
+                search_after: Some(PartialHit {
+                    sort_value: Some(SortByValue {
+                        sort_value: Some(SortValue::Datetime(1_700_000_000_500_000_000)),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, None);
+            assert_eq!(request.start_timestamp, None);
+        }
     }
 
     fn create_search_resp(
