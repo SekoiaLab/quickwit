@@ -358,6 +358,66 @@ fn resolve_java_datetime_format_alias_for_parsing(java_datetime_format: &str) ->
 
         m.insert("strict_week_date", "xxxx-'W'ww-e");
         m.insert("week_date", "xxxx-'W'w[w]-e");
+
+        m.insert("date", "yyyy-MM-dd");
+        m.insert("strict_date", "yyyy-MM-dd");
+        m.insert("year_month_day", "yyyy-MM-dd");
+        m.insert("strict_year_month_day", "yyyy-MM-dd");
+        m.insert("year_month", "yyyy-MM");
+        m.insert("strict_year_month", "yyyy-MM");
+        m.insert("year", "yyyy");
+        m.insert("strict_year", "yyyy");
+        m.insert("date_hour", "yyyy-MM-dd'T'HH");
+        m.insert("strict_date_hour", "yyyy-MM-dd'T'HH");
+        m.insert("date_hour_minute", "yyyy-MM-dd'T'HH:mm");
+        m.insert("strict_date_hour_minute", "yyyy-MM-dd'T'HH:mm");
+        m.insert("date_hour_minute_second", "yyyy-MM-dd'T'HH:mm:ss");
+        m.insert("strict_date_hour_minute_second", "yyyy-MM-dd'T'HH:mm:ss");
+        m.insert(
+            "date_hour_minute_second_fraction",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        );
+        m.insert(
+            "strict_date_hour_minute_second_fraction",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        );
+        m.insert(
+            "date_hour_minute_second_millis",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        );
+        m.insert(
+            "strict_date_hour_minute_second_millis",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        );
+        m.insert("date_time", "yyyy-MM-dd'T'HH:mm:ss.SSSZ");
+        m.insert("strict_date_time", "yyyy-MM-dd'T'HH:mm:ss.SSSZ");
+        m.insert("date_time_no_millis", "yyyy-MM-dd'T'HH:mm:ssZ");
+        m.insert("strict_date_time_no_millis", "yyyy-MM-dd'T'HH:mm:ssZ");
+        m.insert("hour", "HH");
+        m.insert("strict_hour", "HH");
+        m.insert("hour_minute", "HH:mm");
+        m.insert("strict_hour_minute", "HH:mm");
+        m.insert("hour_minute_second", "HH:mm:ss");
+        m.insert("strict_hour_minute_second", "HH:mm:ss");
+        m.insert("hour_minute_second_fraction", "HH:mm:ss.SSS");
+        m.insert("strict_hour_minute_second_fraction", "HH:mm:ss.SSS");
+        m.insert("hour_minute_second_millis", "HH:mm:ss.SSS");
+        m.insert("strict_hour_minute_second_millis", "HH:mm:ss.SSS");
+        m.insert("time", "HH:mm:ss.SSSZ");
+        m.insert("strict_time", "HH:mm:ss.SSSZ");
+        m.insert("time_no_millis", "HH:mm:ssZ");
+        m.insert("strict_time_no_millis", "HH:mm:ssZ");
+        m.insert("t_time", "'T'HH:mm:ss.SSSZ");
+        m.insert("strict_t_time", "'T'HH:mm:ss.SSSZ");
+        m.insert("t_time_no_millis", "'T'HH:mm:ssZ");
+        m.insert("strict_t_time_no_millis", "'T'HH:mm:ssZ");
+        // Basic (separator-less) formats. Elasticsearch has no `strict_*` variant for these.
+        m.insert("basic_date_time", "yyyyMMdd'T'HHmmss.SSSZ");
+        m.insert("basic_date_time_no_millis", "yyyyMMdd'T'HHmmssZ");
+        m.insert("basic_time", "HHmmss.SSSZ");
+        m.insert("basic_time_no_millis", "HHmmssZ");
+        m.insert("basic_t_time", "'T'HHmmss.SSSZ");
+        m.insert("basic_t_time_no_millis", "'T'HHmmssZ");
         m
     });
     java_datetime_format_map
@@ -399,6 +459,65 @@ fn resolve_java_datetime_format_alias_for_formatting(java_datetime_format: &str)
         m.insert("basic_week_date_time_no_millis", "xxxx'W'wwe'T'HHmmssXXXXX");
         m.insert("strict_week_date", "xxxx-'W'ww-e");
         m.insert("week_date", "xxxx-'W'ww-e");
+
+        m.insert("date", "yyyy-MM-dd");
+        m.insert("strict_date", "yyyy-MM-dd");
+        m.insert("year_month_day", "yyyy-MM-dd");
+        m.insert("strict_year_month_day", "yyyy-MM-dd");
+        m.insert("year_month", "yyyy-MM");
+        m.insert("strict_year_month", "yyyy-MM");
+        m.insert("year", "yyyy");
+        m.insert("strict_year", "yyyy");
+        m.insert("date_hour", "yyyy-MM-dd'T'HH");
+        m.insert("strict_date_hour", "yyyy-MM-dd'T'HH");
+        m.insert("date_hour_minute", "yyyy-MM-dd'T'HH:mm");
+        m.insert("strict_date_hour_minute", "yyyy-MM-dd'T'HH:mm");
+        m.insert("date_hour_minute_second", "yyyy-MM-dd'T'HH:mm:ss");
+        m.insert("strict_date_hour_minute_second", "yyyy-MM-dd'T'HH:mm:ss");
+        m.insert(
+            "date_hour_minute_second_fraction",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        );
+        m.insert(
+            "strict_date_hour_minute_second_fraction",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        );
+        m.insert(
+            "date_hour_minute_second_millis",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        );
+        m.insert(
+            "strict_date_hour_minute_second_millis",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        );
+        m.insert("date_time", "yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX");
+        m.insert("strict_date_time", "yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX");
+        m.insert("date_time_no_millis", "yyyy-MM-dd'T'HH:mm:ssXXXXX");
+        m.insert("strict_date_time_no_millis", "yyyy-MM-dd'T'HH:mm:ssXXXXX");
+        m.insert("hour", "HH");
+        m.insert("strict_hour", "HH");
+        m.insert("hour_minute", "HH:mm");
+        m.insert("strict_hour_minute", "HH:mm");
+        m.insert("hour_minute_second", "HH:mm:ss");
+        m.insert("strict_hour_minute_second", "HH:mm:ss");
+        m.insert("hour_minute_second_fraction", "HH:mm:ss.SSS");
+        m.insert("strict_hour_minute_second_fraction", "HH:mm:ss.SSS");
+        m.insert("hour_minute_second_millis", "HH:mm:ss.SSS");
+        m.insert("strict_hour_minute_second_millis", "HH:mm:ss.SSS");
+        m.insert("time", "HH:mm:ss.SSSXXXXX");
+        m.insert("strict_time", "HH:mm:ss.SSSXXXXX");
+        m.insert("time_no_millis", "HH:mm:ssXXXXX");
+        m.insert("strict_time_no_millis", "HH:mm:ssXXXXX");
+        m.insert("t_time", "'T'HH:mm:ss.SSSXXXXX");
+        m.insert("strict_t_time", "'T'HH:mm:ss.SSSXXXXX");
+        m.insert("t_time_no_millis", "'T'HH:mm:ssXXXXX");
+        m.insert("strict_t_time_no_millis", "'T'HH:mm:ssXXXXX");
+        m.insert("basic_date_time", "yyyyMMdd'T'HHmmss.SSSXXXXX");
+        m.insert("basic_date_time_no_millis", "yyyyMMdd'T'HHmmssXXXXX");
+        m.insert("basic_time", "HHmmss.SSSXXXXX");
+        m.insert("basic_time_no_millis", "HHmmssXXXXX");
+        m.insert("basic_t_time", "'T'HHmmss.SSSXXXXX");
+        m.insert("basic_t_time_no_millis", "'T'HHmmssXXXXX");
         m
     });
     java_datetime_format_map
@@ -720,6 +839,147 @@ mod tests {
             "2021-01-21T03:01:22.312+01:00",
             datetime!(2021-01-21 03:01:22.312 +1),
         );
+    }
+
+    #[test]
+    fn test_parse_java_date_formats() {
+        test_parse_java_datetime_aux("year", "2021", datetime!(2021-01-01 00:00:00 UTC));
+        test_parse_java_datetime_aux("strict_year", "2021", datetime!(2021-01-01 00:00:00 UTC));
+        test_parse_java_datetime_aux("year_month", "2021-03", datetime!(2021-03-01 00:00:00 UTC));
+        test_parse_java_datetime_aux("date", "2021-03-05", datetime!(2021-03-05 00:00:00 UTC));
+        test_parse_java_datetime_aux(
+            "strict_date",
+            "2021-03-05",
+            datetime!(2021-03-05 00:00:00 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "year_month_day",
+            "2021-03-05",
+            datetime!(2021-03-05 00:00:00 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "date_hour",
+            "2021-03-05T13",
+            datetime!(2021-03-05 13:00:00 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "date_hour_minute",
+            "2021-03-05T13:32",
+            datetime!(2021-03-05 13:32:00 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "date_hour_minute_second",
+            "2021-03-05T13:32:43",
+            datetime!(2021-03-05 13:32:43 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "date_hour_minute_second_fraction",
+            "2021-03-05T13:32:43.123",
+            datetime!(2021-03-05 13:32:43.123 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "date_hour_minute_second_millis",
+            "2021-03-05T13:32:43.123",
+            datetime!(2021-03-05 13:32:43.123 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "date_time",
+            "2021-03-05T13:32:43.123Z",
+            datetime!(2021-03-05 13:32:43.123 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "strict_date_time",
+            "2021-03-05T13:32:43.123+01:00",
+            datetime!(2021-03-05 13:32:43.123 +1),
+        );
+        test_parse_java_datetime_aux(
+            "date_time_no_millis",
+            "2021-03-05T13:32:43Z",
+            datetime!(2021-03-05 13:32:43 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "basic_date_time",
+            "20210305T133243.123Z",
+            datetime!(2021-03-05 13:32:43.123 UTC),
+        );
+        test_parse_java_datetime_aux(
+            "basic_date_time_no_millis",
+            "20210305T133243Z",
+            datetime!(2021-03-05 13:32:43 UTC),
+        );
+    }
+
+    // Time-only formats leave the date unspecified, so it is filled with an inferred (current)
+    // year. We therefore only assert on the parsed time-of-day, which is deterministic.
+    #[track_caller]
+    fn assert_parses_time(
+        java_date_time_format: &str,
+        date_str: &str,
+        expected: (u8, u8, u8, u16),
+    ) {
+        let parser = StrptimeParser::from_java_datetime_format(java_date_time_format).unwrap();
+        let datetime = parser.parse_date_time(date_str).unwrap();
+        assert_eq!(
+            (
+                datetime.hour(),
+                datetime.minute(),
+                datetime.second(),
+                datetime.millisecond(),
+            ),
+            expected,
+            "unexpected time for format `{java_date_time_format}` input `{date_str}`"
+        );
+    }
+
+    #[test]
+    fn test_parse_java_time_formats() {
+        assert_parses_time("hour", "13", (13, 0, 0, 0));
+        assert_parses_time("strict_hour", "13", (13, 0, 0, 0));
+        assert_parses_time("hour_minute", "13:32", (13, 32, 0, 0));
+        assert_parses_time("hour_minute_second", "13:32:43", (13, 32, 43, 0));
+        assert_parses_time(
+            "hour_minute_second_fraction",
+            "13:32:43.123",
+            (13, 32, 43, 123),
+        );
+        assert_parses_time(
+            "hour_minute_second_millis",
+            "13:32:43.123",
+            (13, 32, 43, 123),
+        );
+        assert_parses_time("time", "13:32:43.123Z", (13, 32, 43, 123));
+        assert_parses_time("time_no_millis", "13:32:43Z", (13, 32, 43, 0));
+        assert_parses_time("t_time", "T13:32:43.123Z", (13, 32, 43, 123));
+        assert_parses_time("t_time_no_millis", "T13:32:43Z", (13, 32, 43, 0));
+        assert_parses_time("basic_time", "133243.123Z", (13, 32, 43, 123));
+        assert_parses_time("basic_time_no_millis", "133243Z", (13, 32, 43, 0));
+        assert_parses_time("basic_t_time", "T133243.123Z", (13, 32, 43, 123));
+        assert_parses_time("basic_t_time_no_millis", "T133243Z", (13, 32, 43, 0));
+    }
+
+    #[track_caller]
+    fn assert_formats(java_date_time_format: &str, date_time: OffsetDateTime, expected: &str) {
+        let parser = StrptimeParser::from_java_datetime_format(java_date_time_format).unwrap();
+        let formatted = parser.format_date_time(&date_time).unwrap();
+        assert_eq!(formatted, expected, "format `{java_date_time_format}`");
+    }
+
+    #[test]
+    fn test_format_java_formats() {
+        let utc = datetime!(2021-03-05 13:32:43.123 UTC);
+        assert_formats("date", utc, "2021-03-05");
+        assert_formats("year_month", utc, "2021-03");
+        assert_formats("year", utc, "2021");
+        assert_formats("date_hour_minute_second", utc, "2021-03-05T13:32:43");
+        assert_formats("date_time", utc, "2021-03-05T13:32:43.123Z");
+        assert_formats("date_time_no_millis", utc, "2021-03-05T13:32:43Z");
+        assert_formats("basic_date_time", utc, "20210305T133243.123Z");
+        assert_formats("basic_date_time_no_millis", utc, "20210305T133243Z");
+        assert_formats("time_no_millis", utc, "13:32:43Z");
+
+        // Non-UTC offset is rendered with the `XXXXX` (`+HH:MM`) convention.
+        let plus_one = datetime!(2021-03-05 13:32:43.123 +1);
+        assert_formats("date_time", plus_one, "2021-03-05T13:32:43.123+01:00");
     }
 
     #[test]
