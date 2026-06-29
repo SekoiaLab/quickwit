@@ -48,6 +48,7 @@ impl<F> PinnedDrop for SearchPlanMetricsFuture<F> {
             Some(Ok(())) => return,
             Some(Err(error)) => error,
             None => {
+                record_all!(self.req_span, elapsed_ms = self.start.elapsed().as_millis());
                 let _guard = self.req_span.enter();
                 tracing::info!("root search cancelled");
                 "plan-cancelled"
@@ -75,6 +76,7 @@ where F: Future<Output = crate::Result<R>>
         let this = self.project();
         let response = ready!(this.tracked.poll(cx));
         if let Err(err) = &response {
+            record_all!(this.req_span, elapsed_ms = this.start.elapsed().as_millis());
             let _guard = this.req_span.enter();
             tracing::error!(?err, "root search planning failed");
         }
