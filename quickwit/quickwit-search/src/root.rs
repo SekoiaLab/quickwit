@@ -4717,6 +4717,62 @@ mod tests {
         }
     }
 
+    // Regression guard for the call ordering in `refine_and_list_matches`:
+    // `refine_timestamps_from_search_after` only tightens the timestamp bounds when the cursor is
+    // already a `SortValue::Datetime`, which is produced by `convert_search_after_datetime_values`.
+    // If the conversion is moved *after* the refinement, the cursor stays a raw integer, the
+    // refinement silently no-ops, and this test fails without touching any other code.
+    #[tokio::test]
+    async fn test_refine_and_list_matches_refines_timestamps_from_search_after() {
+        const TS_FIELD: &str = "timestamp";
+
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore.expect_list_splits().returning(|_| {
+            Ok(ServiceStream::from(vec![Ok(
+                ListSplitsResponse::try_from_splits(Vec::new()).unwrap(),
+            )]))
+        });
+        let mut metastore = MetastoreServiceClient::from_mock(mock_metastore);
+
+        let index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
+
+        // The cursor arrives as a raw unix-millis integer, exactly as it would before
+        // normalisation.
+        let mut search_request = SearchRequest {
+            index_id_patterns: vec!["test-index".to_string()],
+            sort_fields: vec![SortField {
+                field_name: TS_FIELD.to_string(),
+                sort_order: SortOrder::Desc as i32,
+                sort_datetime_format: None,
+            }],
+            search_after: Some(PartialHit {
+                sort_value: Some(SortByValue {
+                    sort_value: Some(SortValue::I64(1_700_000_000_500)),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sort_fields_is_datetime: SortFieldsIsDatetime =
+            HashMap::from([(TS_FIELD.to_string(), true)]);
+
+        refine_and_list_matches(
+            &mut metastore,
+            &mut search_request,
+            vec![index_metadata],
+            QueryAst::MatchAll,
+            sort_fields_is_datetime,
+            Some(TS_FIELD.to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The cursor (1_700_000_000.5s, DESC) must tighten the exclusive upper bound to the next
+        // second. This only happens if the datetime conversion ran before the refinement.
+        assert_eq!(search_request.end_timestamp, Some(1_700_000_001));
+    }
+
     fn create_search_resp(
         index_uri: &str,
         hit_range: Range<usize>,
