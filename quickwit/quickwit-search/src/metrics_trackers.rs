@@ -50,7 +50,7 @@ impl<F> PinnedDrop for SearchPlanMetricsFuture<F> {
             None => {
                 record_all!(self.req_span, elapsed_ms = self.start.elapsed().as_millis());
                 let _guard = self.req_span.enter();
-                tracing::info!("root search cancelled");
+                tracing::info!("root search planning cancelled");
                 "plan-cancelled"
             }
         };
