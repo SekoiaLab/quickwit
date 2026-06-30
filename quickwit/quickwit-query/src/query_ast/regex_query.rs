@@ -241,7 +241,7 @@ mod tests {
     use std::ops::Deref;
     use std::sync::Arc;
 
-    use tantivy::schema::{Schema as TantivySchema, TEXT};
+    use tantivy::schema::{Schema as TantivySchema, TEXT, Type};
     use tantivy_fst::{Automaton, Regex};
 
     use super::prefix::JsonPathPrefixState;
@@ -305,6 +305,8 @@ mod tests {
     #[test]
     fn test_json_prefix_automaton() {
         let regex = Arc::new(Regex::new("e(f|g.*)").unwrap());
+        // JsonPath::from_json_path encodes "ab" as b"ab\0s" (null separator + string
+        // type marker), so the prefix is 4 bytes, not 2.
         let automaton = JsonPathPrefix {
             prefix: JsonPath::from_json_path("ab", false),
             automaton: regex.clone(),
@@ -327,41 +329,53 @@ mod tests {
         assert!(!automaton.is_match(&a));
 
         let ab = automaton.accept(&a, b'b');
-        assert_eq!(ab, JsonPathPrefixState::Inner(regex.start()));
+        assert!(matches!(ab, JsonPathPrefixState::Prefix(_)));
         assert!(automaton.can_match(&ab));
         assert!(!automaton.is_match(&ab));
+
+        // consume the null byte separator
+        let ab0 = automaton.accept(&ab, b'\0');
+        assert!(matches!(ab0, JsonPathPrefixState::Prefix(_)));
+        assert!(automaton.can_match(&ab0));
+        assert!(!automaton.is_match(&ab0));
+
+        // consume the string type marker — prefix is now fully consumed
+        let inner_start = automaton.accept(&ab0, Type::Str.to_code());
+        assert_eq!(inner_start, JsonPathPrefixState::Inner(regex.start()));
+        assert!(automaton.can_match(&inner_start));
+        assert!(!automaton.is_match(&inner_start));
 
         // starting here, we just take that we passthrough correctly,
         // and reply to can_match as well as possible
         // (we don't test will_always_match because Regex doesn't support it)
-        let abc = automaton.accept(&ab, b'c');
-        assert!(matches!(abc, JsonPathPrefixState::Inner(_)));
-        assert!(!automaton.can_match(&abc));
-        assert!(!automaton.is_match(&abc));
+        let inner_c = automaton.accept(&inner_start, b'c');
+        assert!(matches!(inner_c, JsonPathPrefixState::Inner(_)));
+        assert!(!automaton.can_match(&inner_c));
+        assert!(!automaton.is_match(&inner_c));
 
-        let abe = automaton.accept(&ab, b'e');
-        assert!(matches!(abe, JsonPathPrefixState::Inner(_)));
-        assert!(automaton.can_match(&abe));
-        assert!(!automaton.is_match(&abe));
+        let inner_e = automaton.accept(&inner_start, b'e');
+        assert!(matches!(inner_e, JsonPathPrefixState::Inner(_)));
+        assert!(automaton.can_match(&inner_e));
+        assert!(!automaton.is_match(&inner_e));
 
-        let abef = automaton.accept(&abe, b'f');
-        assert!(matches!(abef, JsonPathPrefixState::Inner(_)));
-        assert!(automaton.can_match(&abef));
-        assert!(automaton.is_match(&abef));
+        let inner_ef = automaton.accept(&inner_e, b'f');
+        assert!(matches!(inner_ef, JsonPathPrefixState::Inner(_)));
+        assert!(automaton.can_match(&inner_ef));
+        assert!(automaton.is_match(&inner_ef));
 
-        let abefg = automaton.accept(&abef, b'g');
-        assert!(matches!(abefg, JsonPathPrefixState::Inner(_)));
-        assert!(!automaton.can_match(&abefg));
-        assert!(!automaton.is_match(&abefg));
+        let inner_efg = automaton.accept(&inner_ef, b'g');
+        assert!(matches!(inner_efg, JsonPathPrefixState::Inner(_)));
+        assert!(!automaton.can_match(&inner_efg));
+        assert!(!automaton.is_match(&inner_efg));
 
-        let abeg = automaton.accept(&abe, b'g');
-        assert!(matches!(abeg, JsonPathPrefixState::Inner(_)));
-        assert!(automaton.can_match(&abeg));
-        assert!(automaton.is_match(&abeg));
+        let inner_eg = automaton.accept(&inner_e, b'g');
+        assert!(matches!(inner_eg, JsonPathPrefixState::Inner(_)));
+        assert!(automaton.can_match(&inner_eg));
+        assert!(automaton.is_match(&inner_eg));
 
-        let abegh = automaton.accept(&abeg, b'h');
-        assert!(matches!(abegh, JsonPathPrefixState::Inner(_)));
-        assert!(automaton.can_match(&abegh));
-        assert!(automaton.is_match(&abegh));
+        let inner_egh = automaton.accept(&inner_eg, b'h');
+        assert!(matches!(inner_egh, JsonPathPrefixState::Inner(_)));
+        assert!(automaton.can_match(&inner_egh));
+        assert!(automaton.is_match(&inner_egh));
     }
 }
