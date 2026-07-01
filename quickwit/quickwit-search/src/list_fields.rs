@@ -341,40 +341,40 @@ pub async fn leaf_list_fields(
 
     let mut single_split_list_fields_vec: Vec<Vec<ListFieldsEntryResponse>> =
         future::try_join_all(single_split_list_fields_futures).await?;
-
-    let fields = search_thread_pool()
-        .run_cpu_intensive(move || {
-            for single_split_list_fields in &mut single_split_list_fields_vec {
-                // This contract is enforced on a different node, etc. so we defensively check that
-                // the fields are sorted and deduplicated.
-                if !single_split_list_fields.is_sorted_by(|left, right| {
-                    // Checking on less ensure that this is both sorted AND that there are no
-                    // duplicates
-                    field_order(left, right) == std::cmp::Ordering::Less
-                }) {
-                    rate_limited_warn!(
-                        limit_per_min = 1,
-                        "contract breach: fields returned by a leaf are not strictly sorted! \
-                         please report"
-                    );
-                    make_sorted_and_dedup(single_split_list_fields);
-                }
+    let cpu_task = move || {
+        for single_split_list_fields in &mut single_split_list_fields_vec {
+            // This contract is enforced on a different node, etc. so we defensively check
+            // that the fields are sorted and deduplicated.
+            if !single_split_list_fields.is_sorted_by(|left, right| {
+                // Checking on less ensure that this is both sorted AND that there are no
+                // duplicates
+                field_order(left, right) == std::cmp::Ordering::Less
+            }) {
+                rate_limited_warn!(
+                    limit_per_min = 1,
+                    "contract breach: fields returned by a leaf are not strictly sorted! please \
+                     report"
+                );
+                make_sorted_and_dedup(single_split_list_fields);
             }
+        }
 
-            let filtered_list_fields_sorted_iters: Vec<_> = single_split_list_fields_vec
-                .into_iter()
-                .map(|list_fields_sorted| {
-                    list_fields_sorted.into_iter().filter(|field| {
-                        if field_patterns.is_empty() {
-                            true
-                        } else {
-                            matches_any_pattern(&field.field_name, &field_patterns)
-                        }
-                    })
+        let filtered_list_fields_sorted_iters: Vec<_> = single_split_list_fields_vec
+            .into_iter()
+            .map(|list_fields_sorted| {
+                list_fields_sorted.into_iter().filter(|field| {
+                    if field_patterns.is_empty() {
+                        true
+                    } else {
+                        matches_any_pattern(&field.field_name, &field_patterns)
+                    }
                 })
-                .collect();
-            merge_leaf_list_fields(filtered_list_fields_sorted_iters)
-        })
+            })
+            .collect();
+        merge_leaf_list_fields(filtered_list_fields_sorted_iters)
+    };
+    let fields = search_thread_pool()
+        .run_cpu_intensive_with_identified_caller(cpu_task, "leaf_list_fields")
         .await
         .context("failed to merge single split list fields")??;
     Ok(ListFieldsResponse { fields })
@@ -448,13 +448,16 @@ pub async fn root_list_fields(
     }
     let leaf_list_fields_protos: Vec<ListFieldsResponse> = try_join_all(leaf_request_tasks).await?;
     let fields = search_thread_pool()
-        .run_cpu_intensive(move || {
-            let leaf_list_fields = leaf_list_fields_protos
-                .into_iter()
-                .map(|leaf_list_fields_proto| leaf_list_fields_proto.fields.into_iter())
-                .collect();
-            merge_leaf_list_fields(leaf_list_fields)
-        })
+        .run_cpu_intensive_with_identified_caller(
+            move || {
+                let leaf_list_fields = leaf_list_fields_protos
+                    .into_iter()
+                    .map(|leaf_list_fields_proto| leaf_list_fields_proto.fields.into_iter())
+                    .collect();
+                merge_leaf_list_fields(leaf_list_fields)
+            },
+            "root_list_fields",
+        )
         .await
         .context("failed to merge leaf list fields responses")??;
 

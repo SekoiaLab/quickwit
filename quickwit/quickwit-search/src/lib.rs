@@ -55,6 +55,7 @@ use quickwit_proto::metastore::{
     ListIndexesMetadataRequest, ListSplitsRequest, MetastoreService, MetastoreServiceClient,
 };
 use tantivy::schema::NamedFieldDocument;
+use tracing::info;
 
 /// Refer to this as `crate::Result<T>`.
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -99,7 +100,20 @@ pub type SearcherPool = Pool<SocketAddr, SearchServiceClient>;
 
 fn search_thread_pool() -> &'static ThreadPool {
     static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
-    SEARCH_THREAD_POOL.get_or_init(|| ThreadPool::new("search", None))
+
+    SEARCH_THREAD_POOL.get_or_init(|| {
+        let use_all_cpus =
+            quickwit_common::get_bool_from_env("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS", false);
+        let num_threads = if use_all_cpus {
+            info!("search thread pool configured with default Rayon thread pool size");
+            None
+        } else {
+            let threads = usize::max(quickwit_common::num_cpus().saturating_sub(1), 1);
+            info!(threads, "search thread pool configured with one free CPU");
+            Some(threads)
+        };
+        ThreadPool::new("search", num_threads)
+    })
 }
 
 /// GlobalDocAddress serves as a hit address.

@@ -329,7 +329,7 @@ async fn warm_up_automatons(
     let mut warm_up_futures = Vec::new();
     let cpu_intensive_executor = |task| async {
         crate::search_thread_pool()
-            .run_cpu_intensive(task)
+            .run_cpu_intensive_with_identified_caller(task, "automaton_warmup")
             .await
             .map_err(|_| std::io::Error::other("task panicked"))?
     };
@@ -567,52 +567,50 @@ async fn leaf_search_single_split(
     let split_clone = split.clone();
 
     let ctx_clone = ctx.clone();
+
     leaf_search_state_guard.set_state(SplitSearchState::CpuQueue);
+    let cpu_task = move || {
+        leaf_search_state_guard.set_state(SplitSearchState::Cpu);
+        let cpu_start = Instant::now();
+        let cpu_thread_pool_wait_microsecs = cpu_start.duration_since(warmup_end);
+        let _span_guard = span.enter();
+        // Our search execution has been scheduled, let's check if we can improve the
+        // request based on the results of the preceding searches
+        let Some(simplified_search_request) =
+            simplify_search_request(search_request, &split_clone, &ctx_clone.split_filter)
+        else {
+            leaf_search_state_guard.set_state(SplitSearchState::PrunedAfterWarmup);
+            return Ok(None);
+        };
+        collector.update_search_param(&simplified_search_request);
+        let mut leaf_search_response: LeafSearchResponse =
+            if is_metadata_count_request_with_ast(&query_ast, &simplified_search_request) {
+                let num_docs = searcher
+                    .num_docs()
+                    .saturating_sub(split_clone.soft_deleted_doc_ids.len() as u64);
+                get_leaf_resp_from_count(num_docs)
+            } else if collector.is_count_only() {
+                let count = query.count(&searcher)? as u64;
+                get_leaf_resp_from_count(count)
+            } else {
+                searcher.search(&query, &collector)?
+            };
+        leaf_search_response.resource_stats = Some(ResourceStats {
+            cpu_microsecs: cpu_start.elapsed().as_micros() as u64,
+            short_lived_cache_num_bytes: warmup_size.as_u64(),
+            split_num_docs,
+            warmup_microsecs: warmup_duration.as_micros() as u64,
+            cpu_thread_pool_wait_microsecs: cpu_thread_pool_wait_microsecs.as_micros() as u64,
+        });
+        // splits by outcome are estimated at the (doc mapping) leaf
+        // response level to account for all early returns, so it is
+        // left None here
+        leaf_search_state_guard.set_state(SplitSearchState::Processed);
+        Result::<_, TantivyError>::Ok(Some((simplified_search_request, leaf_search_response)))
+    };
     let search_request_and_result: Option<(SearchRequest, LeafSearchResponse)> =
         crate::search_thread_pool()
-            .run_cpu_intensive(move || {
-                leaf_search_state_guard.set_state(SplitSearchState::Cpu);
-                let cpu_start = Instant::now();
-                let cpu_thread_pool_wait_microsecs = cpu_start.duration_since(warmup_end);
-                let _span_guard = span.enter();
-                // Our search execution has been scheduled, let's check if we can improve the
-                // request based on the results of the preceding searches
-                let Some(simplified_search_request) =
-                    simplify_search_request(search_request, &split_clone, &ctx_clone.split_filter)
-                else {
-                    leaf_search_state_guard.set_state(SplitSearchState::PrunedAfterWarmup);
-                    return Ok(None);
-                };
-                collector.update_search_param(&simplified_search_request);
-                let mut leaf_search_response: LeafSearchResponse =
-                    if is_metadata_count_request_with_ast(&query_ast, &simplified_search_request) {
-                        let num_docs = searcher
-                            .num_docs()
-                            .saturating_sub(split_clone.soft_deleted_doc_ids.len() as u64);
-                        get_leaf_resp_from_count(num_docs)
-                    } else if collector.is_count_only() {
-                        let count = query.count(&searcher)? as u64;
-                        get_leaf_resp_from_count(count)
-                    } else {
-                        searcher.search(&query, &collector)?
-                    };
-                leaf_search_response.resource_stats = Some(ResourceStats {
-                    cpu_microsecs: cpu_start.elapsed().as_micros() as u64,
-                    short_lived_cache_num_bytes: warmup_size.as_u64(),
-                    split_num_docs,
-                    warmup_microsecs: warmup_duration.as_micros() as u64,
-                    cpu_thread_pool_wait_microsecs: cpu_thread_pool_wait_microsecs.as_micros()
-                        as u64,
-                });
-                // splits by outcome are estimated at the (doc mapping) leaf
-                // response level to account for all early returns, so it is
-                // left None here
-                leaf_search_state_guard.set_state(SplitSearchState::Processed);
-                Result::<_, TantivyError>::Ok(Some((
-                    simplified_search_request,
-                    leaf_search_response,
-                )))
-            })
+            .run_cpu_intensive_with_identified_caller(cpu_task, "split_search")
             .await
             .map_err(|_| {
                 crate::SearchError::Internal(format!("leaf search panicked. split={split_id}"))
@@ -1306,7 +1304,10 @@ pub async fn multi_index_leaf_search(
     }
 
     crate::search_thread_pool()
-        .run_cpu_intensive(|| incremental_merge_collector.finalize().map_err(Into::into))
+        .run_cpu_intensive_with_identified_caller(
+            || incremental_merge_collector.finalize().map_err(Into::into),
+            "finalize",
+        )
         .instrument(info_span!("incremental_merge_finalize"))
         .await
         .context("failed to merge split search responses")?
@@ -1488,7 +1489,10 @@ pub async fn single_doc_mapping_leaf_search(
 
     let leaf_search_response_reresult: Result<Result<LeafSearchResponse, _>, _> =
         crate::search_thread_pool()
-            .run_cpu_intensive(|| incremental_merge_collector.finalize())
+            .run_cpu_intensive_with_identified_caller(
+                || incremental_merge_collector.finalize(),
+                "finalize",
+            )
             .instrument(info_span!("incremental_merge_intermediate"))
             .await
             .context("failed to merge split search responses");
