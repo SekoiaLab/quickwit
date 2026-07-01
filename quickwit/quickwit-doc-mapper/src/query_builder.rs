@@ -23,7 +23,7 @@ use quickwit_query::query_ast::{
     QueryAstTransformer, QueryAstVisitor, RangeQuery, RegexQuery, TermSetQuery, WildcardQuery,
 };
 use quickwit_query::tokenizers::TokenizerManager;
-use quickwit_query::{InvalidQuery, find_field_or_hit_dynamic};
+use quickwit_query::{InvalidQuery, JsonPath, find_field_or_hit_dynamic};
 use tantivy::Term;
 use tantivy::query::Query;
 use tantivy::schema::{Field, Schema};
@@ -323,7 +323,7 @@ fn coalesce_multi_term_fields_into_automatons(
 /// and cannot be shared). `Automaton::TermSet` entries are left untouched.
 fn coalesce_regexes_by_field(automatons_grouped_by_field: &mut HashMap<Field, HashSet<Automaton>>) {
     for automatons in automatons_grouped_by_field.values_mut() {
-        let mut regexes_by_path: HashMap<Option<Vec<u8>>, Vec<String>> = HashMap::new();
+        let mut regexes_by_path: HashMap<Option<JsonPath>, Vec<String>> = HashMap::new();
         let mut others: Vec<Automaton> = Vec::new();
         for automaton in automatons.drain() {
             match automaton {

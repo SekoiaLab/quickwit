@@ -35,6 +35,7 @@ pub use elastic_query_dsl::{ElasticQueryDsl, OneFieldMap};
 pub use error::InvalidQuery;
 pub use json_literal::{InterpretUserInput, JsonLiteral};
 pub(crate) use not_nan_f32::NotNaNf32;
+pub use query_ast::JsonPath;
 pub use query_ast::utils::find_field_or_hit_dynamic;
 use serde::{Deserialize, Serialize};
 pub use tantivy::query::Query as TantivyQuery;
