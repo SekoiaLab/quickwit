@@ -126,15 +126,10 @@ impl SplitCache {
     }
 
     /// Wraps a storage with our split cache.
-    pub fn wrap_storage(
-        self_arc: Arc<Self>,
-        storage: Arc<dyn Storage>,
-        read_only: bool,
-    ) -> Arc<dyn Storage> {
+    pub fn wrap_storage(self_arc: Arc<Self>, storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
         let cache = Arc::new(SplitCacheBackingStorage {
             split_cache: self_arc,
             storage_root_uri: storage.uri().clone(),
-            read_only,
         });
         wrap_storage_with_cache(cache, storage)
     }
@@ -156,20 +151,15 @@ impl SplitCache {
     }
 
     // Returns a split guard object. As long as it is not dropped, the
-    // split won't be evinced from the cache.
-    async fn get_split_file(
-        &self,
-        split_id: Ulid,
-        storage_uri: &Uri,
-        read_only: bool,
-    ) -> Option<SplitFile> {
+    // split won't be evicted from the cache.
+    async fn get_split_file(&self, split_id: Ulid, storage_uri: &Uri) -> Option<SplitFile> {
         // We touch before even checking the fd cache in order to update the file's last access time
         // for the file cache.
-        let num_bytes_opt: Option<u64> =
-            self.split_table
-                .lock()
-                .unwrap()
-                .touch(split_id, storage_uri, read_only);
+        let num_bytes_opt: Option<u64> = self
+            .split_table
+            .lock()
+            .unwrap()
+            .touch(split_id, storage_uri);
 
         let num_bytes = num_bytes_opt?;
         self.fd_cache
@@ -205,7 +195,6 @@ fn split_id_from_path(split_path: &Path) -> Option<Ulid> {
 struct SplitCacheBackingStorage {
     split_cache: Arc<SplitCache>,
     storage_root_uri: Uri,
-    read_only: bool,
 }
 
 impl SplitCacheBackingStorage {
@@ -213,7 +202,7 @@ impl SplitCacheBackingStorage {
         let split_id = split_id_from_path(path)?;
         let split_file: SplitFile = self
             .split_cache
-            .get_split_file(split_id, &self.storage_root_uri, self.read_only)
+            .get_split_file(split_id, &self.storage_root_uri)
             .await?;
         split_file.get_range(byte_range).await.ok()
     }
@@ -222,7 +211,7 @@ impl SplitCacheBackingStorage {
         let split_id = split_id_from_path(path)?;
         let split_file = self
             .split_cache
-            .get_split_file(split_id, &self.storage_root_uri, self.read_only)
+            .get_split_file(split_id, &self.storage_root_uri)
             .await?;
         split_file.get_all().await.ok()
     }
