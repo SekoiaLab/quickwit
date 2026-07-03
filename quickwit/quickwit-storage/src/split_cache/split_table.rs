@@ -242,16 +242,14 @@ impl SplitTable {
     /// cache (if in cache).
     ///
     /// If the file is already on the disk cache, return `Some(num_bytes)`.
-    /// If the file is not in cache, return `None`, and register the file in the candidate for
-    /// download list.
-    pub fn touch(&mut self, split_ulid: Ulid, storage_uri: &Uri, read_only: bool) -> Option<u64> {
+    /// If the file is not in cache, register the file in the candidate for download list, and
+    /// return `None`.
+    pub fn touch(&mut self, split_ulid: Ulid, storage_uri: &Uri) -> Option<u64> {
         let timestamp = compute_timestamp(self.origin_time);
         let status = self.mutate_split(split_ulid, |old_split_info| {
             if let Some(mut split_info) = old_split_info {
                 split_info.split_key.last_accessed = timestamp;
                 Some(split_info)
-            } else if read_only {
-                None
             } else {
                 let split_key = SplitKey {
                     split_ulid,
@@ -510,7 +508,7 @@ mod tests {
         let ulid2 = ulids[1];
         split_table.report(ulid1, Uri::for_test(TEST_STORAGE_URI));
         split_table.report(ulid2, Uri::for_test(TEST_STORAGE_URI));
-        let num_bytes_opt = split_table.touch(ulid1, &Uri::for_test("s3://test1/"), false);
+        let num_bytes_opt = split_table.touch(ulid1, &Uri::for_test("s3://test1/"));
         assert!(num_bytes_opt.is_none());
         let candidate = split_table.best_candidate().unwrap();
         assert_eq!(candidate.split_ulid, ulid1);
@@ -536,7 +534,7 @@ mod tests {
         split_table.register_as_downloaded(ulid1, 10_000_000);
         assert_eq!(split_table.num_bytes(), 10_000_000);
         assert_eq!(
-            split_table.touch(ulid1, &Uri::for_test(TEST_STORAGE_URI), false),
+            split_table.touch(ulid1, &Uri::for_test(TEST_STORAGE_URI)),
             Some(10_000_000)
         );
         let ulid2 = Ulid::new();
