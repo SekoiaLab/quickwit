@@ -136,12 +136,43 @@ impl SplitTable {
                 status: Status::OnDisk { num_bytes },
             };
             self.insert(split_info);
+            record_split_added_to_disk(num_bytes);
         }
     }
 }
 
 fn compute_timestamp(start: Instant) -> LastAccessDate {
     start.elapsed().as_micros() as u64
+}
+
+fn record_split_added_to_disk(num_bytes: u64) {
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .in_cache_count
+        .inc();
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .in_cache_num_bytes
+        .add(num_bytes as i64);
+}
+
+fn record_split_evicted(num_bytes: u64) {
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .in_cache_count
+        .dec();
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .in_cache_num_bytes
+        .sub(num_bytes as i64);
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .evict_num_items
+        .inc();
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .evict_num_bytes
+        .inc_by(num_bytes);
 }
 
 impl SplitTable {
@@ -152,22 +183,6 @@ impl SplitTable {
             Status::Downloading { .. } => &mut self.downloading_splits,
             Status::OnDisk { num_bytes } => {
                 self.on_disk_bytes -= num_bytes;
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .in_cache_count
-                    .dec();
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .in_cache_num_bytes
-                    .sub(num_bytes as i64);
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .evict_num_items
-                    .inc();
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .evict_num_bytes
-                    .inc_by(num_bytes);
                 &mut self.on_disk_splits
             }
         };
@@ -216,14 +231,6 @@ impl SplitTable {
             Status::Downloading { .. } => self.downloading_splits.insert(split_info.split_key),
             Status::OnDisk { num_bytes } => {
                 self.on_disk_bytes += num_bytes;
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .in_cache_count
-                    .inc();
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .in_cache_num_bytes
-                    .add(num_bytes as i64);
                 self.on_disk_splits.insert(split_info.split_key)
             }
         };
@@ -335,6 +342,7 @@ impl SplitTable {
 
     pub(crate) fn register_as_downloaded(&mut self, split_ulid: Ulid, num_bytes: u64) {
         self.change_split_status(split_ulid, Status::OnDisk { num_bytes });
+        record_split_added_to_disk(num_bytes);
     }
 
     /// Change the state of the given split from candidate to downloading state,
@@ -406,6 +414,11 @@ impl SplitTable {
             }
             Err(NoRoomAvailable)
         } else {
+            for split_info in &split_infos {
+                if let Status::OnDisk { num_bytes } = split_info.status {
+                    record_split_evicted(num_bytes);
+                }
+            }
             Ok(split_infos
                 .into_iter()
                 .map(|split_info| split_info.split_key.split_ulid)
