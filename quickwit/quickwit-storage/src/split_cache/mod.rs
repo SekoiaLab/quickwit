@@ -126,10 +126,22 @@ impl SplitCache {
     }
 
     /// Wraps a storage with our split cache.
-    pub fn wrap_storage(self_arc: Arc<Self>, storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
-        let cache = Arc::new(SplitCacheBackingStorage {
+    ///
+    /// The returned storage is specific to the given `split_id`: it is only
+    /// ever meant to be used to access that single split's file. `num_bytes` is
+    /// the split's total file size, it is only used to register that split as a
+    /// download candidate with a known size.
+    pub fn wrap_storage(
+        self_arc: Arc<Self>,
+        storage: Arc<dyn Storage>,
+        split_id: Ulid,
+        num_bytes: u64,
+    ) -> Arc<dyn Storage> {
+        let cache = Arc::new(SplitScopedStorageCache {
             split_cache: self_arc,
             storage_root_uri: storage.uri().clone(),
+            split_id,
+            num_bytes,
         });
         wrap_storage_with_cache(cache, storage)
     }
@@ -146,22 +158,28 @@ impl SplitCache {
                 error!(storage_uri=%report_split.storage_uri, "received invalid storage uri: ignoring");
                 continue;
             };
-            split_table.report(split_ulid, storage_uri);
+            split_table.report(split_ulid, storage_uri, report_split.num_bytes);
         }
     }
 
     // Returns a split guard object. As long as it is not dropped, the
     // split won't be evicted from the cache.
-    async fn get_split_file(&self, split_id: Ulid, storage_uri: &Uri) -> Option<SplitFile> {
-        // We touch before even checking the fd cache in order to update the file's last access time
-        // for the file cache.
-        let num_bytes_opt: Option<u64> = self
+    async fn get_split_file(
+        &self,
+        split_id: Ulid,
+        storage_uri: &Uri,
+        num_bytes: u64,
+    ) -> Option<SplitFile> {
+        // We touch before even checking the fd cache in order to update the file's last access
+        // time for the file cache.
+        let is_on_disk = self
             .split_table
             .lock()
             .unwrap()
-            .touch(split_id, storage_uri);
-
-        let num_bytes = num_bytes_opt?;
+            .touch(split_id, storage_uri, num_bytes);
+        if !is_on_disk {
+            return None;
+        }
         self.fd_cache
             .get_or_open_split_file(&self.root_path, split_id, num_bytes)
             .await
@@ -192,26 +210,32 @@ fn split_id_from_path(split_path: &Path) -> Option<Ulid> {
     Ulid::from_str(split_id_str).ok()
 }
 
-struct SplitCacheBackingStorage {
+/// A `StorageCache` implementation that is specific to a single split: it is only ever meant to
+/// be used to access `split_id`'s own file. It is not a general-purpose cache for arbitrary splits
+/// living under `storage_root_uri`, since `num_bytes` would otherwise no longer make sense for the
+/// paths it doesn't apply to.
+struct SplitScopedStorageCache {
     split_cache: Arc<SplitCache>,
     storage_root_uri: Uri,
+    split_id: Ulid,
+    num_bytes: u64,
 }
 
-impl SplitCacheBackingStorage {
+impl SplitScopedStorageCache {
     async fn get_impl(&self, path: &Path, byte_range: Range<usize>) -> Option<OwnedBytes> {
-        let split_id = split_id_from_path(path)?;
+        self.verify_cache_isnt_used_for_other_splits(path)?;
         let split_file: SplitFile = self
             .split_cache
-            .get_split_file(split_id, &self.storage_root_uri)
+            .get_split_file(self.split_id, &self.storage_root_uri, self.num_bytes)
             .await?;
         split_file.get_range(byte_range).await.ok()
     }
 
     async fn get_all_impl(&self, path: &Path) -> Option<OwnedBytes> {
-        let split_id = split_id_from_path(path)?;
+        self.verify_cache_isnt_used_for_other_splits(path)?;
         let split_file = self
             .split_cache
-            .get_split_file(split_id, &self.storage_root_uri)
+            .get_split_file(self.split_id, &self.storage_root_uri, self.num_bytes)
             .await?;
         split_file.get_all().await.ok()
     }
@@ -225,10 +249,19 @@ impl SplitCacheBackingStorage {
             split_metrics.misses_num_items.inc();
         }
     }
+
+    fn verify_cache_isnt_used_for_other_splits(&self, path: &Path) -> Option<()> {
+        debug_assert_eq!(split_id_from_path(path), Some(self.split_id));
+        if split_id_from_path(path) != Some(self.split_id) {
+            error!("split scoped cache used on an unexpected split, please report");
+            return None;
+        }
+        Some(())
+    }
 }
 
 #[async_trait]
-impl StorageCache for SplitCacheBackingStorage {
+impl StorageCache for SplitScopedStorageCache {
     async fn get(&self, path: &Path, byte_range: Range<usize>) -> Option<OwnedBytes> {
         let result = self.get_impl(path, byte_range).await;
         self.record_hit_metrics(result.as_ref());

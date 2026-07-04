@@ -107,6 +107,8 @@ message ReportSplit {
   string split_id = 2;
   // The storage uri. This URI does NOT include the split id.
   string storage_uri = 1;
+  // The size of the split file, in bytes.
+  uint64 num_bytes = 3;
 }
 
 message ReportSplitsRequest {
