@@ -51,10 +51,11 @@ impl<K: Hash + Eq + Clone + Display> TieredSizedCache<K> {
 
     /// Stores the given payload in both the memory tier and, if configured, the disk tier.
     pub async fn put(&self, key: K, bytes: OwnedBytes) {
+        // Populate L1 first so callers benefit immediately even if the disk tier is slow.
+        self.memory.put(key.clone(), bytes.clone());
         if let Some(disk) = &self.disk {
-            disk.put(key.clone(), bytes.clone()).await;
+            disk.put(key, bytes).await;
         }
-        self.memory.put(key, bytes);
     }
 }
 
@@ -92,7 +93,7 @@ mod tests {
             .await;
         assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
         // The payload must have been persisted on disk as well.
-        assert!(tmp_dir.path().join("a").exists());
+        assert!(tmp_dir.path().join("a").try_exists().unwrap());
     }
 
     #[tokio::test]

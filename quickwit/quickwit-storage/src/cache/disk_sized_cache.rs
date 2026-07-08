@@ -180,7 +180,12 @@ impl<K: Display> DiskSizedCache<K> {
                 // stale index entry and report a miss.
                 let mut index = self.index.lock().unwrap();
                 if let Some(num_bytes) = index.lru_cache.pop(&file_name) {
-                    index.drop_item(num_bytes);
+                    index.num_bytes -= num_bytes;
+                    index.cache_counters.in_cache_count.dec();
+                    index
+                        .cache_counters
+                        .in_cache_num_bytes
+                        .sub(num_bytes as i64);
                 }
                 index.cache_counters.misses_num_items.inc();
                 None
@@ -210,7 +215,7 @@ impl<K: Display> DiskSizedCache<K> {
                     warn!(
                         capacity_in_bytes = index.capacity_in_bytes,
                         len = num_bytes,
-                        "footer larger than the disk cache capacity, not caching it on disk"
+                        "payload larger than the disk cache capacity, not caching it on disk"
                     );
                 }
                 return;
@@ -290,7 +295,7 @@ mod tests {
             .await;
         assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
         // A file should have been written on disk.
-        assert!(tmp_dir.path().join("a").exists());
+        assert!(tmp_dir.path().join("a").try_exists().unwrap());
     }
 
     #[tokio::test]
@@ -332,7 +337,7 @@ mod tests {
         assert!(cache.get(&"b".to_string()).await.is_none());
         assert_eq!(cache.get(&"c".to_string()).await.unwrap(), &b"ccc"[..]);
         // The evicted entry's file must be gone.
-        assert!(!tmp_dir.path().join("b").exists());
+        assert!(!tmp_dir.path().join("b").try_exists().unwrap());
     }
 
     #[tokio::test]
@@ -343,7 +348,7 @@ mod tests {
             .put("big".to_string(), OwnedBytes::new(&b"toolarge"[..]))
             .await;
         assert!(cache.get(&"big".to_string()).await.is_none());
-        assert!(!tmp_dir.path().join("big").exists());
+        assert!(!tmp_dir.path().join("big").try_exists().unwrap());
     }
 
     #[tokio::test]
@@ -402,7 +407,7 @@ mod tests {
         let leftover = tmp_dir.path().join("a.tmp42");
         std::fs::write(&leftover, b"partial").unwrap();
         let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
-        assert!(!leftover.exists());
+        assert!(!leftover.try_exists().unwrap());
         assert!(cache.get(&"a".to_string()).await.is_none());
     }
 }
