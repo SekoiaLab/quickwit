@@ -274,6 +274,8 @@ pub struct SearcherConfig {
     pub aggregation_bucket_limit: u32,
     pub fast_field_cache_capacity: ByteSize,
     pub split_footer_cache_capacity: ByteSize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_footer_disk_cache_capacity: Option<ByteSize>,
     pub partial_request_cache_capacity: ByteSize,
     pub predicate_cache_capacity: ByteSize,
     pub max_num_concurrent_split_searches: usize,
@@ -333,6 +335,7 @@ impl Default for SearcherConfig {
         SearcherConfig {
             fast_field_cache_capacity: ByteSize::gb(1),
             split_footer_cache_capacity: ByteSize::mb(500),
+            split_footer_disk_cache_capacity: None,
             partial_request_cache_capacity: ByteSize::mb(64),
             predicate_cache_capacity: ByteSize::mb(256),
             max_num_concurrent_split_searches: 100,

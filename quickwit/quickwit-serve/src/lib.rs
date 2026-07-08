@@ -113,7 +113,7 @@ use quickwit_search::{
     SearchJobPlacer, SearchService, SearchServiceClient, SearcherContext, SearcherPool,
     create_search_client_from_channel, start_searcher_service,
 };
-use quickwit_storage::{SplitCache, StorageResolver};
+use quickwit_storage::{DiskSizedCache, SplitCache, StorageResolver};
 use tcp_listener::TcpListenerResolver;
 use tokio::sync::oneshot;
 use tonic_health::ServingStatus;
@@ -658,9 +658,30 @@ pub async fn serve_quickwit(
             None
         };
 
+    let split_footer_disk_cache_opt: Option<DiskSizedCache<String>> = if let Some(capacity) =
+        node_config.searcher_config.split_footer_disk_cache_capacity
+    {
+        match DiskSizedCache::open(
+            node_config
+                .data_dir_path
+                .join("searcher-split-footer-cache"),
+            capacity.as_u64(),
+            &quickwit_storage::STORAGE_METRICS.split_footer_disk_cache,
+        ) {
+            Ok(disk_cache) => Some(disk_cache),
+            Err(error) => {
+                error!(%error, "failed to open the persistent split footer cache, disabling it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let searcher_context = Arc::new(SearcherContext::new(
         node_config.searcher_config.clone(),
         split_cache_opt,
+        split_footer_disk_cache_opt,
     ));
 
     let (search_job_placer, search_service) = setup_searcher(
@@ -1581,7 +1602,8 @@ mod tests {
     #[tokio::test]
     async fn test_setup_searcher() {
         let node_config = NodeConfig::for_test();
-        let searcher_context = Arc::new(SearcherContext::new(SearcherConfig::default(), None));
+        let searcher_context =
+            Arc::new(SearcherContext::new(SearcherConfig::default(), None, None));
         let metastore = metastore_for_test();
         let (change_stream, change_stream_tx) = ClusterChangeStream::new_unbounded();
         let storage_resolver = StorageResolver::unconfigured();

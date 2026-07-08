@@ -207,8 +207,11 @@ mod tests {
         let search_job_placer = SearchJobPlacer::new(searcher_pool.clone());
         let cluster_client = ClusterClient::new(search_job_placer);
         let searcher_config = SearcherConfig::default();
-        let searcher_context =
-            Arc::new(quickwit_search::SearcherContext::new(searcher_config, None));
+        let searcher_context = Arc::new(quickwit_search::SearcherContext::new(
+            searcher_config,
+            None,
+            None,
+        ));
         let search_service: Arc<dyn SearchService> = Arc::new(SearchServiceImpl::new(
             sandbox.metastore(),
             sandbox.storage_resolver(),
