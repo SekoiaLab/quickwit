@@ -15,7 +15,7 @@
 use std::fmt::Display;
 use std::io;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -147,12 +147,12 @@ impl<K: Display> DiskSizedCache<K> {
             index: Mutex::new(index),
             _phantom: PhantomData,
         };
-        cache.remove_files(&victims);
+        remove_files(&cache.root_path, &victims);
         Ok(cache)
     }
 
     /// Returns the cached payload for the given key, if present on disk.
-    pub fn get(&self, key: &K) -> Option<OwnedBytes> {
+    pub async fn get(&self, key: &K) -> Option<OwnedBytes> {
         let file_name = key.to_string();
         {
             let mut index = self.index.lock().unwrap();
@@ -162,8 +162,11 @@ impl<K: Display> DiskSizedCache<K> {
                 return None;
             }
         }
-        match std::fs::read(self.root_path.join(&file_name)) {
-            Ok(buffer) => {
+        // Offload the blocking read so we don't stall the async runtime worker.
+        let path = self.root_path.join(&file_name);
+        let read_res = tokio::task::spawn_blocking(move || std::fs::read(path)).await;
+        match read_res {
+            Ok(Ok(buffer)) => {
                 let index = self.index.lock().unwrap();
                 index.cache_counters.hits_num_items.inc();
                 index
@@ -172,13 +175,20 @@ impl<K: Display> DiskSizedCache<K> {
                     .inc_by(buffer.len() as u64);
                 Some(OwnedBytes::new(buffer))
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 // The file vanished (e.g. concurrent eviction or manual deletion): drop the
                 // stale index entry and report a miss.
                 let mut index = self.index.lock().unwrap();
                 if let Some(num_bytes) = index.lru_cache.pop(&file_name) {
                     index.drop_item(num_bytes);
                 }
+                index.cache_counters.misses_num_items.inc();
+                None
+            }
+            Err(_join_error) => {
+                // The blocking read task failed unexpectedly. Keep the index entry (the file is
+                // likely still valid) and just report a miss.
+                let index = self.index.lock().unwrap();
                 index.cache_counters.misses_num_items.inc();
                 None
             }
@@ -190,7 +200,7 @@ impl<K: Display> DiskSizedCache<K> {
     /// This silently does nothing if the payload is larger than the whole cache capacity. If an
     /// entry already exists for the key, it is kept as-is (payloads are assumed immutable) and its
     /// recency is refreshed.
-    pub fn put(&self, key: K, bytes: OwnedBytes) {
+    pub async fn put(&self, key: K, bytes: OwnedBytes) {
         let num_bytes = bytes.len() as u64;
         let file_name = key.to_string();
         {
@@ -214,9 +224,19 @@ impl<K: Display> DiskSizedCache<K> {
         // We write the new file *before* evicting on purpose: if the write fails we return early
         // without having deleted any valid entry, and the write stays outside the index lock. The
         // tradeoff is that on-disk usage may transiently exceed the capacity by roughly one entry.
-        if let Err(error) = self.write_file(&file_name, &bytes) {
-            warn!(%error, file_name, "failed to persist entry to disk cache");
-            return;
+        // The blocking write is offloaded so we don't stall the async runtime worker.
+        let write_res = {
+            let root_path = self.root_path.clone();
+            let write_name = file_name.clone();
+            tokio::task::spawn_blocking(move || write_file(&root_path, &write_name, &bytes)).await
+        };
+        match write_res {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(%error, file_name, "failed to persist entry to disk cache");
+                return;
+            }
+            Err(_join_error) => return,
         }
 
         let victims = {
@@ -230,22 +250,23 @@ impl<K: Display> DiskSizedCache<K> {
             index.lru_cache.put(file_name, num_bytes);
             victims
         };
-        self.remove_files(&victims);
-    }
-
-    fn write_file(&self, file_name: &str, bytes: &[u8]) -> io::Result<()> {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = self
-            .root_path
-            .join(format!("{file_name}{TEMP_MARKER}{counter}"));
-        std::fs::write(&tmp_path, bytes)?;
-        std::fs::rename(&tmp_path, self.root_path.join(file_name))
-    }
-
-    fn remove_files(&self, file_names: &[String]) {
-        for file_name in file_names {
-            let _ = std::fs::remove_file(self.root_path.join(file_name));
+        if !victims.is_empty() {
+            let root_path = self.root_path.clone();
+            let _ = tokio::task::spawn_blocking(move || remove_files(&root_path, &victims)).await;
         }
+    }
+}
+
+fn write_file(root_path: &Path, file_name: &str, bytes: &[u8]) -> io::Result<()> {
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = root_path.join(format!("{file_name}{TEMP_MARKER}{counter}"));
+    std::fs::write(&tmp_path, bytes)?;
+    std::fs::rename(&tmp_path, root_path.join(file_name))
+}
+
+fn remove_files(root_path: &Path, file_names: &[String]) {
+    for file_name in file_names {
+        let _ = std::fs::remove_file(root_path.join(file_name));
     }
 }
 
@@ -258,104 +279,130 @@ mod tests {
         DiskSizedCache::open(root_path, capacity_in_bytes, &CACHE_METRICS_FOR_TESTS).unwrap()
     }
 
-    #[test]
-    fn test_put_get() {
+    #[tokio::test]
+    async fn test_put_get() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
-        assert!(cache.get(&"missing".to_string()).is_none());
+        assert!(cache.get(&"missing".to_string()).await.is_none());
 
-        cache.put("a".to_string(), OwnedBytes::new(&b"hello"[..]));
-        assert_eq!(cache.get(&"a".to_string()).unwrap(), &b"hello"[..]);
+        cache
+            .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
+            .await;
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
         // A file should have been written on disk.
         assert!(tmp_dir.path().join("a").exists());
     }
 
-    #[test]
-    fn test_persists_across_reopen() {
+    #[tokio::test]
+    async fn test_persists_across_reopen() {
         let tmp_dir = tempfile::tempdir().unwrap();
         {
             let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
-            cache.put("a".to_string(), OwnedBytes::new(&b"hello"[..]));
-            cache.put("b".to_string(), OwnedBytes::new(&b"world"[..]));
+            cache
+                .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
+                .await;
+            cache
+                .put("b".to_string(), OwnedBytes::new(&b"world"[..]))
+                .await;
         }
         // Re-opening the cache should recover the previously stored entries.
         let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
-        assert_eq!(cache.get(&"a".to_string()).unwrap(), &b"hello"[..]);
-        assert_eq!(cache.get(&"b".to_string()).unwrap(), &b"world"[..]);
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
+        assert_eq!(cache.get(&"b".to_string()).await.unwrap(), &b"world"[..]);
     }
 
-    #[test]
-    fn test_lru_eviction() {
+    #[tokio::test]
+    async fn test_lru_eviction() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let cache = open_cache(tmp_dir.path().to_path_buf(), 6);
-        cache.put("a".to_string(), OwnedBytes::new(&b"aaa"[..]));
-        cache.put("b".to_string(), OwnedBytes::new(&b"bbb"[..]));
+        cache
+            .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
+            .await;
+        cache
+            .put("b".to_string(), OwnedBytes::new(&b"bbb"[..]))
+            .await;
         // Access "a" so that "b" becomes the least recently used entry.
-        assert_eq!(cache.get(&"a".to_string()).unwrap(), &b"aaa"[..]);
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"aaa"[..]);
         // Inserting a third entry must evict "b".
-        cache.put("c".to_string(), OwnedBytes::new(&b"ccc"[..]));
+        cache
+            .put("c".to_string(), OwnedBytes::new(&b"ccc"[..]))
+            .await;
 
-        assert_eq!(cache.get(&"a".to_string()).unwrap(), &b"aaa"[..]);
-        assert!(cache.get(&"b".to_string()).is_none());
-        assert_eq!(cache.get(&"c".to_string()).unwrap(), &b"ccc"[..]);
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"aaa"[..]);
+        assert!(cache.get(&"b".to_string()).await.is_none());
+        assert_eq!(cache.get(&"c".to_string()).await.unwrap(), &b"ccc"[..]);
         // The evicted entry's file must be gone.
         assert!(!tmp_dir.path().join("b").exists());
     }
 
-    #[test]
-    fn test_payload_larger_than_capacity_is_ignored() {
+    #[tokio::test]
+    async fn test_payload_larger_than_capacity_is_ignored() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let cache = open_cache(tmp_dir.path().to_path_buf(), 3);
-        cache.put("big".to_string(), OwnedBytes::new(&b"toolarge"[..]));
-        assert!(cache.get(&"big".to_string()).is_none());
+        cache
+            .put("big".to_string(), OwnedBytes::new(&b"toolarge"[..]))
+            .await;
+        assert!(cache.get(&"big".to_string()).await.is_none());
         assert!(!tmp_dir.path().join("big").exists());
     }
 
-    #[test]
-    fn test_put_same_key_twice_keeps_single_entry() {
+    #[tokio::test]
+    async fn test_put_same_key_twice_keeps_single_entry() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let cache = open_cache(tmp_dir.path().to_path_buf(), 6);
-        cache.put("a".to_string(), OwnedBytes::new(&b"aaa"[..]));
+        cache
+            .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
+            .await;
         // Immutable payload: putting the same key again is a no-op and must not evict others.
-        cache.put("a".to_string(), OwnedBytes::new(&b"aaa"[..]));
-        cache.put("b".to_string(), OwnedBytes::new(&b"bbb"[..]));
-        assert_eq!(cache.get(&"a".to_string()).unwrap(), &b"aaa"[..]);
-        assert_eq!(cache.get(&"b".to_string()).unwrap(), &b"bbb"[..]);
+        cache
+            .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
+            .await;
+        cache
+            .put("b".to_string(), OwnedBytes::new(&b"bbb"[..]))
+            .await;
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"aaa"[..]);
+        assert_eq!(cache.get(&"b".to_string()).await.unwrap(), &b"bbb"[..]);
     }
 
-    #[test]
-    fn test_get_after_manual_file_deletion() {
+    #[tokio::test]
+    async fn test_get_after_manual_file_deletion() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
-        cache.put("a".to_string(), OwnedBytes::new(&b"hello"[..]));
+        cache
+            .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
+            .await;
         std::fs::remove_file(tmp_dir.path().join("a")).unwrap();
         // The stale entry should be detected and reported as a miss.
-        assert!(cache.get(&"a".to_string()).is_none());
+        assert!(cache.get(&"a".to_string()).await.is_none());
     }
 
-    #[test]
-    fn test_open_evicts_when_over_capacity() {
+    #[tokio::test]
+    async fn test_open_evicts_when_over_capacity() {
         let tmp_dir = tempfile::tempdir().unwrap();
         {
             let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
-            cache.put("a".to_string(), OwnedBytes::new(&b"aaa"[..]));
-            cache.put("b".to_string(), OwnedBytes::new(&b"bbb"[..]));
+            cache
+                .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
+                .await;
+            cache
+                .put("b".to_string(), OwnedBytes::new(&b"bbb"[..]))
+                .await;
         }
         // Re-open with a capacity that can only hold one of the two entries.
         let cache = open_cache(tmp_dir.path().to_path_buf(), 3);
-        let a = cache.get(&"a".to_string());
-        let b = cache.get(&"b".to_string());
+        let a = cache.get(&"a".to_string()).await;
+        let b = cache.get(&"b".to_string()).await;
         // Exactly one entry should have survived.
         assert_ne!(a.is_some(), b.is_some());
     }
 
-    #[test]
-    fn test_open_cleans_up_temp_files() {
+    #[tokio::test]
+    async fn test_open_cleans_up_temp_files() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let leftover = tmp_dir.path().join("a.tmp42");
         std::fs::write(&leftover, b"partial").unwrap();
         let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
         assert!(!leftover.exists());
-        assert!(cache.get(&"a".to_string()).is_none());
+        assert!(cache.get(&"a".to_string()).await.is_none());
     }
 }

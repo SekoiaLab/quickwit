@@ -38,20 +38,21 @@ impl<K: Hash + Eq + Clone + Display> TieredSizedCache<K> {
 
     /// Returns the cached payload for the given key, checking memory first, then disk.
     ///
-    /// A disk hit is promoted into the memory tier before being returned.
-    pub fn get(&self, key: &K) -> Option<OwnedBytes> {
+    /// A disk hit is promoted into the memory tier before being returned. Only the disk tier
+    /// performs (off-thread) I/O, so an in-memory hit stays fully synchronous and cheap.
+    pub async fn get(&self, key: &K) -> Option<OwnedBytes> {
         if let Some(bytes) = self.memory.get(key) {
             return Some(bytes);
         }
-        let bytes = self.disk.as_ref()?.get(key)?;
+        let bytes = self.disk.as_ref()?.get(key).await?;
         self.memory.put(key.clone(), bytes.clone());
         Some(bytes)
     }
 
     /// Stores the given payload in both the memory tier and, if configured, the disk tier.
-    pub fn put(&self, key: K, bytes: OwnedBytes) {
+    pub async fn put(&self, key: K, bytes: OwnedBytes) {
         if let Some(disk) = &self.disk {
-            disk.put(key.clone(), bytes.clone());
+            disk.put(key.clone(), bytes.clone()).await;
         }
         self.memory.put(key, bytes);
     }
@@ -66,16 +67,18 @@ mod tests {
         MemorySizedCache::with_capacity_in_bytes(1_000, &CACHE_METRICS_FOR_TESTS)
     }
 
-    #[test]
-    fn test_memory_only() {
+    #[tokio::test]
+    async fn test_memory_only() {
         let cache = TieredSizedCache::new(memory_cache(), None);
-        assert!(cache.get(&"a".to_string()).is_none());
-        cache.put("a".to_string(), OwnedBytes::new(&b"hello"[..]));
-        assert_eq!(cache.get(&"a".to_string()).unwrap(), &b"hello"[..]);
+        assert!(cache.get(&"a".to_string()).await.is_none());
+        cache
+            .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
+            .await;
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
     }
 
-    #[test]
-    fn test_put_writes_to_both_tiers() {
+    #[tokio::test]
+    async fn test_put_writes_to_both_tiers() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let disk = DiskSizedCache::open(
             tmp_dir.path().to_path_buf(),
@@ -84,14 +87,16 @@ mod tests {
         )
         .unwrap();
         let cache = TieredSizedCache::new(memory_cache(), Some(disk));
-        cache.put("a".to_string(), OwnedBytes::new(&b"hello"[..]));
-        assert_eq!(cache.get(&"a".to_string()).unwrap(), &b"hello"[..]);
+        cache
+            .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
+            .await;
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
         // The payload must have been persisted on disk as well.
         assert!(tmp_dir.path().join("a").exists());
     }
 
-    #[test]
-    fn test_disk_hit_is_promoted_to_memory() {
+    #[tokio::test]
+    async fn test_disk_hit_is_promoted_to_memory() {
         let tmp_dir = tempfile::tempdir().unwrap();
         {
             let disk = DiskSizedCache::open(
@@ -101,7 +106,9 @@ mod tests {
             )
             .unwrap();
             let cache = TieredSizedCache::new(memory_cache(), Some(disk));
-            cache.put("a".to_string(), OwnedBytes::new(&b"hello"[..]));
+            cache
+                .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
+                .await;
         }
         // Simulate a fresh process: only the disk tier still holds the data.
         let disk = DiskSizedCache::open(
@@ -113,9 +120,9 @@ mod tests {
         let memory = memory_cache();
         let cache = TieredSizedCache::new(memory, Some(disk));
 
-        assert_eq!(cache.get(&"a".to_string()).unwrap(), &b"hello"[..]);
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
         // After a disk hit, deleting the file must not lose the value: it lives in memory now.
         std::fs::remove_file(tmp_dir.path().join("a")).unwrap();
-        assert_eq!(cache.get(&"a".to_string()).unwrap(), &b"hello"[..]);
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
     }
 }

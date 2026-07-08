@@ -63,7 +63,7 @@ async fn get_split_footer_from_cache_or_fetch(
     footer_cache: &TieredSizedCache<String>,
 ) -> anyhow::Result<OwnedBytes> {
     {
-        let possible_val = footer_cache.get(&split_and_footer_offsets.split_id);
+        let possible_val = footer_cache.get(&split_and_footer_offsets.split_id).await;
         if let Some(footer_data) = possible_val {
             return Ok(footer_data);
         }
@@ -84,10 +84,12 @@ async fn get_split_footer_from_cache_or_fetch(
             )
         })?;
 
-    footer_cache.put(
-        split_and_footer_offsets.split_id.to_owned(),
-        footer_data_opt.clone(),
-    );
+    footer_cache
+        .put(
+            split_and_footer_offsets.split_id.to_owned(),
+            footer_data_opt.clone(),
+        )
+        .await;
 
     Ok(footer_data_opt)
 }
