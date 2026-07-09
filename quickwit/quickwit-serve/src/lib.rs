@@ -667,7 +667,9 @@ pub async fn serve_quickwit(
                 .join("searcher-split-footer-cache"),
             capacity.as_u64(),
             &quickwit_storage::STORAGE_METRICS.split_footer_disk_cache,
-        ) {
+        )
+        .await
+        {
             Ok(disk_cache) => Some(disk_cache),
             Err(error) => {
                 error!(%error, "failed to open the persistent split footer cache, disabling it");

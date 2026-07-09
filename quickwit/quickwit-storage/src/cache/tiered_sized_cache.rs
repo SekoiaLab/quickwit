@@ -86,6 +86,7 @@ mod tests {
             1_000,
             &CACHE_METRICS_FOR_TESTS,
         )
+        .await
         .unwrap();
         let cache = TieredSizedCache::new(memory_cache(), Some(disk));
         cache
@@ -105,6 +106,7 @@ mod tests {
                 1_000,
                 &CACHE_METRICS_FOR_TESTS,
             )
+            .await
             .unwrap();
             let cache = TieredSizedCache::new(memory_cache(), Some(disk));
             cache
@@ -117,6 +119,7 @@ mod tests {
             1_000,
             &CACHE_METRICS_FOR_TESTS,
         )
+        .await
         .unwrap();
         let memory = memory_cache();
         let cache = TieredSizedCache::new(memory, Some(disk));

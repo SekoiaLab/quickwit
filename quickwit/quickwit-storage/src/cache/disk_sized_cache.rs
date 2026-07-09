@@ -99,7 +99,22 @@ pub struct DiskSizedCache<K = String> {
 
 impl<K: Display> DiskSizedCache<K> {
     /// Opens a disk cache rooted at `root_path`.
-    pub fn open(
+    pub async fn open(
+        root_path: PathBuf,
+        capacity_in_bytes: u64,
+        cache_counters: &'static CacheMetrics,
+    ) -> io::Result<Self>
+    where
+        K: 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            Self::open_blocking(root_path, capacity_in_bytes, cache_counters)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    fn open_blocking(
         root_path: PathBuf,
         capacity_in_bytes: u64,
         cache_counters: &'static CacheMetrics,
@@ -109,11 +124,9 @@ impl<K: Display> DiskSizedCache<K> {
         let mut entries: Vec<(String, u64, SystemTime)> = Vec::new();
         for dir_entry_res in std::fs::read_dir(&root_path)? {
             let dir_entry = dir_entry_res?;
-            let metadata = match dir_entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            if !metadata.is_file() {
+            if let Ok(file_type) = dir_entry.file_type()
+                && !file_type.is_file()
+            {
                 continue;
             }
             let file_name = match dir_entry.file_name().into_string() {
@@ -123,6 +136,13 @@ impl<K: Display> DiskSizedCache<K> {
             if file_name.contains(TEMP_MARKER) {
                 // Leftover temporary file from an interrupted write: clean it up.
                 let _ = std::fs::remove_file(dir_entry.path());
+                continue;
+            }
+            let metadata = match dir_entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if !metadata.is_file() {
                 continue;
             }
             let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -280,14 +300,16 @@ mod tests {
     use super::*;
     use crate::metrics::CACHE_METRICS_FOR_TESTS;
 
-    fn open_cache(root_path: PathBuf, capacity_in_bytes: u64) -> DiskSizedCache<String> {
-        DiskSizedCache::open(root_path, capacity_in_bytes, &CACHE_METRICS_FOR_TESTS).unwrap()
+    async fn open_cache(root_path: PathBuf, capacity_in_bytes: u64) -> DiskSizedCache<String> {
+        DiskSizedCache::open(root_path, capacity_in_bytes, &CACHE_METRICS_FOR_TESTS)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn test_put_get() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000).await;
         assert!(cache.get(&"missing".to_string()).await.is_none());
 
         cache
@@ -302,7 +324,7 @@ mod tests {
     async fn test_persists_across_reopen() {
         let tmp_dir = tempfile::tempdir().unwrap();
         {
-            let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
+            let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000).await;
             cache
                 .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
                 .await;
@@ -311,7 +333,7 @@ mod tests {
                 .await;
         }
         // Re-opening the cache should recover the previously stored entries.
-        let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000).await;
         assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
         assert_eq!(cache.get(&"b".to_string()).await.unwrap(), &b"world"[..]);
     }
@@ -319,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn test_lru_eviction() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let cache = open_cache(tmp_dir.path().to_path_buf(), 6);
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 6).await;
         cache
             .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
             .await;
@@ -343,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn test_payload_larger_than_capacity_is_ignored() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let cache = open_cache(tmp_dir.path().to_path_buf(), 3);
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 3).await;
         cache
             .put("big".to_string(), OwnedBytes::new(&b"toolarge"[..]))
             .await;
@@ -354,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_same_key_twice_keeps_single_entry() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let cache = open_cache(tmp_dir.path().to_path_buf(), 6);
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 6).await;
         cache
             .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
             .await;
@@ -372,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_after_manual_file_deletion() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000).await;
         cache
             .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
             .await;
@@ -385,7 +407,7 @@ mod tests {
     async fn test_open_evicts_when_over_capacity() {
         let tmp_dir = tempfile::tempdir().unwrap();
         {
-            let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
+            let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000).await;
             cache
                 .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
                 .await;
@@ -394,7 +416,7 @@ mod tests {
                 .await;
         }
         // Re-open with a capacity that can only hold one of the two entries.
-        let cache = open_cache(tmp_dir.path().to_path_buf(), 3);
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 3).await;
         let a = cache.get(&"a".to_string()).await;
         let b = cache.get(&"b".to_string()).await;
         // Exactly one entry should have survived.
@@ -406,7 +428,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let leftover = tmp_dir.path().join("a.tmp42");
         std::fs::write(&leftover, b"partial").unwrap();
-        let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000);
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000).await;
         assert!(!leftover.try_exists().unwrap());
         assert!(cache.get(&"a".to_string()).await.is_none());
     }
