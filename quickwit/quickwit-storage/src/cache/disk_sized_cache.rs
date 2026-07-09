@@ -31,9 +31,6 @@ use crate::metrics::CacheMetrics;
 /// Substring used to mark files that are being written.
 const TEMP_MARKER: &str = ".tmp";
 
-/// Number of shard sub-directories files are spread across.
-const NUM_SHARDS: u64 = 256;
-
 /// Global counter used to build unique temporary file names.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -135,32 +132,31 @@ impl<K: Display> DiskSizedCache<K> {
                 Ok(file_type) if file_type.is_dir() => {}
                 _ => continue,
             }
-            let shard_dir_iter = match std::fs::read_dir(shard_entry.path()) {
-                Ok(shard_dir_iter) => shard_dir_iter,
-                Err(_) => continue,
+            let Ok(shard_dir_iter) = std::fs::read_dir(shard_entry.path()) else {
+                continue;
             };
+
             for dir_entry_res in shard_dir_iter {
-                let dir_entry = match dir_entry_res {
-                    Ok(dir_entry) => dir_entry,
-                    Err(_) => continue,
+                let Ok(dir_entry) = dir_entry_res else {
+                    continue;
                 };
+
                 if let Ok(file_type) = dir_entry.file_type()
                     && !file_type.is_file()
                 {
                     continue;
                 }
-                let file_name = match dir_entry.file_name().into_string() {
-                    Ok(file_name) => file_name,
-                    Err(_) => continue,
+                let Ok(file_name) = dir_entry.file_name().into_string() else {
+                    continue;
                 };
+
                 if file_name.contains(TEMP_MARKER) {
                     // Leftover temporary file from an interrupted write: clean it up.
                     let _ = std::fs::remove_file(dir_entry.path());
                     continue;
                 }
-                let metadata = match dir_entry.metadata() {
-                    Ok(metadata) => metadata,
-                    Err(_) => continue,
+                let Ok(metadata) = dir_entry.metadata() else {
+                    continue;
                 };
                 if !metadata.is_file() {
                     continue;
@@ -316,6 +312,9 @@ impl<K: Display> DiskSizedCache<K> {
 
 /// Returns the shard sub-directory name a file belongs to.
 fn shard_dir(file_name: &str) -> String {
+    // Number of shard sub-directories files are spread across.
+    const NUM_SHARDS: u64 = 256;
+
     let mut hasher = FnvHasher::default();
     hasher.write(file_name.as_bytes());
     format!("{:02x}", hasher.finish() % NUM_SHARDS)
@@ -329,6 +328,7 @@ pub(crate) fn path_for(root_path: &Path, file_name: &str) -> PathBuf {
 fn write_file(root_path: &Path, file_name: &str, bytes: &[u8]) -> io::Result<()> {
     let shard_path = root_path.join(shard_dir(file_name));
     std::fs::create_dir_all(&shard_path)?;
+    // Rely on a counter to guarantee uniqueness of the temporary file name.
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_path = shard_path.join(format!("{file_name}{TEMP_MARKER}{counter}"));
     std::fs::write(&tmp_path, bytes)?;
