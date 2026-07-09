@@ -13,21 +13,26 @@
 // limitations under the License.
 
 use std::fmt::Display;
+use std::hash::Hasher;
 use std::io;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
+use fnv::FnvHasher;
 use lru::LruCache;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::OwnedBytes;
 use crate::metrics::CacheMetrics;
 
 /// Substring used to mark files that are being written.
 const TEMP_MARKER: &str = ".tmp";
+
+/// Number of shard sub-directories files are spread across.
+const NUM_SHARDS: u64 = 256;
 
 /// Global counter used to build unique temporary file names.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -119,34 +124,50 @@ impl<K: Display> DiskSizedCache<K> {
         capacity_in_bytes: u64,
         cache_counters: &'static CacheMetrics,
     ) -> io::Result<Self> {
+        let start = Instant::now();
         std::fs::create_dir_all(&root_path)?;
 
         let mut entries: Vec<(String, u64, SystemTime)> = Vec::new();
-        for dir_entry_res in std::fs::read_dir(&root_path)? {
-            let dir_entry = dir_entry_res?;
-            if let Ok(file_type) = dir_entry.file_type()
-                && !file_type.is_file()
-            {
-                continue;
+        for shard_entry_res in std::fs::read_dir(&root_path)? {
+            let shard_entry = shard_entry_res?;
+            // Entries live inside shard sub-directories; only recurse into those.
+            match shard_entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => {}
+                _ => continue,
             }
-            let file_name = match dir_entry.file_name().into_string() {
-                Ok(file_name) => file_name,
+            let shard_dir_iter = match std::fs::read_dir(shard_entry.path()) {
+                Ok(shard_dir_iter) => shard_dir_iter,
                 Err(_) => continue,
             };
-            if file_name.contains(TEMP_MARKER) {
-                // Leftover temporary file from an interrupted write: clean it up.
-                let _ = std::fs::remove_file(dir_entry.path());
-                continue;
+            for dir_entry_res in shard_dir_iter {
+                let dir_entry = match dir_entry_res {
+                    Ok(dir_entry) => dir_entry,
+                    Err(_) => continue,
+                };
+                if let Ok(file_type) = dir_entry.file_type()
+                    && !file_type.is_file()
+                {
+                    continue;
+                }
+                let file_name = match dir_entry.file_name().into_string() {
+                    Ok(file_name) => file_name,
+                    Err(_) => continue,
+                };
+                if file_name.contains(TEMP_MARKER) {
+                    // Leftover temporary file from an interrupted write: clean it up.
+                    let _ = std::fs::remove_file(dir_entry.path());
+                    continue;
+                }
+                let metadata = match dir_entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                if !metadata.is_file() {
+                    continue;
+                }
+                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                entries.push((file_name, metadata.len(), modified));
             }
-            let metadata = match dir_entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            entries.push((file_name, metadata.len(), modified));
         }
         entries.sort_by_key(|(_, _, modified)| *modified);
 
@@ -168,6 +189,17 @@ impl<K: Display> DiskSizedCache<K> {
             _phantom: PhantomData,
         };
         remove_files(&cache.root_path, &victims);
+        let num_entries = {
+            let index = cache.index.lock().unwrap();
+            index.lru_cache.len()
+        };
+        info!(
+            root_path = %cache.root_path.display(),
+            num_entries,
+            num_evicted = victims.len(),
+            elapsed_millis = start.elapsed().as_millis(),
+            "opened disk cache"
+        );
         Ok(cache)
     }
 
@@ -183,7 +215,7 @@ impl<K: Display> DiskSizedCache<K> {
             }
         }
         // Offload the blocking read so we don't stall the async runtime worker.
-        let path = self.root_path.join(&file_name);
+        let path = path_for(&self.root_path, &file_name);
         let read_res = tokio::task::spawn_blocking(move || std::fs::read(path)).await;
         match read_res {
             Ok(Ok(buffer)) => {
@@ -282,16 +314,30 @@ impl<K: Display> DiskSizedCache<K> {
     }
 }
 
+/// Returns the shard sub-directory name a file belongs to.
+fn shard_dir(file_name: &str) -> String {
+    let mut hasher = FnvHasher::default();
+    hasher.write(file_name.as_bytes());
+    format!("{:02x}", hasher.finish() % NUM_SHARDS)
+}
+
+/// Returns the full on-disk path of an entry, including its shard sub-directory.
+pub(crate) fn path_for(root_path: &Path, file_name: &str) -> PathBuf {
+    root_path.join(shard_dir(file_name)).join(file_name)
+}
+
 fn write_file(root_path: &Path, file_name: &str, bytes: &[u8]) -> io::Result<()> {
+    let shard_path = root_path.join(shard_dir(file_name));
+    std::fs::create_dir_all(&shard_path)?;
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = root_path.join(format!("{file_name}{TEMP_MARKER}{counter}"));
+    let tmp_path = shard_path.join(format!("{file_name}{TEMP_MARKER}{counter}"));
     std::fs::write(&tmp_path, bytes)?;
-    std::fs::rename(&tmp_path, root_path.join(file_name))
+    std::fs::rename(&tmp_path, shard_path.join(file_name))
 }
 
 fn remove_files(root_path: &Path, file_names: &[String]) {
     for file_name in file_names {
-        let _ = std::fs::remove_file(root_path.join(file_name));
+        let _ = std::fs::remove_file(path_for(root_path, file_name));
     }
 }
 
@@ -316,8 +362,8 @@ mod tests {
             .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
             .await;
         assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
-        // A file should have been written on disk.
-        assert!(tmp_dir.path().join("a").try_exists().unwrap());
+        // A file should have been written on disk, inside its shard sub-directory.
+        assert!(path_for(tmp_dir.path(), "a").try_exists().unwrap());
     }
 
     #[tokio::test]
@@ -359,7 +405,7 @@ mod tests {
         assert!(cache.get(&"b".to_string()).await.is_none());
         assert_eq!(cache.get(&"c".to_string()).await.unwrap(), &b"ccc"[..]);
         // The evicted entry's file must be gone.
-        assert!(!tmp_dir.path().join("b").try_exists().unwrap());
+        assert!(!path_for(tmp_dir.path(), "b").try_exists().unwrap());
     }
 
     #[tokio::test]
@@ -370,7 +416,7 @@ mod tests {
             .put("big".to_string(), OwnedBytes::new(&b"toolarge"[..]))
             .await;
         assert!(cache.get(&"big".to_string()).await.is_none());
-        assert!(!tmp_dir.path().join("big").try_exists().unwrap());
+        assert!(!path_for(tmp_dir.path(), "big").try_exists().unwrap());
     }
 
     #[tokio::test]
@@ -398,7 +444,7 @@ mod tests {
         cache
             .put("a".to_string(), OwnedBytes::new(&b"hello"[..]))
             .await;
-        std::fs::remove_file(tmp_dir.path().join("a")).unwrap();
+        std::fs::remove_file(path_for(tmp_dir.path(), "a")).unwrap();
         // The stale entry should be detected and reported as a miss.
         assert!(cache.get(&"a".to_string()).await.is_none());
     }
@@ -426,10 +472,45 @@ mod tests {
     #[tokio::test]
     async fn test_open_cleans_up_temp_files() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let leftover = tmp_dir.path().join("a.tmp42");
+        // A leftover temp file lives inside the shard directory of the entry it belongs to.
+        let shard_path = tmp_dir.path().join(shard_dir("a"));
+        std::fs::create_dir_all(&shard_path).unwrap();
+        let leftover = shard_path.join("a.tmp42");
         std::fs::write(&leftover, b"partial").unwrap();
         let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000).await;
         assert!(!leftover.try_exists().unwrap());
         assert!(cache.get(&"a".to_string()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_entries_are_sharded_and_survive_reopen() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 100_000).await;
+        // Insert enough entries that at least two distinct shard directories get used.
+        for i in 0..64 {
+            let key = format!("key-{i}");
+            cache.put(key, OwnedBytes::new(&b"payload"[..])).await;
+        }
+        // Files must be nested under shard sub-directories, not directly in the root.
+        let mut shard_dirs = 0;
+        for entry in std::fs::read_dir(tmp_dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            assert!(
+                entry.file_type().unwrap().is_dir(),
+                "root should only contain shard directories"
+            );
+            shard_dirs += 1;
+        }
+        assert!(
+            shard_dirs > 1,
+            "entries should be spread over several shards"
+        );
+
+        // Every entry is still retrievable, including after a reopen (which walks the shards).
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 100_000).await;
+        for i in 0..64 {
+            let key = format!("key-{i}");
+            assert_eq!(cache.get(&key).await.unwrap(), &b"payload"[..]);
+        }
     }
 }

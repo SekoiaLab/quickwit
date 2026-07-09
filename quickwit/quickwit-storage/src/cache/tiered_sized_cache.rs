@@ -62,6 +62,7 @@ impl<K: Hash + Eq + Clone + Display> TieredSizedCache<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::disk_sized_cache::path_for;
     use crate::metrics::CACHE_METRICS_FOR_TESTS;
 
     fn memory_cache() -> MemorySizedCache<String> {
@@ -94,7 +95,7 @@ mod tests {
             .await;
         assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
         // The payload must have been persisted on disk as well.
-        assert!(tmp_dir.path().join("a").try_exists().unwrap());
+        assert!(path_for(tmp_dir.path(), "a").try_exists().unwrap());
     }
 
     #[tokio::test]
@@ -126,7 +127,7 @@ mod tests {
 
         assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
         // After a disk hit, deleting the file must not lose the value: it lives in memory now.
-        std::fs::remove_file(tmp_dir.path().join("a")).unwrap();
+        std::fs::remove_file(path_for(tmp_dir.path(), "a")).unwrap();
         assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
     }
 }
