@@ -28,6 +28,7 @@ pub struct StorageMetrics {
     pub fd_cache_metrics: CacheMetrics,
     pub fast_field_cache: CacheMetrics,
     pub split_footer_cache: CacheMetrics,
+    pub split_footer_disk_cache: CacheMetrics,
     pub searcher_split_cache: CacheMetrics,
     pub get_slice_timeout_successes: [IntCounter; 3],
     pub get_slice_timeout_all_timeouts: IntCounter,
@@ -66,6 +67,7 @@ impl Default for StorageMetrics {
             searcher_split_cache: CacheMetrics::for_component("searcher_split"),
             shortlived_cache: CacheMetrics::for_component("shortlived"),
             split_footer_cache: CacheMetrics::for_component("splitfooter"),
+            split_footer_disk_cache: CacheMetrics::for_component("splitfooter_disk"),
             get_slice_timeout_successes,
             get_slice_timeout_all_timeouts,
             object_storage_requests_total: new_counter_vec(

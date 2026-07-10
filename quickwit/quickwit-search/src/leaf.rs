@@ -35,8 +35,8 @@ use quickwit_query::query_ast::{
 };
 use quickwit_query::tokenizers::TokenizerManager;
 use quickwit_storage::{
-    BundleStorage, ByteRangeCache, MemorySizedCache, OwnedBytes, SplitCache, Storage,
-    StorageResolver, TimeoutAndRetryStorage, wrap_storage_with_cache,
+    BundleStorage, ByteRangeCache, OwnedBytes, SplitCache, Storage, StorageResolver,
+    TieredSizedCache, TimeoutAndRetryStorage, wrap_storage_with_cache,
 };
 use tantivy::aggregation::agg_req::{AggregationVariants, Aggregations};
 use tantivy::aggregation::{AggContextParams, AggregationLimitsGuard};
@@ -60,10 +60,10 @@ use crate::{QuickwitAggregations, SearchError};
 async fn get_split_footer_from_cache_or_fetch(
     index_storage: Arc<dyn Storage>,
     split_and_footer_offsets: &SplitIdAndFooterOffsets,
-    footer_cache: &MemorySizedCache<String>,
+    footer_cache: &TieredSizedCache<String>,
 ) -> anyhow::Result<OwnedBytes> {
     {
-        let possible_val = footer_cache.get(&split_and_footer_offsets.split_id);
+        let possible_val = footer_cache.get(&split_and_footer_offsets.split_id).await;
         if let Some(footer_data) = possible_val {
             return Ok(footer_data);
         }
@@ -84,10 +84,12 @@ async fn get_split_footer_from_cache_or_fetch(
             )
         })?;
 
-    footer_cache.put(
-        split_and_footer_offsets.split_id.to_owned(),
-        footer_data_opt.clone(),
-    );
+    footer_cache
+        .put(
+            split_and_footer_offsets.split_id.to_owned(),
+            footer_data_opt.clone(),
+        )
+        .await;
 
     Ok(footer_data_opt)
 }
