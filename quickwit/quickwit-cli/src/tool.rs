@@ -216,7 +216,8 @@ pub fn build_tool_command() -> Command {
                         .display_order(6)
                         .required(false),
                     arg!(--"split-timestamp-days-range" <SPLIT_TIMESTAMP_DAYS_RANGE>
-                        "Group splits that span this many days together (0 = single-day, default: 0).")
+                        "Group splits that span this many days together. If unset (default), merges \
+                         are attempted successively for 0, 1, and 2 day spans.")
                         .display_order(7)
                         .required(false),
                     arg!(--"index-parallelism" <INDEX_PARALLELISM>
@@ -512,7 +513,7 @@ impl ToolCliCommand {
             .remove_one::<String>("split-timestamp-days-range")
             .map(|s| s.parse::<u8>())
             .transpose()?
-            .unwrap_or(defaults.split_timestamp_days_range);
+            .or(defaults.split_timestamp_days_range);
         let index_parallelism = matches
             .remove_one::<String>("index-parallelism")
             .map(|s| s.parse::<usize>())

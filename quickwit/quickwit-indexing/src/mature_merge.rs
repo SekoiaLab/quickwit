@@ -55,8 +55,9 @@ pub struct MatureMergeConfig {
     pub max_merge_group_size: usize,
     /// Maximum total number of documents per merge operation.
     pub split_target_num_docs: usize,
-    /// Focus on splits that span this many days.
-    pub split_timestamp_days_range: u8,
+    /// Focus on splits that span this many days. If `None`, merges are
+    /// attempted successively for 0, 1, and 2 days spans.
+    pub split_timestamp_days_range: Option<u8>,
     /// Number of indexes processed concurrently. Lower to avoid fetching splits
     /// metadata too eagerly.
     pub index_parallelism: usize,
@@ -76,7 +77,7 @@ impl Default for MatureMergeConfig {
             input_split_max_num_docs: 10_000,
             max_merge_group_size: 100,
             split_target_num_docs: 5_000_000,
-            split_timestamp_days_range: 0, // by default single day splits
+            split_timestamp_days_range: None,
             index_parallelism: 50,
             max_concurrent_merges: 10,
             dry_run: false,
@@ -97,6 +98,14 @@ struct IndexMergeSummary {
     num_input_splits: usize,
     total_input_bytes: u64,
     outcome: IndexMergeOutcome,
+}
+
+/// Values of `split_timestamp_days_range` to attempt, in order.
+fn days_range_candidates(config: &MatureMergeConfig) -> Vec<u8> {
+    match config.split_timestamp_days_range {
+        Some(days_range) => vec![days_range],
+        None => vec![0, 1, 2],
+    }
 }
 
 /// Fetches all published splits for the given index from the metastore (no
@@ -139,6 +148,7 @@ async fn fetch_splits_and_plan(
         index_id = %index_metadata.index_config.index_id,
         total_splits,
         num_planned_merges = operations.len(),
+        days_range = config.split_timestamp_days_range.unwrap_or_default(),
         "fetched splits for mature merge planning"
     );
     Ok(operations)
@@ -301,10 +311,14 @@ async fn run_mature_merges_for_index(
     })
 }
 
-/// Plans and optionally executes mature merges for a single index
+/// Plans and, unless `config.dry_run` is set, executes mature merges for a
+/// single index.
+///
+/// The day span must be configured in `config.split_timestamp_days_range`
+/// (`None` panics).
 #[allow(clippy::too_many_arguments)]
 async fn merge_mature_single_index(
-    index_metadata: IndexMetadata,
+    index_metadata: &IndexMetadata,
     metastore: &MetastoreServiceClient,
     storage_resolver: &StorageResolver,
     semaphore: Arc<Semaphore>,
@@ -353,7 +367,7 @@ async fn merge_mature_single_index(
         IndexingSplitStore::new(remote_storage, Arc::new(IndexingSplitCache::no_caching()));
 
     let outcome = run_mature_merges_for_index(
-        &index_metadata,
+        index_metadata,
         operations,
         metastore.clone(),
         split_store,
@@ -513,7 +527,6 @@ pub async fn merge_mature_all_indexes(
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_merges));
     let metastore_ref = &metastore;
     let storage_resolver_ref = &storage_resolver;
-    let config_ref = &config;
 
     if indexes_metadata
         .iter()
@@ -524,30 +537,37 @@ pub async fn merge_mature_all_indexes(
         bail!("tags not supported in mature merges");
     }
 
-    let results: Vec<anyhow::Result<IndexMergeSummary>> = futures::stream::iter(indexes_metadata)
-        .map(|index_metadata| {
-            let node_id = node_id.clone();
-            let semaphore = Arc::clone(&semaphore);
-            async move {
-                let now = OffsetDateTime::now_utc();
-                merge_mature_single_index(
-                    index_metadata,
-                    metastore_ref,
-                    storage_resolver_ref,
-                    semaphore,
-                    data_dir_path,
-                    config_ref,
-                    node_id,
-                    now,
-                )
-                .await
-            }
-        })
-        .buffer_unordered(config.index_parallelism)
-        .collect()
-        .await;
+    for days_range in days_range_candidates(&config) {
+        let config_ref = &MatureMergeConfig {
+            split_timestamp_days_range: Some(days_range),
+            ..config.clone()
+        };
+        let results: Vec<anyhow::Result<IndexMergeSummary>> =
+            futures::stream::iter(indexes_metadata.clone())
+                .map(|index_metadata| {
+                    let node_id = node_id.clone();
+                    let semaphore = Arc::clone(&semaphore);
+                    async move {
+                        let now = OffsetDateTime::now_utc();
+                        merge_mature_single_index(
+                            &index_metadata,
+                            metastore_ref,
+                            storage_resolver_ref,
+                            semaphore,
+                            data_dir_path,
+                            config_ref,
+                            node_id,
+                            now,
+                        )
+                        .await
+                    }
+                })
+                .buffer_unordered(config.index_parallelism)
+                .collect()
+                .await;
 
-    log_merge_results(results, config.dry_run);
+        log_merge_results(results, config.dry_run);
+    }
     Ok(())
 }
 
@@ -808,14 +828,16 @@ mod tests {
         // Splits have the default 48h maturation period. Pass a `now` far enough in the future
         // so all splits (both v1 and v2) are mature at `now - MATURITY_BUFFER (6h)`.
         let now = OffsetDateTime::now_utc() + time::Duration::days(3);
-        // Override min_merge_group_size to 2 so that 3-split groups qualify.
+        // Override min_merge_group_size to 2 so that 3-split groups qualify. All
+        // splits fall on the same UTC day, so a single days_range=0 pass suffices.
         let config = MatureMergeConfig {
             min_merge_group_size: 2,
+            split_timestamp_days_range: Some(0),
             ..MatureMergeConfig::default()
         };
 
         let summary = merge_mature_single_index(
-            index_metadata_v2,
+            &index_metadata_v2,
             &metastore,
             &test_sandbox.storage_resolver(),
             semaphore,
