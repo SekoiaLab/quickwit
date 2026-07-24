@@ -155,7 +155,7 @@ async fn fetch_splits_and_plan(
         index_id = %index_metadata.index_config.index_id,
         total_splits,
         num_planned_merges = operations.len(),
-        days_range = config.split_timestamp_days_range.unwrap_or_default(),
+        days_range = config.split_timestamp_days_range,
         "fetched splits for mature merge planning"
     );
     Ok(operations)
@@ -406,7 +406,7 @@ async fn merge_mature_single_index(
 }
 
 /// Aggregates per-index results, logs per-index and global summary lines, and warns on errors.
-fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>, dry_run: bool) {
+fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>, config: &MatureMergeConfig) {
     let mut total_planned_merges = 0usize;
     let mut total_input_splits = 0usize;
     let mut total_input_bytes = 0u64;
@@ -437,17 +437,18 @@ fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>, dry_run: b
                 }
             }
             Err(err) => {
-                warn!(err = ?err, "error processing index during mature merge");
+                warn!(err = ?err, config = ?config, "error processing index during mature merge");
             }
         }
     }
-    if dry_run {
+    if config.dry_run {
         info!(
             num_indexes_with_opportunities = num_indexes_partially_merged,
             num_indexes_without_opportunity,
             total_planned_merges,
             total_input_splits,
             total_input_bytes,
+            config = ?config,
             "mature merge dry-run complete"
         );
     } else {
@@ -460,6 +461,7 @@ fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>, dry_run: b
             total_successfully_replaced_splits,
             total_input_splits,
             total_input_bytes,
+            config = ?config,
             "mature merge complete"
         );
     }
@@ -545,24 +547,24 @@ async fn merge_mature_all_indexes(
     }
 
     for days_range in days_range_candidates(&config) {
-        let config_ref = &MatureMergeConfig {
+        let updated_config = &MatureMergeConfig {
             split_timestamp_days_range: Some(days_range),
             ..config.clone()
         };
         let results: Vec<anyhow::Result<IndexMergeSummary>> =
-            futures::stream::iter(indexes_metadata.clone())
+            futures::stream::iter(&indexes_metadata)
                 .map(|index_metadata| {
                     let node_id = node_id.clone();
                     let semaphore = Arc::clone(&semaphore);
                     async move {
                         let now = OffsetDateTime::now_utc();
                         merge_mature_single_index(
-                            &index_metadata,
+                            index_metadata,
                             metastore_ref,
                             storage_resolver_ref,
                             semaphore,
                             data_dir_path,
-                            config_ref,
+                            updated_config,
                             node_id,
                             now,
                         )
@@ -573,7 +575,7 @@ async fn merge_mature_all_indexes(
                 .collect()
                 .await;
 
-        log_merge_results(results, config.dry_run);
+        log_merge_results(results, updated_config);
     }
     Ok(())
 }
