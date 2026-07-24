@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use bytesize::ByteSize;
+use chrono::Utc;
+use cron::Schedule;
 use futures::StreamExt;
 use quickwit_actors::{ActorExitStatus, Universe};
 use quickwit_common::io::IoControls;
@@ -67,6 +70,9 @@ pub struct MatureMergeConfig {
     pub dry_run: bool,
     /// List of index patterns to include in the mature merge process.
     pub index_id_patterns: Vec<String>,
+    /// Cron expression controlling how often mature merges are run. If
+    /// `None` (default), the merge runs once immediately and returns.
+    pub cron_schedule: Option<String>,
 }
 
 impl Default for MatureMergeConfig {
@@ -82,6 +88,7 @@ impl Default for MatureMergeConfig {
             max_concurrent_merges: 10,
             dry_run: false,
             index_id_patterns: vec!["*".to_string()],
+            cron_schedule: None,
         }
     }
 }
@@ -328,7 +335,7 @@ async fn merge_mature_single_index(
     now: OffsetDateTime,
 ) -> anyhow::Result<IndexMergeSummary> {
     let index_id = index_metadata.index_config.index_id.clone();
-    let operations = fetch_splits_and_plan(&index_metadata, metastore, now, config).await?;
+    let operations = fetch_splits_and_plan(index_metadata, metastore, now, config).await?;
     let num_merges_planned = operations.len();
     let num_input_splits: usize = operations.iter().map(|op| op.splits.len()).sum();
     let total_input_bytes: u64 = operations
@@ -499,7 +506,7 @@ fn log_op_for_dry_run(op: &MergeOperation, index_id: &str) {
 /// merge opportunities.
 ///
 /// If `dry_run` is `true`, the planned operations are printed but not executed.
-pub async fn merge_mature_all_indexes(
+async fn merge_mature_all_indexes(
     metastore: MetastoreServiceClient,
     storage_resolver: StorageResolver,
     data_dir_path: &std::path::Path,
@@ -569,6 +576,57 @@ pub async fn merge_mature_all_indexes(
         log_merge_results(results, config.dry_run);
     }
     Ok(())
+}
+
+/// Runs mature merges according to `config.cron_schedule`.
+///
+/// If `cron_schedule` is `None`, runs [`merge_mature_all_indexes`] once and
+/// returns. Otherwise, waits for each upcoming occurrence of the cron
+/// schedule and runs indefinitely: a single failed run is logged but does not
+/// stop subsequent scheduled runs.
+pub async fn run_mature_merge_on_schedule(
+    metastore: MetastoreServiceClient,
+    storage_resolver: StorageResolver,
+    data_dir_path: &std::path::Path,
+    config: MatureMergeConfig,
+    node_id: NodeId,
+) -> anyhow::Result<()> {
+    let Some(cron_schedule) = &config.cron_schedule else {
+        return merge_mature_all_indexes(
+            metastore,
+            storage_resolver,
+            data_dir_path,
+            config,
+            node_id,
+        )
+        .await;
+    };
+    let schedule = Schedule::from_str(cron_schedule)
+        .with_context(|| format!("failed to parse mature merge cron schedule `{cron_schedule}`"))?;
+
+    loop {
+        let next_run = schedule
+            .upcoming(Utc)
+            .next()
+            .context("cron schedule has no upcoming occurrence")?;
+        let sleep_duration = (next_run - Utc::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        info!(next_run = ?next_run, "waiting for next scheduled mature merge run");
+        tokio::time::sleep(sleep_duration).await;
+
+        if let Err(error) = merge_mature_all_indexes(
+            metastore.clone(),
+            storage_resolver.clone(),
+            data_dir_path,
+            config.clone(),
+            node_id.clone(),
+        )
+        .await
+        {
+            error!(%error, "scheduled mature merge run failed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -888,6 +946,22 @@ mod tests {
         );
 
         test_sandbox.assert_quit().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "Not really a test, rather a place to test cron strings"]
+    async fn test_example_supported_crons() -> anyhow::Result<()> {
+        for cron in &[
+            "0 0 * * * *", // every hour
+            "0 0 0 * * *", // every day
+            "0 0 4 * * *", // every day at 04:00 UTC
+            "0 0 4 * * 1", // on sundays at 04:00 UTC
+        ] {
+            let schedule = Schedule::from_str(cron).unwrap();
+            let next_3: Vec<_> = schedule.upcoming(Utc).take(3).collect();
+            println!("{cron}: {:?}", next_3);
+        }
         Ok(())
     }
 }
