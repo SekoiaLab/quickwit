@@ -23,11 +23,18 @@ updates:
 
   # GitHub Actions
   - package-ecosystem: github-actions
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "weekly"
+    # Cooldown applies only to version updates, not security updates
+    cooldown:
+      default-days: 14
     groups:
+      # Group all version updates into a single PR; security updates remain ungrouped
       github-actions:
+        applies-to: version-updates
         patterns:
           - "*"
     open-pull-requests-limit: 10
