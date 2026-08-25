@@ -17,6 +17,7 @@ use std::collections::binary_heap::PeekMut;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use bytesize::ByteSize;
 use quickwit_common::metrics::GaugeGuard;
@@ -189,6 +190,9 @@ impl LeafPermitRequest {
     fn from_estimated_costs(permit_sizes: Vec<u64>) -> (Self, Vec<SearchPermitFuture>) {
         let mut permits = Vec::with_capacity(permit_sizes.len());
         let mut single_split_permit_requests = Vec::with_capacity(permit_sizes.len());
+        // All permits in this batch start waiting at the same time, as soon as the request
+        // reaches the actor.
+        let requested_at = Instant::now();
         for permit_size in permit_sizes {
             let (tx, rx) = oneshot::channel();
             // we keep our internal list of permits and the returned wait handles in the
@@ -198,7 +202,10 @@ impl LeafPermitRequest {
                 permit_sender: tx,
                 permit_size,
             });
-            permits.push(SearchPermitFuture(rx));
+            permits.push(SearchPermitFuture {
+                receiver: rx,
+                requested_at,
+            });
         }
         (
             LeafPermitRequest {
@@ -357,15 +364,24 @@ impl Drop for SearchPermit {
     }
 }
 
-pub struct SearchPermitFuture(oneshot::Receiver<SearchPermit>);
+pub struct SearchPermitFuture {
+    receiver: oneshot::Receiver<SearchPermit>,
+    requested_at: Instant,
+}
 
 impl Future for SearchPermitFuture {
     type Output = SearchPermit;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let receiver = Pin::new(&mut self.get_mut().0);
+        let this = self.get_mut();
+        let receiver = Pin::new(&mut this.receiver);
         match receiver.poll(cx) {
-            Poll::Ready(Ok(search_permit)) => Poll::Ready(search_permit),
+            Poll::Ready(Ok(search_permit)) => {
+                crate::metrics::SEARCH_METRICS
+                    .leaf_search_permit_wait_duration_secs
+                    .observe(this.requested_at.elapsed().as_secs_f64());
+                Poll::Ready(search_permit)
+            }
             Poll::Ready(Err(_)) => panic!("Failed to acquire permit. This should never happen! Please, report on https://github.com/quickwit-oss/quickwit/issues."),
             Poll::Pending => Poll::Pending,
         }

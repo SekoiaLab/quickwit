@@ -14,13 +14,17 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::{Future, TryFutureExt};
 use once_cell::sync::Lazy;
 use tokio::sync::oneshot;
 use tracing::error;
 
-use crate::metrics::{GaugeGuard, IntGaugeVec, OwnedGaugeGuard, new_gauge_vec};
+use crate::metrics::{
+    GaugeGuard, HistogramVec, IntGaugeVec, OwnedGaugeGuard, exponential_buckets, new_gauge_vec,
+    new_histogram_vec,
+};
 
 /// An executor backed by a thread pool to run CPU-intensive tasks.
 ///
@@ -79,20 +83,30 @@ impl ThreadPool {
         let pending_tasks = THREAD_POOL_METRICS
             .pending_tasks
             .with_label_values([self.name, caller]);
+        let queue_wait_time = THREAD_POOL_METRICS
+            .queue_wait_time_secs
+            .with_label_values([self.name, caller]);
+        let run_time = THREAD_POOL_METRICS
+            .run_time_secs
+            .with_label_values([self.name, caller]);
         let ongoing_tasks = ongoing_tasks.clone();
         let mut pending_tasks_guard: OwnedGaugeGuard =
             OwnedGaugeGuard::from_gauge(pending_tasks.clone());
         pending_tasks_guard.add(1i64);
+        let enqueued_at = Instant::now();
         let (tx, rx) = oneshot::channel();
         self.thread_pool.spawn(move || {
             drop(pending_tasks_guard);
+            queue_wait_time.observe(enqueued_at.elapsed().as_secs_f64());
             if tx.is_closed() {
                 return;
             }
             let _guard = span.enter();
             let mut ongoing_task_guard = GaugeGuard::from_gauge(&ongoing_tasks);
             ongoing_task_guard.add(1i64);
+            let task_started_at = Instant::now();
             let result = cpu_intensive_fn();
+            run_time.observe(task_started_at.elapsed().as_secs_f64());
             let _ = tx.send(result);
         });
         rx.map_err(|_| Panicked)
@@ -161,6 +175,13 @@ impl std::error::Error for Panicked {}
 struct ThreadPoolMetrics {
     ongoing_tasks: IntGaugeVec<2>,
     pending_tasks: IntGaugeVec<2>,
+    queue_wait_time_secs: HistogramVec<2>,
+    run_time_secs: HistogramVec<2>,
+}
+
+/// From 1ms to ~32.768s
+fn wait_and_run_time_buckets() -> Vec<f64> {
+    exponential_buckets(0.001, 2.0, 16).unwrap()
 }
 
 impl Default for ThreadPoolMetrics {
@@ -179,6 +200,24 @@ impl Default for ThreadPoolMetrics {
                 "thread_pool",
                 &[],
                 ["pool", "caller"],
+            ),
+            queue_wait_time_secs: new_histogram_vec(
+                "queue_wait_time_secs",
+                "amount of time a task waited in the queue before being picked up by a thread in \
+                 the thread pool",
+                "thread_pool",
+                &[],
+                ["pool", "caller"],
+                wait_and_run_time_buckets(),
+            ),
+            run_time_secs: new_histogram_vec(
+                "run_time_secs",
+                "amount of time spent actually running a task on a thread pool worker, once it \
+                 has been picked up from the queue",
+                "thread_pool",
+                &[],
+                ["pool", "caller"],
+                wait_and_run_time_buckets(),
             ),
         }
     }

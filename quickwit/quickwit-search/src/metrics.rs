@@ -149,6 +149,7 @@ pub struct SearchMetrics {
     pub leaf_list_terms_splits_total: IntCounter,
     pub split_search_outcome_total: SplitSearchOutcomeCounters,
     pub leaf_search_split_duration_secs: Histogram,
+    pub leaf_search_permit_wait_duration_secs: Histogram,
     pub job_assigned_total: IntCounterVec<1>,
     pub leaf_search_single_split_tasks_pending: IntGauge,
     pub leaf_search_single_split_tasks_ongoing: IntGauge,
@@ -257,6 +258,12 @@ impl Default for SearchMetrics {
                  starts after the semaphore is obtained.",
                 "search",
                 duration_buckets(),
+            ),
+            leaf_search_permit_wait_duration_secs: new_histogram(
+                "leaf_search_permit_wait_duration_secs",
+                "Number of seconds a single split leaf search waited to acquire a search permit.",
+                "search",
+                exponential_buckets(0.001, 2.0, 16).unwrap(),
             ),
             // we need to expose the gauges here to provide a static ref to for the gauge guards
             leaf_search_single_split_tasks_ongoing: leaf_search_single_split_tasks
