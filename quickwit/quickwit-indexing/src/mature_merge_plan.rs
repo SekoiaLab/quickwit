@@ -98,6 +98,9 @@ pub fn plan_merge_operations_for_index(
     now: OffsetDateTime,
     config: &MatureMergeConfig,
 ) -> Vec<MergeOperation> {
+    let days_range = config
+        .split_timestamp_days_range
+        .expect("split_timestamp_days_range must be set before planning merge operations");
     let now_secs = now.unix_timestamp();
 
     let earliest_cutoff_timestamp = retention_safety_cutoff_secs(index_config, now_secs, config);
@@ -135,7 +138,7 @@ pub fn plan_merge_operations_for_index(
             .map(|r| r.start() / SECS_PER_DAY);
 
         // Focus on splits with a specific timestamp range.
-        if end_day - start_day != (config.split_timestamp_days_range as i64) {
+        if end_day - start_day != (days_range as i64) {
             continue;
         }
 
@@ -242,7 +245,10 @@ mod tests {
             &index_config_no_retention(),
             splits,
             now_well_after_recent_day(),
-            &MatureMergeConfig::default(),
+            &MatureMergeConfig {
+                split_timestamp_days_range: Some(0),
+                ..Default::default()
+            },
         );
 
         assert_eq!(operations.len(), 1);
@@ -273,6 +279,7 @@ mod tests {
             now_well_after_recent_day(),
             &MatureMergeConfig {
                 min_merge_group_size: 5,
+                split_timestamp_days_range: Some(0),
                 ..Default::default()
             },
         );
@@ -311,7 +318,10 @@ mod tests {
             &index_config_no_retention(),
             splits,
             now,
-            &MatureMergeConfig::default(),
+            &MatureMergeConfig {
+                split_timestamp_days_range: Some(0),
+                ..Default::default()
+            },
         );
 
         assert!(operations.is_empty(), "immature splits should be excluded");
@@ -343,7 +353,10 @@ mod tests {
             &index_config_no_retention(),
             splits,
             now_well_after_recent_day(),
-            &MatureMergeConfig::default(),
+            &MatureMergeConfig {
+                split_timestamp_days_range: Some(0),
+                ..Default::default()
+            },
         );
 
         assert!(operations.is_empty(), "multi-day splits should be skipped");
@@ -380,6 +393,7 @@ mod tests {
 
         let merge_config = MatureMergeConfig {
             retention_safety_buffer_days: 30,
+            split_timestamp_days_range: Some(0),
             ..MatureMergeConfig::default()
         };
         let operations = plan_merge_operations_for_index(&config, splits, now, &merge_config);
@@ -416,7 +430,10 @@ mod tests {
             &config,
             splits,
             now_well_after_recent_day(),
-            &MatureMergeConfig::default(),
+            &MatureMergeConfig {
+                split_timestamp_days_range: Some(0),
+                ..Default::default()
+            },
         );
 
         assert!(
@@ -448,7 +465,10 @@ mod tests {
             &index_config_no_retention(),
             splits,
             now_well_after_recent_day(),
-            &MatureMergeConfig::default(),
+            &MatureMergeConfig {
+                split_timestamp_days_range: Some(0),
+                ..Default::default()
+            },
         );
         operations.sort_by_key(|op| op.splits[0].partition_id);
 
@@ -478,7 +498,7 @@ mod tests {
             .collect();
 
         let config = MatureMergeConfig {
-            split_timestamp_days_range: 1,
+            split_timestamp_days_range: Some(1),
             ..MatureMergeConfig::default()
         };
         let operations = plan_merge_operations_for_index(

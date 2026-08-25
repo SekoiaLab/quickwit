@@ -41,7 +41,7 @@ use quickwit_directories::BundleDirectory;
 use quickwit_index_management::{IndexService, clear_cache_directory};
 use quickwit_indexing::IndexingPipeline;
 use quickwit_indexing::actors::{IndexingService, MergePipeline, MergeSchedulerService};
-use quickwit_indexing::mature_merge::{MatureMergeConfig, merge_mature_all_indexes};
+use quickwit_indexing::mature_merge::{MatureMergeConfig, run_mature_merge_on_schedule};
 use quickwit_indexing::models::{
     DetachIndexingPipeline, DetachMergePipeline, IndexingStatistics, SpawnPipeline,
 };
@@ -184,8 +184,9 @@ pub fn build_tool_command() -> Command {
                 .display_order(10)
                 .about("Merges mature splits across all indexes and nodes.")
                 .long_about(
-                    "Scans indexes for merge opportunities in mature Published splits. Considers \
-                    opportunities across all origin nodes and sources. Runs once and exits."
+                    "Scans indexes for merge opportunities in mature splits. Considers opportunities \
+                     across all origin nodes and sources. If `--cron-schedule` is not set, runs once \
+                     and exits."
                 )
                 .args(&[
                     arg!(--"dry-run"
@@ -216,7 +217,8 @@ pub fn build_tool_command() -> Command {
                         .display_order(6)
                         .required(false),
                     arg!(--"split-timestamp-days-range" <SPLIT_TIMESTAMP_DAYS_RANGE>
-                        "Group splits that span this many days together (0 = single-day, default: 0).")
+                        "Group splits that span this many days together. If unset (default), merges \
+                         are attempted successively for 0, 1, and 2 day spans.")
                         .display_order(7)
                         .required(false),
                     arg!(--"index-parallelism" <INDEX_PARALLELISM>
@@ -227,9 +229,14 @@ pub fn build_tool_command() -> Command {
                         "Comma-separated list of index ID patterns to include (default: '*').")
                         .display_order(9)
                         .required(false),
+                    arg!(--"cron-schedule" <CRON_SCHEDULE>
+                        "Cron expression controlling how often mature merges run. If unset, runs once \
+                        and exits.")
+                        .display_order(10)
+                        .required(false),
                     arg!(--"metrics"
                         "Expose Prometheus metrics on the REST listen address during the run.")
-                        .display_order(10)
+                        .display_order(11)
                         .required(false),
                 ])
             )
@@ -512,7 +519,7 @@ impl ToolCliCommand {
             .remove_one::<String>("split-timestamp-days-range")
             .map(|s| s.parse::<u8>())
             .transpose()?
-            .unwrap_or(defaults.split_timestamp_days_range);
+            .or(defaults.split_timestamp_days_range);
         let index_parallelism = matches
             .remove_one::<String>("index-parallelism")
             .map(|s| s.parse::<usize>())
@@ -522,6 +529,9 @@ impl ToolCliCommand {
             .remove_one::<String>("index-id-patterns")
             .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
             .unwrap_or(defaults.index_id_patterns);
+        let cron_schedule = matches
+            .remove_one::<String>("cron-schedule")
+            .or(defaults.cron_schedule);
         let serve_metrics = matches.get_flag("metrics");
 
         if max_concurrent_merges == 0 {
@@ -544,6 +554,7 @@ impl ToolCliCommand {
                 split_timestamp_days_range,
                 index_parallelism,
                 index_id_patterns,
+                cron_schedule,
             },
         }))
     }
@@ -846,7 +857,7 @@ pub async fn merge_mature_cli(args: MatureMergeArgs) -> anyhow::Result<()> {
         tokio::spawn(serve_metrics(metrics_addr));
     }
 
-    merge_mature_all_indexes(
+    run_mature_merge_on_schedule(
         metastore,
         storage_resolver,
         &config.data_dir_path,
@@ -854,11 +865,6 @@ pub async fn merge_mature_cli(args: MatureMergeArgs) -> anyhow::Result<()> {
         config.node_id,
     )
     .await?;
-
-    if !args.merge_config.dry_run {
-        info!("mature splits successfully merged, waiting for explicit termination signal");
-        tokio::time::sleep(Duration::MAX).await;
-    }
 
     Ok(())
 }

@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use bytesize::ByteSize;
+use chrono::Utc;
+use cron::Schedule;
 use futures::StreamExt;
 use quickwit_actors::{ActorExitStatus, Universe};
 use quickwit_common::io::IoControls;
@@ -55,8 +58,9 @@ pub struct MatureMergeConfig {
     pub max_merge_group_size: usize,
     /// Maximum total number of documents per merge operation.
     pub split_target_num_docs: usize,
-    /// Focus on splits that span this many days.
-    pub split_timestamp_days_range: u8,
+    /// Focus on splits that span this many days. If `None`, merges are
+    /// attempted successively for 0, 1, and 2 days spans.
+    pub split_timestamp_days_range: Option<u8>,
     /// Number of indexes processed concurrently. Lower to avoid fetching splits
     /// metadata too eagerly.
     pub index_parallelism: usize,
@@ -66,6 +70,9 @@ pub struct MatureMergeConfig {
     pub dry_run: bool,
     /// List of index patterns to include in the mature merge process.
     pub index_id_patterns: Vec<String>,
+    /// Cron expression controlling how often mature merges are run. If
+    /// `None` (default), the merge runs once immediately and returns.
+    pub cron_schedule: Option<String>,
 }
 
 impl Default for MatureMergeConfig {
@@ -76,11 +83,12 @@ impl Default for MatureMergeConfig {
             input_split_max_num_docs: 10_000,
             max_merge_group_size: 100,
             split_target_num_docs: 5_000_000,
-            split_timestamp_days_range: 0, // by default single day splits
+            split_timestamp_days_range: None,
             index_parallelism: 50,
             max_concurrent_merges: 10,
             dry_run: false,
             index_id_patterns: vec!["*".to_string()],
+            cron_schedule: None,
         }
     }
 }
@@ -97,6 +105,14 @@ struct IndexMergeSummary {
     num_input_splits: usize,
     total_input_bytes: u64,
     outcome: IndexMergeOutcome,
+}
+
+/// Values of `split_timestamp_days_range` to attempt, in order.
+fn days_range_candidates(config: &MatureMergeConfig) -> Vec<u8> {
+    match config.split_timestamp_days_range {
+        Some(days_range) => vec![days_range],
+        None => vec![0, 1, 2],
+    }
 }
 
 /// Fetches all published splits for the given index from the metastore (no
@@ -139,6 +155,7 @@ async fn fetch_splits_and_plan(
         index_id = %index_metadata.index_config.index_id,
         total_splits,
         num_planned_merges = operations.len(),
+        days_range = config.split_timestamp_days_range,
         "fetched splits for mature merge planning"
     );
     Ok(operations)
@@ -301,10 +318,14 @@ async fn run_mature_merges_for_index(
     })
 }
 
-/// Plans and optionally executes mature merges for a single index
+/// Plans and, unless `config.dry_run` is set, executes mature merges for a
+/// single index.
+///
+/// The day span must be configured in `config.split_timestamp_days_range`
+/// (`None` panics).
 #[allow(clippy::too_many_arguments)]
 async fn merge_mature_single_index(
-    index_metadata: IndexMetadata,
+    index_metadata: &IndexMetadata,
     metastore: &MetastoreServiceClient,
     storage_resolver: &StorageResolver,
     semaphore: Arc<Semaphore>,
@@ -314,7 +335,7 @@ async fn merge_mature_single_index(
     now: OffsetDateTime,
 ) -> anyhow::Result<IndexMergeSummary> {
     let index_id = index_metadata.index_config.index_id.clone();
-    let operations = fetch_splits_and_plan(&index_metadata, metastore, now, config).await?;
+    let operations = fetch_splits_and_plan(index_metadata, metastore, now, config).await?;
     let num_merges_planned = operations.len();
     let num_input_splits: usize = operations.iter().map(|op| op.splits.len()).sum();
     let total_input_bytes: u64 = operations
@@ -353,7 +374,7 @@ async fn merge_mature_single_index(
         IndexingSplitStore::new(remote_storage, Arc::new(IndexingSplitCache::no_caching()));
 
     let outcome = run_mature_merges_for_index(
-        &index_metadata,
+        index_metadata,
         operations,
         metastore.clone(),
         split_store,
@@ -385,7 +406,7 @@ async fn merge_mature_single_index(
 }
 
 /// Aggregates per-index results, logs per-index and global summary lines, and warns on errors.
-fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>, dry_run: bool) {
+fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>, config: &MatureMergeConfig) {
     let mut total_planned_merges = 0usize;
     let mut total_input_splits = 0usize;
     let mut total_input_bytes = 0u64;
@@ -416,17 +437,18 @@ fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>, dry_run: b
                 }
             }
             Err(err) => {
-                warn!(err = ?err, "error processing index during mature merge");
+                warn!(err = ?err, config = ?config, "error processing index during mature merge");
             }
         }
     }
-    if dry_run {
+    if config.dry_run {
         info!(
             num_indexes_with_opportunities = num_indexes_partially_merged,
             num_indexes_without_opportunity,
             total_planned_merges,
             total_input_splits,
             total_input_bytes,
+            config = ?config,
             "mature merge dry-run complete"
         );
     } else {
@@ -439,6 +461,7 @@ fn log_merge_results(results: Vec<anyhow::Result<IndexMergeSummary>>, dry_run: b
             total_successfully_replaced_splits,
             total_input_splits,
             total_input_bytes,
+            config = ?config,
             "mature merge complete"
         );
     }
@@ -485,7 +508,7 @@ fn log_op_for_dry_run(op: &MergeOperation, index_id: &str) {
 /// merge opportunities.
 ///
 /// If `dry_run` is `true`, the planned operations are printed but not executed.
-pub async fn merge_mature_all_indexes(
+async fn merge_mature_all_indexes(
     metastore: MetastoreServiceClient,
     storage_resolver: StorageResolver,
     data_dir_path: &std::path::Path,
@@ -513,7 +536,6 @@ pub async fn merge_mature_all_indexes(
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_merges));
     let metastore_ref = &metastore;
     let storage_resolver_ref = &storage_resolver;
-    let config_ref = &config;
 
     if indexes_metadata
         .iter()
@@ -524,31 +546,89 @@ pub async fn merge_mature_all_indexes(
         bail!("tags not supported in mature merges");
     }
 
-    let results: Vec<anyhow::Result<IndexMergeSummary>> = futures::stream::iter(indexes_metadata)
-        .map(|index_metadata| {
-            let node_id = node_id.clone();
-            let semaphore = Arc::clone(&semaphore);
-            async move {
-                let now = OffsetDateTime::now_utc();
-                merge_mature_single_index(
-                    index_metadata,
-                    metastore_ref,
-                    storage_resolver_ref,
-                    semaphore,
-                    data_dir_path,
-                    config_ref,
-                    node_id,
-                    now,
-                )
-                .await
-            }
-        })
-        .buffer_unordered(config.index_parallelism)
-        .collect()
-        .await;
+    for days_range in days_range_candidates(&config) {
+        let updated_config = &MatureMergeConfig {
+            split_timestamp_days_range: Some(days_range),
+            ..config.clone()
+        };
+        let results: Vec<anyhow::Result<IndexMergeSummary>> =
+            futures::stream::iter(&indexes_metadata)
+                .map(|index_metadata| {
+                    let node_id = node_id.clone();
+                    let semaphore = Arc::clone(&semaphore);
+                    async move {
+                        let now = OffsetDateTime::now_utc();
+                        merge_mature_single_index(
+                            index_metadata,
+                            metastore_ref,
+                            storage_resolver_ref,
+                            semaphore,
+                            data_dir_path,
+                            updated_config,
+                            node_id,
+                            now,
+                        )
+                        .await
+                    }
+                })
+                .buffer_unordered(config.index_parallelism)
+                .collect()
+                .await;
 
-    log_merge_results(results, config.dry_run);
+        log_merge_results(results, updated_config);
+    }
     Ok(())
+}
+
+/// Runs mature merges according to `config.cron_schedule`.
+///
+/// If `cron_schedule` is `None`, runs [`merge_mature_all_indexes`] once and
+/// returns. Otherwise, waits for each upcoming occurrence of the cron
+/// schedule and runs indefinitely: a single failed run is logged but does not
+/// stop subsequent scheduled runs.
+pub async fn run_mature_merge_on_schedule(
+    metastore: MetastoreServiceClient,
+    storage_resolver: StorageResolver,
+    data_dir_path: &std::path::Path,
+    config: MatureMergeConfig,
+    node_id: NodeId,
+) -> anyhow::Result<()> {
+    let Some(cron_schedule) = &config.cron_schedule else {
+        return merge_mature_all_indexes(
+            metastore,
+            storage_resolver,
+            data_dir_path,
+            config,
+            node_id,
+        )
+        .await;
+    };
+    let schedule = Schedule::from_str(cron_schedule)
+        .with_context(|| format!("failed to parse mature merge cron schedule `{cron_schedule}`"))?;
+
+    loop {
+        let next_run = schedule
+            .upcoming(Utc)
+            .next()
+            .context("cron schedule has no upcoming occurrence")?;
+        let sleep_duration = (next_run - Utc::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        info!(next_run = ?next_run, "waiting for next scheduled mature merge run");
+        tokio::time::sleep(sleep_duration).await;
+
+        if let Err(error) = merge_mature_all_indexes(
+            metastore.clone(),
+            storage_resolver.clone(),
+            data_dir_path,
+            config.clone(),
+            node_id.clone(),
+        )
+        .await
+        {
+            error!(%error, "scheduled mature merge run failed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -808,14 +888,16 @@ mod tests {
         // Splits have the default 48h maturation period. Pass a `now` far enough in the future
         // so all splits (both v1 and v2) are mature at `now - MATURITY_BUFFER (6h)`.
         let now = OffsetDateTime::now_utc() + time::Duration::days(3);
-        // Override min_merge_group_size to 2 so that 3-split groups qualify.
+        // Override min_merge_group_size to 2 so that 3-split groups qualify. All
+        // splits fall on the same UTC day, so a single days_range=0 pass suffices.
         let config = MatureMergeConfig {
             min_merge_group_size: 2,
+            split_timestamp_days_range: Some(0),
             ..MatureMergeConfig::default()
         };
 
         let summary = merge_mature_single_index(
-            index_metadata_v2,
+            &index_metadata_v2,
             &metastore,
             &test_sandbox.storage_resolver(),
             semaphore,
@@ -866,6 +948,22 @@ mod tests {
         );
 
         test_sandbox.assert_quit().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "Not really a test, rather a place to test cron strings"]
+    async fn test_example_supported_crons() -> anyhow::Result<()> {
+        for cron in &[
+            "0 0 * * * *", // every hour
+            "0 0 0 * * *", // every day
+            "0 0 4 * * *", // every day at 04:00 UTC
+            "0 0 4 * * 1", // on sundays at 04:00 UTC
+        ] {
+            let schedule = Schedule::from_str(cron).unwrap();
+            let next_3: Vec<_> = schedule.upcoming(Utc).take(3).collect();
+            println!("{cron}: {:?}", next_3);
+        }
         Ok(())
     }
 }
