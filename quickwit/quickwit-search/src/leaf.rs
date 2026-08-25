@@ -451,15 +451,6 @@ async fn leaf_search_single_split(
         &split,
         ctx.doc_mapper.timestamp_field_name(),
     );
-    if let Some(cached_answer) = ctx
-        .searcher_context
-        .leaf_search_cache
-        .get(split.clone(), search_request.clone())
-    {
-        leaf_search_state_guard.set_state(SplitSearchState::CacheHit);
-        return Ok(Some(cached_answer));
-    }
-
     let query_ast: QueryAst = serde_json::from_str(search_request.query_ast.as_str())
         .map_err(|err| SearchError::InvalidQuery(err.to_string()))?;
 
@@ -473,6 +464,17 @@ async fn leaf_search_single_split(
             .num_docs
             .saturating_sub(split.soft_deleted_doc_ids.len() as u64);
         return Ok(Some(get_leaf_resp_from_count(effective_num_docs)));
+    }
+
+    // Queries answerable from split metadata alone are handled above, before touching the
+    // cache, so that they don't count as cache misses.
+    if let Some(cached_answer) = ctx
+        .searcher_context
+        .leaf_search_cache
+        .get(split.clone(), search_request.clone())
+    {
+        leaf_search_state_guard.set_state(SplitSearchState::CacheHit);
+        return Ok(Some(cached_answer));
     }
 
     let split_id = split.split_id.to_string();
