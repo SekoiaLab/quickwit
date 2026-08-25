@@ -24,6 +24,7 @@ use tracing::{Span, record_all};
 
 use crate::SearchError;
 use crate::metrics::SEARCH_METRICS;
+use crate::query_cost_classifier::QueryCostClass;
 
 // planning
 
@@ -212,12 +213,16 @@ pub struct LeafSearchMetricsFuture<F> {
     pub start: Instant,
     pub targeted_splits: usize,
     pub status: Option<&'static str>,
+    pub cost_class: QueryCostClass,
 }
 
 #[pinned_drop]
 impl<F> PinnedDrop for LeafSearchMetricsFuture<F> {
     fn drop(self: Pin<&mut Self>) {
-        let label_values = [self.status.unwrap_or("cancelled")];
+        let label_values = [
+            self.status.unwrap_or("cancelled"),
+            self.cost_class.as_label(),
+        ];
         SEARCH_METRICS
             .leaf_search_requests_total
             .with_label_values(label_values)

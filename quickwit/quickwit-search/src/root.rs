@@ -49,6 +49,7 @@ use tracing::{debug, info_span, instrument, record_all};
 
 use crate::cluster_client::ClusterClient;
 use crate::collector::{QuickwitAggregations, make_merge_collector};
+use crate::metrics::SEARCH_METRICS;
 use crate::metrics_trackers::{RootSearchMetricsFuture, SearchPlanMetricsFuture};
 use crate::scroll_context::{ScrollContext, ScrollKeyAndStartOffset};
 use crate::search_job_placer::{Job, group_by, group_jobs_by_index_id};
@@ -57,6 +58,7 @@ use crate::service::SearcherContext;
 use crate::{
     SearchError, SearchJobPlacer, SearchPlanResponseRest, SearchServiceClient,
     extract_split_and_footer_offsets, list_relevant_splits_with_secondary_time,
+    query_cost_classifier,
 };
 
 /// Maximum accepted scroll TTL.
@@ -408,6 +410,8 @@ fn simplify_search_request_for_scroll_api(req: &SearchRequest) -> crate::Result<
         ignore_missing_indexes: req.ignore_missing_indexes,
         split_id: req.split_id.clone(),
         user_agent: req.user_agent.clone(),
+        // This is a scroll page of the same original query, so it keeps the same cost class.
+        cost_class: req.cost_class,
     })
 }
 
@@ -1249,6 +1253,17 @@ async fn plan_splits_for_root_search(
     }
 
     let request_metadata = validate_request_and_build_metadata(&indexes_metadata, search_request)?;
+
+    // Classify the query once, right after it has been fully resolved. This is our single point
+    // of truth for how many queries we classify as costly, independent of how many splits or
+    // searcher nodes end up handling them.
+    let cost_class = query_cost_classifier::classify(&request_metadata.query_ast_resolved);
+    search_request.set_cost_class(cost_class.into());
+    SEARCH_METRICS
+        .query_cost_class_total
+        .with_label_values([cost_class.as_label()])
+        .inc();
+
     let secondary_timestamp_field_opt = validate_secondary_time(&indexes_metadata)?;
     let split_metadatas = refine_and_list_matches(
         metastore,

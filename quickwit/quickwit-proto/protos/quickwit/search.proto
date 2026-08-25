@@ -257,6 +257,11 @@ message SearchRequest {
 
   // The user agent of the client that initiated the search request.
   optional string user_agent = 20;
+
+  // Coarse classification of the expected cost of this query. Computed once
+  // at the root, right after the query AST is resolved, and carried along
+  // so leaf/searcher nodes don't need to reclassify the query themselves.
+  QueryCostClass cost_class = 21;
 }
 
 enum CountHits {
@@ -265,6 +270,15 @@ enum CountHits {
   // Give an underestimate of the number of hits, possibly skipping entire
   // splits if they are otherwise not needed to fulfull a query.
   UNDERESTIMATE = 1;
+}
+
+enum QueryCostClass {
+  // The query is expected to run with predictable, moderate cost.
+  REGULAR = 0;
+  // The query contains patterns (e.g. unanchored regexes or wildcards) that
+  // can prevent efficient pruning of the term dictionary, and can be
+  // significantly more expensive to run.
+  COSTLY = 1;
 }
 
 message SortField {

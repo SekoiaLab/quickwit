@@ -41,6 +41,7 @@ use crate::list_fields_cache::ListFieldsCache;
 use crate::list_terms::{leaf_list_terms, root_list_terms};
 use crate::metrics::SEARCH_METRICS;
 use crate::metrics_trackers::LeafSearchMetricsFuture;
+use crate::query_cost_classifier::QueryCostClass;
 use crate::root::fetch_docs_phase;
 use crate::scroll_context::{MiniKV, ScrollContext, ScrollKeyAndStartOffset};
 use crate::search_permit_provider::SearchPermitProvider;
@@ -179,9 +180,10 @@ impl SearchService for SearchServiceImpl {
         leaf_search_request: LeafSearchRequest,
     ) -> crate::Result<LeafSearchResponse> {
         // Check leaf_search_request existence before tracing with `instrument` call.
-        if leaf_search_request.search_request.is_none() {
+        let Some(search_request) = leaf_search_request.search_request.as_ref() else {
             return Err(SearchError::Internal("no search request".to_string()));
-        }
+        };
+        let cost_class: QueryCostClass = search_request.cost_class().into();
         let num_splits = leaf_search_request
             .leaf_requests
             .iter()
@@ -198,6 +200,7 @@ impl SearchService for SearchServiceImpl {
             start: Instant::now(),
             targeted_splits: num_splits,
             status: None,
+            cost_class,
         };
         tokio::time::timeout(timeout, tracked_future).await?
     }

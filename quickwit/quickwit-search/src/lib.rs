@@ -29,6 +29,7 @@ mod list_fields;
 mod list_fields_cache;
 mod list_terms;
 mod metrics_trackers;
+mod query_cost_classifier;
 mod retry;
 mod root;
 mod scroll_context;
