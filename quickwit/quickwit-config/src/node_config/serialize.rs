@@ -534,6 +534,7 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+    use crate::CacheConfig;
     use crate::storage_config::StorageBackendFlavor;
 
     fn get_config_filepath(config_filename: &str) -> String {
@@ -661,11 +662,11 @@ mod tests {
             SearcherConfig {
                 aggregation_memory_limit: ByteSize::gb(1),
                 aggregation_bucket_limit: 500_000,
-                fast_field_cache_capacity: ByteSize::gb(10),
-                split_footer_cache_capacity: ByteSize::gb(1),
+                fast_field_cache: CacheConfig::default_with_capacity(ByteSize::gb(10)),
+                split_footer_cache: CacheConfig::default_with_capacity(ByteSize::gb(1)),
                 split_footer_disk_cache_capacity: None,
-                partial_request_cache_capacity: ByteSize::mb(64),
-                predicate_cache_capacity: ByteSize::mb(256),
+                partial_request_cache: CacheConfig::default_with_capacity(ByteSize::mb(64)),
+                predicate_cache: CacheConfig::default_with_capacity(ByteSize::mb(256)),
                 max_num_concurrent_split_searches: 150,
                 max_splits_per_search: None,
                 _max_num_concurrent_split_streams: Some(serde::de::IgnoredAny),

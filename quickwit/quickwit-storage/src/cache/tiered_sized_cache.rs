@@ -30,7 +30,7 @@ pub struct TieredSizedCache<K: Hash + Eq = String> {
     disk: Option<DiskSizedCache<K>>,
 }
 
-impl<K: Hash + Eq + Clone + Display> TieredSizedCache<K> {
+impl<K: Hash + Eq + Clone + Display + Send + Sync + 'static> TieredSizedCache<K> {
     /// Creates a tiered cache from an in-memory tier and an optional disk tier.
     pub fn new(memory: MemorySizedCache<K>, disk: Option<DiskSizedCache<K>>) -> Self {
         TieredSizedCache { memory, disk }
@@ -61,12 +61,14 @@ impl<K: Hash + Eq + Clone + Display> TieredSizedCache<K> {
 
 #[cfg(test)]
 mod tests {
+    use bytesize::ByteSize;
+
     use super::*;
     use crate::cache::disk_sized_cache::path_for;
     use crate::metrics::CACHE_METRICS_FOR_TESTS;
 
     fn memory_cache() -> MemorySizedCache<String> {
-        MemorySizedCache::with_capacity_in_bytes(1_000, &CACHE_METRICS_FOR_TESTS)
+        MemorySizedCache::from_config(&ByteSize::b(1_000).into(), &CACHE_METRICS_FOR_TESTS)
     }
 
     #[tokio::test]

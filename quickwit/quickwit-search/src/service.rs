@@ -443,9 +443,8 @@ impl SearcherContext {
         split_cache_opt: Option<Arc<SplitCache>>,
         split_footer_disk_cache_opt: Option<DiskSizedCache<String>>,
     ) -> Self {
-        let capacity_in_bytes = searcher_config.split_footer_cache_capacity.as_u64() as usize;
-        let global_split_footer_cache = MemorySizedCache::with_capacity_in_bytes(
-            capacity_in_bytes,
+        let global_split_footer_cache = MemorySizedCache::from_config(
+            &searcher_config.split_footer_cache,
             &quickwit_storage::STORAGE_METRICS.split_footer_cache,
         );
         let split_footer_cache =
@@ -455,14 +454,11 @@ impl SearcherContext {
             searcher_config.warmup_memory_budget,
             SEARCH_METRICS.search_task_metrics(),
         );
-        let fast_field_cache_capacity = searcher_config.fast_field_cache_capacity.as_u64() as usize;
-        let storage_long_term_cache = Arc::new(QuickwitCache::new(fast_field_cache_capacity));
-        let leaf_search_cache =
-            LeafSearchCache::new(searcher_config.partial_request_cache_capacity.as_u64() as usize);
-        let predicate_cache =
-            PredicateCacheImpl::new(searcher_config.predicate_cache_capacity.as_u64() as usize);
-        let list_fields_cache =
-            ListFieldsCache::new(searcher_config.partial_request_cache_capacity.as_u64() as usize);
+        let storage_long_term_cache =
+            Arc::new(QuickwitCache::new(&searcher_config.fast_field_cache));
+        let leaf_search_cache = LeafSearchCache::new(&searcher_config.partial_request_cache);
+        let predicate_cache = PredicateCacheImpl::new(&searcher_config.predicate_cache);
+        let list_fields_cache = ListFieldsCache::new(&searcher_config.partial_request_cache);
         let aggregation_limit = AggregationLimitsGuard::new(
             Some(searcher_config.aggregation_memory_limit.as_u64()),
             Some(searcher_config.aggregation_bucket_limit),

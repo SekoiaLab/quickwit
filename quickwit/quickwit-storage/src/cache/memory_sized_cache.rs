@@ -16,192 +16,103 @@ use std::borrow::Borrow;
 use std::hash::Hash;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
-use lru::LruCache;
-use tokio::time::Instant;
-use tracing::{error, warn};
+use quickwit_config::CacheConfig;
 
 use crate::OwnedBytes;
+use crate::cache::base_cache::{AnyCache, FakeCacheEntry};
 use crate::cache::slice_address::{SliceAddress, SliceAddressKey, SliceAddressRef};
-use crate::cache::stored_item::StoredItem;
-use crate::metrics::CacheMetrics;
+use crate::metrics::ComponentCacheMetrics;
 
-/// We do not evict anything that has been accessed in the last 60s.
-///
-/// The goal is to behave better on scan access patterns, without being as aggressive as
-/// using a MRU strategy.
-///
-/// TLDR is:
-///
-/// If two items have been access in the last 60s it is not really worth considering the
-/// latter too be more recent than the previous and do an eviction.
-/// The difference is not significant enough to raise the probability of its future access.
-///
-/// On the other hand, for very large queries involving enough data to saturate the cache,
-/// we are facing a scanning pattern. If variations of this  query is repeated over and over
-/// a regular LRU eviction policy would yield a hit rate of 0.
-const MIN_TIME_SINCE_LAST_ACCESS: Duration = Duration::from_secs(60);
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Capacity {
-    Unlimited,
-    InBytes(usize),
+struct CacheState<K: Hash + Eq> {
+    cache: AnyCache<K, OwnedBytes>,
+    virtual_caches: Vec<AnyCache<K, FakeCacheEntry>>,
 }
 
-impl Capacity {
-    fn exceeds_capacity(&self, num_bytes: usize) -> bool {
-        match *self {
-            Capacity::Unlimited => false,
-            Capacity::InBytes(capacity_in_bytes) => num_bytes > capacity_in_bytes,
-        }
-    }
-}
-
-struct NeedMutMemorySizedCache<K: Hash + Eq> {
-    lru_cache: LruCache<K, StoredItem>,
-    num_items: usize,
-    num_bytes: u64,
-    capacity: Capacity,
-    cache_counters: &'static CacheMetrics,
-}
-
-impl<K: Hash + Eq> Drop for NeedMutMemorySizedCache<K> {
-    fn drop(&mut self) {
-        // we don't count this toward evicted entries, as we are clearing the whole cache
-        self.cache_counters
-            .in_cache_count
-            .sub(self.num_items as i64);
-        self.cache_counters
-            .in_cache_num_bytes
-            .sub(self.num_bytes as i64);
-    }
-}
-
-impl<K: Hash + Eq> NeedMutMemorySizedCache<K> {
-    /// Creates a new NeedMutSliceCache with the given capacity.
-    fn with_capacity(capacity: Capacity, cache_counters: &'static CacheMetrics) -> Self {
-        NeedMutMemorySizedCache {
-            // The limit will be decided by the amount of memory in the cache,
-            // not the number of items in the cache.
-            // Enforcing this limit is done in the `NeedMutCache` impl.
-            lru_cache: LruCache::unbounded(),
-            num_items: 0,
-            num_bytes: 0,
-            capacity,
-            cache_counters,
+impl<K: Hash + Eq + Clone + Send + Sync + 'static> CacheState<K> {
+    fn from_config(
+        cache_config: &CacheConfig,
+        cache_metrics: &'static ComponentCacheMetrics,
+    ) -> Self {
+        let active_cache = AnyCache::from_policy_and_capacity(
+            cache_config.policy(),
+            cache_config.capacity(),
+            cache_metrics.active_cache_metrics.clone(),
+        );
+        let virtual_caches = cache_config
+            .virtual_caches
+            .iter()
+            .map(|virtual_cache_config| {
+                let policy = virtual_cache_config.policy.unwrap_or(cache_config.policy());
+                let capacity = virtual_cache_config
+                    .capacity
+                    .unwrap_or(cache_config.capacity());
+                AnyCache::from_policy_and_capacity(
+                    policy,
+                    capacity,
+                    cache_metrics
+                        .get_or_create_virtual_cache(capacity, policy)
+                        .clone(),
+                )
+            })
+            .collect();
+        CacheState {
+            cache: active_cache,
+            virtual_caches,
         }
     }
 
-    pub fn record_item(&mut self, num_bytes: u64) {
-        self.num_items += 1;
-        self.num_bytes += num_bytes;
-        self.cache_counters.in_cache_count.inc();
-        self.cache_counters.in_cache_num_bytes.add(num_bytes as i64);
+    fn infinite(cache_counters: &'static ComponentCacheMetrics) -> Self {
+        CacheState {
+            cache: AnyCache::unbounded(cache_counters.active_cache_metrics.clone()),
+            // there is no point in having virtual caches for an unbounded cache
+            virtual_caches: Vec::new(),
+        }
     }
 
-    pub fn drop_item(&mut self, num_bytes: u64) {
-        self.num_items -= 1;
-        self.num_bytes -= num_bytes;
-        self.cache_counters.in_cache_count.dec();
-        self.cache_counters.in_cache_num_bytes.sub(num_bytes as i64);
-        self.cache_counters.evict_num_items.inc();
-        self.cache_counters.evict_num_bytes.inc_by(num_bytes);
-    }
-
-    pub fn get<Q>(&mut self, cache_key: &Q) -> Option<OwnedBytes>
+    fn get<Q>(&mut self, cache_key: &Q) -> Option<OwnedBytes>
     where
         K: Borrow<Q>,
+        Arc<K>: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let item_opt = self.lru_cache.get_mut(cache_key);
-        if let Some(item) = item_opt {
-            self.cache_counters.hits_num_items.inc();
-            self.cache_counters.hits_num_bytes.inc_by(item.len() as u64);
-            Some(item.payload())
-        } else {
-            self.cache_counters.misses_num_items.inc();
-            None
+        for virtual_cache in &mut self.virtual_caches {
+            // we simulate an access on all virtual caches, to gather comparable metrics
+            virtual_cache.get(cache_key);
         }
+        self.cache.get(cache_key)
     }
 
-    /// Attempt to put the given amount of data in the cache.
-    /// This may fail silently if the owned_bytes slice is larger than the cache
-    /// capacity.
     fn put(&mut self, key: K, bytes: OwnedBytes) {
-        if self.capacity.exceeds_capacity(bytes.len()) {
-            // The value does not fit in the cache. We simply don't store it.
-            if self.capacity != Capacity::InBytes(0) {
-                warn!(
-                    capacity_in_bytes = ?self.capacity,
-                    len = bytes.len(),
-                    "Downloaded a byte slice larger than the cache capacity."
-                );
-            }
-            return;
+        for virtual_cache in &mut self.virtual_caches {
+            // we simulate an access on all virtual caches, to gather comparable metrics
+            virtual_cache.put(key.clone(), FakeCacheEntry(bytes.len()));
         }
-        if let Some(previous_data) = self.lru_cache.pop(&key) {
-            self.drop_item(previous_data.len() as u64);
-        }
-
-        let now = Instant::now();
-        while self
-            .capacity
-            .exceeds_capacity(self.num_bytes as usize + bytes.len())
-        {
-            if let Some((_, candidate_for_eviction)) = self.lru_cache.peek_lru() {
-                let time_since_last_access =
-                    now.duration_since(candidate_for_eviction.last_access_time());
-                if time_since_last_access < MIN_TIME_SINCE_LAST_ACCESS {
-                    // It is not worth doing an eviction.
-                    // TODO: It is sub-optimal that we might have needlessly evicted items in this
-                    // loop before just returning.
-                    return;
-                }
-            }
-            if let Some((_, bytes)) = self.lru_cache.pop_lru() {
-                self.drop_item(bytes.len() as u64);
-            } else {
-                error!(
-                    "Logical error. Even after removing all of the items in the cache the \
-                     capacity is insufficient. This case is guarded against and should never \
-                     happen."
-                );
-                return;
-            }
-        }
-        self.record_item(bytes.len() as u64);
-        self.lru_cache.put(key, StoredItem::new(bytes, now));
+        self.cache.put(key, bytes)
     }
 }
 
 /// A simple in-resident memory slice cache.
 pub struct MemorySizedCache<K: Hash + Eq = SliceAddress> {
-    inner: Mutex<NeedMutMemorySizedCache<K>>,
+    inner: Mutex<CacheState<K>>,
 }
 
-impl<K: Hash + Eq> MemorySizedCache<K> {
-    /// Creates an slice cache with the given capacity.
-    pub fn with_capacity_in_bytes(
-        capacity_in_bytes: usize,
-        cache_counters: &'static CacheMetrics,
+impl<K: Hash + Eq + Clone + Send + Sync + 'static> MemorySizedCache<K> {
+    /// Creates a slice cache from the given cache config.
+    pub fn from_config(
+        cache_config: &CacheConfig,
+        cache_counters: &'static ComponentCacheMetrics,
     ) -> Self {
         MemorySizedCache {
-            inner: Mutex::new(NeedMutMemorySizedCache::with_capacity(
-                Capacity::InBytes(capacity_in_bytes),
-                cache_counters,
-            )),
+            inner: Mutex::new(CacheState::from_config(cache_config, cache_counters)),
         }
     }
 
     /// Creates a slice cache that never removes any entry.
-    pub fn with_infinite_capacity(cache_counters: &'static CacheMetrics) -> Self {
+    pub fn with_infinite_capacity(cache_counters: &'static ComponentCacheMetrics) -> Self {
         MemorySizedCache {
-            inner: Mutex::new(NeedMutMemorySizedCache::with_capacity(
-                Capacity::Unlimited,
-                cache_counters,
-            )),
+            inner: Mutex::new(CacheState::infinite(cache_counters)),
         }
     }
 
@@ -209,6 +120,7 @@ impl<K: Hash + Eq> MemorySizedCache<K> {
     pub fn get<Q>(&self, cache_key: &Q) -> Option<OwnedBytes>
     where
         K: Borrow<Q>,
+        Arc<K>: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         self.inner.lock().unwrap().get(cache_key)
@@ -240,14 +152,19 @@ impl MemorySizedCache<SliceAddress> {
 
 #[cfg(test)]
 mod tests {
+    use bytesize::ByteSize;
 
     use super::*;
+    use crate::cache::base_cache::LRU_MIN_TIME_SINCE_LAST_ACCESS;
     use crate::metrics::CACHE_METRICS_FOR_TESTS;
 
     #[tokio::test]
     async fn test_cache_edge_condition() {
         tokio::time::pause();
-        let cache = MemorySizedCache::<String>::with_capacity_in_bytes(5, &CACHE_METRICS_FOR_TESTS);
+        let cache = MemorySizedCache::<String>::from_config(
+            &ByteSize::b(5).into(),
+            &CACHE_METRICS_FOR_TESTS,
+        );
         {
             let data = OwnedBytes::new(&b"abc"[..]);
             cache.put("3".to_string(), data);
@@ -266,7 +183,7 @@ mod tests {
             // Eviction should not happen, because all items in cache are too young.
             assert!(cache.get(&"5".to_string()).is_none());
         }
-        tokio::time::advance(super::MIN_TIME_SINCE_LAST_ACCESS.mul_f32(1.1f32)).await;
+        tokio::time::advance(LRU_MIN_TIME_SINCE_LAST_ACCESS.mul_f32(1.1f32)).await;
         {
             let data = OwnedBytes::new(&b"fghij"[..]);
             cache.put("5".to_string(), data);
@@ -275,7 +192,7 @@ mod tests {
             assert!(cache.get(&"2".to_string()).is_none());
             assert!(cache.get(&"3".to_string()).is_none());
         }
-        tokio::time::advance(super::MIN_TIME_SINCE_LAST_ACCESS.mul_f32(1.1f32)).await;
+        tokio::time::advance(LRU_MIN_TIME_SINCE_LAST_ACCESS.mul_f32(1.1f32)).await;
         {
             let data = OwnedBytes::new(&b"klmnop"[..]);
             cache.put("6".to_string(), data);
@@ -304,10 +221,47 @@ mod tests {
 
     #[test]
     fn test_cache() {
-        let cache = MemorySizedCache::with_capacity_in_bytes(10_000, &CACHE_METRICS_FOR_TESTS);
+        let cache =
+            MemorySizedCache::from_config(&ByteSize::kb(10).into(), &CACHE_METRICS_FOR_TESTS);
         assert!(cache.get(&"hello.seg").is_none());
         let data = OwnedBytes::new(&b"werwer"[..]);
         cache.put("hello.seg", data);
         assert_eq!(cache.get(&"hello.seg").unwrap(), &b"werwer"[..]);
+    }
+
+    #[test]
+    fn test_virtual_cache_tracks_metrics_without_storing_data() {
+        static METRICS: once_cell::sync::Lazy<ComponentCacheMetrics> =
+            once_cell::sync::Lazy::new(|| {
+                ComponentCacheMetrics::for_component_in_tests("virtual_cache_test")
+            });
+
+        // an explicit policy and capacity on the virtual cache means no inheritance happens,
+        // so this same (unmutated) config can be used to look its metrics back up below.
+        let cache_config: CacheConfig = serde_json::from_str(
+            r#"{
+                "capacity": "10kb",
+                "policy": "lru",
+                "virtual_caches": [
+                    {"capacity": "10kb", "policy": "s3-fifo"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let virtual_config = cache_config.virtual_caches[0].clone();
+
+        let cache = MemorySizedCache::<String>::from_config(&cache_config, &METRICS);
+        assert!(cache.get(&"key".to_string()).is_none());
+        cache.put("key".to_string(), OwnedBytes::new(&b"hello"[..]));
+        // the virtual cache never actually stores anything: get() only reflects the real cache.
+        assert_eq!(cache.get(&"key".to_string()).unwrap(), &b"hello"[..]);
+
+        let virtual_metrics = METRICS.get_or_create_virtual_cache(
+            virtual_config.capacity.unwrap(),
+            virtual_config.policy.unwrap(),
+        );
+        assert_eq!(virtual_metrics.in_cache_count.get(), 1);
+        assert_eq!(virtual_metrics.hits_num_items.get(), 1);
+        assert_eq!(virtual_metrics.misses_num_items.get(), 1);
     }
 }

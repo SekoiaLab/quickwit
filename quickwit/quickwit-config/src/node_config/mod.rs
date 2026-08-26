@@ -32,7 +32,7 @@ use quickwit_common::uri::Uri;
 use quickwit_proto::indexing::CpuCapacity;
 use quickwit_proto::tonic::codec::CompressionEncoding;
 use quickwit_proto::types::NodeId;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{info, warn};
 
 use crate::node_config::serialize::load_node_config_with_env;
@@ -272,12 +272,25 @@ impl SplitCacheLimits {
 pub struct SearcherConfig {
     pub aggregation_memory_limit: ByteSize,
     pub aggregation_bucket_limit: u32,
-    pub fast_field_cache_capacity: ByteSize,
-    pub split_footer_cache_capacity: ByteSize,
+    #[serde(alias = "fast_field_cache_capacity")]
+    #[serde(
+        deserialize_with = "CacheConfig::deserialize_with_default::<_, {ByteSize::gb(1).as_u64()}>"
+    )]
+    pub fast_field_cache: CacheConfig,
+    #[serde(alias = "split_footer_cache_capacity")]
+    #[serde(deserialize_with = "CacheConfig::deserialize_with_default::<_, \
+                                {ByteSize::mb(500).as_u64()}>")]
+    pub split_footer_cache: CacheConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_footer_disk_cache_capacity: Option<ByteSize>,
-    pub partial_request_cache_capacity: ByteSize,
-    pub predicate_cache_capacity: ByteSize,
+    #[serde(alias = "partial_request_cache_capacity")]
+    #[serde(deserialize_with = "CacheConfig::deserialize_with_default::<_, \
+                                {ByteSize::mb(64).as_u64()}>")]
+    pub partial_request_cache: CacheConfig,
+    #[serde(alias = "predicate_cache_capacity")]
+    #[serde(deserialize_with = "CacheConfig::deserialize_with_default::<_, \
+                                {ByteSize::mb(256).as_u64()}>")]
+    pub predicate_cache: CacheConfig,
     pub max_num_concurrent_split_searches: usize,
     pub max_splits_per_search: Option<usize>,
     // Deprecated: stream search requests are no longer supported.
@@ -295,6 +308,98 @@ pub struct SearcherConfig {
     pub storage_timeout_policy: Option<StorageTimeoutPolicy>,
     pub warmup_memory_budget: ByteSize,
     pub warmup_single_split_initial_allocation: ByteSize,
+}
+
+/// Capacity and eviction policy of an in-memory cache.
+///
+/// For backward compatibility, this can still be deserialized from a bare byte size (e.g.
+/// `"1G"`), in which case the policy defaults to LRU and no virtual cache is configured.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    #[serde(default)]
+    capacity: Option<ByteSize>,
+    #[serde(default)]
+    policy: Option<CachePolicy>,
+    #[serde(default)]
+    pub virtual_caches: Vec<VirtualCacheConfig>,
+}
+
+impl CacheConfig {
+    pub fn default_with_capacity(capacity: ByteSize) -> Self {
+        CacheConfig {
+            capacity: Some(capacity),
+            policy: None,
+            virtual_caches: Vec::new(),
+        }
+    }
+
+    pub fn capacity(&self) -> ByteSize {
+        self.capacity.unwrap_or_default()
+    }
+
+    pub fn policy(&self) -> CachePolicy {
+        self.policy.unwrap_or_default()
+    }
+
+    fn deserialize_with_default<'de, D, const DEFAULT_CAPACITY: u64>(
+        deserializer: D,
+    ) -> Result<CacheConfig, D::Error>
+    where D: Deserializer<'de> {
+        use serde_with::{DeserializeAs, FromInto, PickFirst, Same};
+
+        let mut cache_config: CacheConfig =
+            PickFirst::<(Same, FromInto<ByteSize>)>::deserialize_as(deserializer)?;
+        if cache_config.capacity.is_none() {
+            cache_config.capacity = Some(ByteSize::b(DEFAULT_CAPACITY));
+        }
+        Ok(cache_config)
+    }
+}
+
+impl From<ByteSize> for CacheConfig {
+    fn from(capacity: ByteSize) -> Self {
+        CacheConfig::default_with_capacity(capacity)
+    }
+}
+
+/// Capacity and eviction policy of a virtual cache: a cache that doesn't store
+/// any data, but records metrics as if it did, to help size a real cache or
+/// compare eviction policies.
+///
+/// Unlike [`CacheConfig`], it cannot itself declare virtual caches. When
+/// capacity or policy is not configured, the value from the active cache is
+/// used.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VirtualCacheConfig {
+    #[serde(default)]
+    pub capacity: Option<ByteSize>,
+    #[serde(default)]
+    pub policy: Option<CachePolicy>,
+}
+
+/// Eviction policy used by an in-memory cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CachePolicy {
+    #[default]
+    Lru,
+    S3Fifo,
+    /// The current implementation (moka-rs) doesn't strictly enforce the size
+    /// capacity. You can enqueue as many over-capacity items as there are
+    /// concurrent inserts.
+    TinyLfu,
+}
+
+impl std::fmt::Display for CachePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CachePolicy::Lru => f.write_str("lru"),
+            CachePolicy::S3Fifo => f.write_str("s3-fifo"),
+            CachePolicy::TinyLfu => f.write_str("tiny-lfu"),
+        }
+    }
 }
 
 /// Configuration controlling how fast a searcher should timeout a `get_slice`
@@ -333,11 +438,11 @@ impl StorageTimeoutPolicy {
 impl Default for SearcherConfig {
     fn default() -> Self {
         SearcherConfig {
-            fast_field_cache_capacity: ByteSize::gb(1),
-            split_footer_cache_capacity: ByteSize::mb(500),
+            fast_field_cache: CacheConfig::default_with_capacity(ByteSize::gb(1)),
+            split_footer_cache: CacheConfig::default_with_capacity(ByteSize::mb(500)),
             split_footer_disk_cache_capacity: None,
-            partial_request_cache_capacity: ByteSize::mb(64),
-            predicate_cache_capacity: ByteSize::mb(256),
+            partial_request_cache: CacheConfig::default_with_capacity(ByteSize::mb(64)),
+            predicate_cache: CacheConfig::default_with_capacity(ByteSize::mb(256)),
             max_num_concurrent_split_searches: 100,
             max_splits_per_search: None,
             _max_num_concurrent_split_streams: None,
@@ -856,5 +961,100 @@ mod tests {
             keep_alive: None,
         };
         assert!(grpc_config.validate().is_err());
+    }
+
+    #[test]
+    fn test_cache_config_deserialize_with_default() {
+        // missing field falls back to the per-field hardcoded default capacity, LRU policy.
+        let config: SearcherConfig = serde_yaml::from_str("").unwrap();
+        assert_eq!(config.fast_field_cache.capacity(), ByteSize::gb(1));
+        assert_eq!(config.fast_field_cache.policy(), CachePolicy::Lru);
+
+        // legacy bare byte-size form (old field name) is still accepted.
+        let config: SearcherConfig =
+            serde_yaml::from_str("fast_field_cache_capacity: 10G").unwrap();
+        assert_eq!(
+            config.fast_field_cache,
+            CacheConfig::default_with_capacity(ByteSize::gb(10))
+        );
+
+        // bare byte-size form also works under the new field name.
+        let config: SearcherConfig = serde_yaml::from_str("fast_field_cache: 10G").unwrap();
+        assert_eq!(
+            config.fast_field_cache,
+            CacheConfig::default_with_capacity(ByteSize::gb(10))
+        );
+
+        // full struct form allows overriding the policy alongside the capacity.
+        let config: SearcherConfig = serde_yaml::from_str(
+            r#"
+                fast_field_cache:
+                  capacity: 2G
+                  policy: s3-fifo
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.fast_field_cache.capacity(), ByteSize::gb(2));
+        assert_eq!(config.fast_field_cache.policy(), CachePolicy::S3Fifo);
+
+        // full struct form without a capacity still gets the per-field hardcoded default.
+        let config: SearcherConfig =
+            serde_yaml::from_str("fast_field_cache:\n  policy: tiny-lfu").unwrap();
+        assert_eq!(config.fast_field_cache.capacity(), ByteSize::gb(1));
+        assert_eq!(config.fast_field_cache.policy(), CachePolicy::TinyLfu);
+    }
+
+    #[test]
+    fn test_virtual_cache_config_deserialize() {
+        // no virtual caches configured by default.
+        let cache_config: CacheConfig = serde_yaml::from_str("capacity: 10G").unwrap();
+        assert!(cache_config.virtual_caches.is_empty());
+
+        // capacity and policy are both optional, and independent of one another; resolving them
+        // against the real cache's own capacity/policy is the caller's responsibility.
+        let cache_config: CacheConfig = serde_yaml::from_str(
+            r#"
+                capacity: 10G
+                virtual_caches:
+                  - {}
+                  - policy: s3-fifo
+                  - capacity: 1G
+                  - capacity: 2G
+                    policy: tiny-lfu
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cache_config.virtual_caches,
+            vec![
+                VirtualCacheConfig {
+                    capacity: None,
+                    policy: None
+                },
+                VirtualCacheConfig {
+                    capacity: None,
+                    policy: Some(CachePolicy::S3Fifo)
+                },
+                VirtualCacheConfig {
+                    capacity: Some(ByteSize::gb(1)),
+                    policy: None
+                },
+                VirtualCacheConfig {
+                    capacity: Some(ByteSize::gb(2)),
+                    policy: Some(CachePolicy::TinyLfu)
+                },
+            ]
+        );
+
+        // unlike CacheConfig, a virtual cache cannot itself declare virtual caches.
+        let error = serde_yaml::from_str::<CacheConfig>(
+            r#"
+                capacity: 10G
+                virtual_caches:
+                  - virtual_caches: []
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("virtual_caches"));
     }
 }

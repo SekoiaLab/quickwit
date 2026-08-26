@@ -26,7 +26,7 @@ use lru::LruCache;
 use tracing::{info, warn};
 
 use crate::OwnedBytes;
-use crate::metrics::CacheMetrics;
+use crate::metrics::{CacheMetricCounters, ComponentCacheMetrics};
 
 /// Substring used to mark files that are being written.
 const TEMP_MARKER: &str = ".tmp";
@@ -40,7 +40,7 @@ struct DiskCacheIndex {
     lru_cache: LruCache<String, u64>,
     num_bytes: u64,
     capacity_in_bytes: u64,
-    cache_counters: &'static CacheMetrics,
+    cache_counters: &'static CacheMetricCounters,
 }
 
 impl DiskCacheIndex {
@@ -104,7 +104,7 @@ impl<K: Display> DiskSizedCache<K> {
     pub async fn open(
         root_path: PathBuf,
         capacity_in_bytes: u64,
-        cache_counters: &'static CacheMetrics,
+        cache_counters: &'static ComponentCacheMetrics,
     ) -> io::Result<Self>
     where
         K: 'static,
@@ -119,7 +119,7 @@ impl<K: Display> DiskSizedCache<K> {
     fn open_blocking(
         root_path: PathBuf,
         capacity_in_bytes: u64,
-        cache_counters: &'static CacheMetrics,
+        cache_counters: &'static ComponentCacheMetrics,
     ) -> io::Result<Self> {
         let start = Instant::now();
         std::fs::create_dir_all(&root_path)?;
@@ -171,7 +171,7 @@ impl<K: Display> DiskSizedCache<K> {
             lru_cache: LruCache::unbounded(),
             num_bytes: 0,
             capacity_in_bytes,
-            cache_counters,
+            cache_counters: &cache_counters.active_cache_metrics,
         };
         for (file_name, num_bytes, _) in entries {
             index.record_item(num_bytes);
