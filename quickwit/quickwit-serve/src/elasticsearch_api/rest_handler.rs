@@ -420,8 +420,6 @@ fn build_request_for_es_api(
             ignore_missing_indexes,
             split_id: None,
             user_agent: user_agent.and_then(|h| h.to_str().ok().map(str::to_owned)),
-            // Computed by the root service once the query AST is resolved.
-            cost_class: 0,
         },
         has_doc_id_field,
     ))

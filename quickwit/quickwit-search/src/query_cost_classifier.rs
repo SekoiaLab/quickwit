@@ -14,9 +14,6 @@
 
 //! Heuristic classification of search queries by expected execution cost.
 //!
-//! The classification is used exclusively to label metrics (search thread
-//! pool occupancy, search permits, ...), so that the resource usage of
-//! expensive queries can be monitored separately from that of regular ones.
 //! It must remain a cheap, pure function of the query AST: no I/O, no schema
 //! access, and no query execution.
 
@@ -53,25 +50,16 @@ impl QueryCostClass {
     }
 }
 
-/// Converts to the wire representation, so the cost class computed once at
-/// the root can be carried on [`quickwit_proto::search::SearchRequest`] down
-/// to leaf/searcher nodes, instead of being reclassified there.
-impl From<QueryCostClass> for quickwit_proto::search::QueryCostClass {
-    fn from(cost_class: QueryCostClass) -> Self {
-        match cost_class {
-            QueryCostClass::Regular => quickwit_proto::search::QueryCostClass::Regular,
-            QueryCostClass::Costly => quickwit_proto::search::QueryCostClass::Costly,
-        }
-    }
-}
-
-impl From<quickwit_proto::search::QueryCostClass> for QueryCostClass {
-    fn from(cost_class: quickwit_proto::search::QueryCostClass) -> Self {
-        match cost_class {
-            quickwit_proto::search::QueryCostClass::Regular => QueryCostClass::Regular,
-            quickwit_proto::search::QueryCostClass::Costly => QueryCostClass::Costly,
-        }
-    }
+/// Classifies a query from its JSON serialized AST, as carried by
+/// [`quickwit_proto::search::SearchRequest::query_ast`].
+///
+/// A query that fails to parse is reported as [`QueryCostClass::Regular`]: it is rejected with a
+/// proper error further down the line, and this is only about labelling metrics.
+pub fn classify_serialized(query_ast_json: &str) -> QueryCostClass {
+    let Ok(query_ast) = serde_json::from_str::<QueryAst>(query_ast_json) else {
+        return QueryCostClass::Regular;
+    };
+    classify(&query_ast)
 }
 
 /// Classifies a query AST as [`QueryCostClass::Regular`] or
@@ -79,7 +67,7 @@ impl From<quickwit_proto::search::QueryCostClass> for QueryCostClass {
 ///
 /// This is a pure, cheap function (no I/O) meant to be called for every
 /// query in order to attach a coarse-grained cost label to metrics.
-pub fn classify(query_ast: &QueryAst) -> QueryCostClass {
+fn classify(query_ast: &QueryAst) -> QueryCostClass {
     match CostClassifierVisitor.visit(query_ast) {
         Ok(()) => QueryCostClass::Regular,
         Err(Costly) => QueryCostClass::Costly,

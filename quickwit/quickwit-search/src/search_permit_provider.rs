@@ -217,7 +217,7 @@ impl LeafPermitRequest {
             });
             permits.push(SearchPermitFuture {
                 receiver: rx,
-                requested_at,
+                requested_at: Some(requested_at),
             });
         }
         (
@@ -393,7 +393,19 @@ impl Drop for SearchPermit {
 
 pub struct SearchPermitFuture {
     receiver: oneshot::Receiver<SearchPermit>,
-    requested_at: Instant,
+    /// Taken by `observe_wait_duration`, so that the wait is reported exactly once.
+    requested_at: Option<Instant>,
+}
+
+impl SearchPermitFuture {
+    /// Reports the time spent queuing for this permit, at most once.
+    fn observe_wait_duration(&mut self) {
+        if let Some(requested_at) = self.requested_at.take() {
+            crate::metrics::SEARCH_METRICS
+                .leaf_search_permit_wait_duration_secs
+                .observe(requested_at.elapsed().as_secs_f64());
+        }
+    }
 }
 
 impl Future for SearchPermitFuture {
@@ -404,9 +416,7 @@ impl Future for SearchPermitFuture {
         let receiver = Pin::new(&mut this.receiver);
         match receiver.poll(cx) {
             Poll::Ready(Ok(search_permit)) => {
-                crate::metrics::SEARCH_METRICS
-                    .leaf_search_permit_wait_duration_secs
-                    .observe(this.requested_at.elapsed().as_secs_f64());
+                this.observe_wait_duration();
                 Poll::Ready(search_permit)
             }
             Poll::Ready(Err(_)) => panic!(
@@ -414,6 +424,12 @@ impl Future for SearchPermitFuture {
             ),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl Drop for SearchPermitFuture {
+    fn drop(&mut self) {
+        self.observe_wait_duration();
     }
 }
 
@@ -447,6 +463,33 @@ mod tests {
             .await;
         assert_eq!(permits.len(), 1);
         let _permit = permits.into_iter().next().unwrap().await;
+    }
+
+    /// A wait that ends in a cancellation must still be reported, otherwise the metric hides the
+    /// longest waits.
+    #[tokio::test]
+    async fn test_abandoned_permit_wait_is_reported() {
+        let samples_before = SEARCH_METRICS
+            .leaf_search_permit_wait_duration_secs
+            .get_sample_count();
+
+        // A single search slot, so the second permit stays queued. Neither future is ever polled,
+        // so both waits can only be reported by `Drop`.
+        let permit_provider = SearchPermitProvider::new(1, ByteSize::mb(100), test_metrics());
+        let permit_futs = permit_provider
+            .get_permits(repeat_n(ByteSize::mb(10), 2), QueryCostClass::Regular)
+            .await;
+        assert_eq!(permit_futs.len(), 2);
+        drop(permit_futs);
+
+        // `SEARCH_METRICS` is process wide, so other tests may concurrently add samples of their
+        // own: only the two we are responsible for are guaranteed.
+        assert!(
+            SEARCH_METRICS
+                .leaf_search_permit_wait_duration_secs
+                .get_sample_count()
+                >= samples_before + 2
+        );
     }
 
     #[tokio::test]

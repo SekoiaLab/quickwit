@@ -56,7 +56,7 @@ use quickwit_proto::metastore::{
     ListIndexesMetadataRequest, ListSplitsRequest, MetastoreService, MetastoreServiceClient,
 };
 use tantivy::schema::NamedFieldDocument;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Refer to this as `crate::Result<T>`.
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -111,11 +111,15 @@ fn compute_search_thread_pool_num_threads() -> Option<usize> {
     if let Some(num_cpus) =
         quickwit_common::get_from_env_opt::<usize>("QW_SEARCH_THREAD_POOL_NUM_CPUS", false)
     {
-        info!(
-            threads = num_cpus,
-            "search thread pool configured from QW_SEARCH_THREAD_POOL_NUM_CPUS"
-        );
-        return Some(num_cpus);
+        if num_cpus == 0 {
+            warn!("QW_SEARCH_THREAD_POOL_NUM_CPUS is set to 0, ignoring it");
+        } else {
+            info!(
+                threads = num_cpus,
+                "search thread pool configured from QW_SEARCH_THREAD_POOL_NUM_CPUS"
+            );
+            return Some(num_cpus);
+        }
     }
     let use_all_cpus =
         quickwit_common::get_bool_from_env("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS", false);

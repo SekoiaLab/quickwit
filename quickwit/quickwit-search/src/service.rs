@@ -41,11 +41,12 @@ use crate::list_fields_cache::ListFieldsCache;
 use crate::list_terms::{leaf_list_terms, root_list_terms};
 use crate::metrics::SEARCH_METRICS;
 use crate::metrics_trackers::LeafSearchMetricsFuture;
-use crate::query_cost_classifier::QueryCostClass;
 use crate::root::fetch_docs_phase;
 use crate::scroll_context::{MiniKV, ScrollContext, ScrollKeyAndStartOffset};
 use crate::search_permit_provider::SearchPermitProvider;
-use crate::{ClusterClient, SearchError, fetch_docs, root_search, search_plan};
+use crate::{
+    ClusterClient, SearchError, fetch_docs, query_cost_classifier, root_search, search_plan,
+};
 
 #[derive(Clone)]
 /// The search service implementation.
@@ -183,7 +184,9 @@ impl SearchService for SearchServiceImpl {
         let Some(search_request) = leaf_search_request.search_request.as_ref() else {
             return Err(SearchError::Internal("no search request".to_string()));
         };
-        let cost_class: QueryCostClass = search_request.cost_class().into();
+        // The cost class is computed here, once per leaf request: it labels the permit and task
+        // gauges, so it has to be known before any permit is requested.
+        let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
         let num_splits = leaf_search_request
             .leaf_requests
             .iter()
@@ -196,6 +199,7 @@ impl SearchService for SearchServiceImpl {
                 self.searcher_context.clone(),
                 leaf_search_request,
                 &self.storage_resolver,
+                cost_class,
             ),
             start: Instant::now(),
             targeted_splits: num_splits,

@@ -190,11 +190,6 @@ pub struct SearchRequest {
     /// The user agent of the client that initiated the search request.
     #[prost(string, optional, tag = "20")]
     pub user_agent: ::core::option::Option<::prost::alloc::string::String>,
-    /// Coarse classification of the expected cost of this query. Computed once
-    /// at the root, right after the query AST is resolved, and carried along
-    /// so leaf/searcher nodes don't need to reclassify the query themselves.
-    #[prost(enumeration = "QueryCostClass", tag = "21")]
-    pub cost_class: i32,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -690,38 +685,6 @@ impl CountHits {
         match value {
             "COUNT_ALL" => Some(Self::CountAll),
             "UNDERESTIMATE" => Some(Self::Underestimate),
-            _ => None,
-        }
-    }
-}
-#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "snake_case")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum QueryCostClass {
-    /// The query is expected to run with predictable, moderate cost.
-    Regular = 0,
-    /// The query contains patterns (e.g. unanchored regexes or wildcards) that
-    /// can prevent efficient pruning of the term dictionary, and can be
-    /// significantly more expensive to run.
-    Costly = 1,
-}
-impl QueryCostClass {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Regular => "REGULAR",
-            Self::Costly => "COSTLY",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "REGULAR" => Some(Self::Regular),
-            "COSTLY" => Some(Self::Costly),
             _ => None,
         }
     }

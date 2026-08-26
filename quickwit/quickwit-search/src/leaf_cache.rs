@@ -16,7 +16,7 @@ use std::ops::{Bound, RangeBounds};
 
 use prost::Message;
 use quickwit_proto::search::{
-    CountHits, LeafSearchResponse, QueryCostClass, SearchRequest, SplitIdAndFooterOffsets,
+    CountHits, LeafSearchResponse, SearchRequest, SplitIdAndFooterOffsets,
 };
 use quickwit_proto::types::SplitId;
 use quickwit_storage::{MemorySizedCache, OwnedBytes};
@@ -104,7 +104,6 @@ impl CacheKey {
         // it doesn't matter whether or not we count all hits at the scale of a
         // single split: either we did process it and got everything, or we didn't.
         search_request.count_hits = CountHits::CountAll.into();
-        search_request.set_cost_class(QueryCostClass::Regular);
 
         CacheKey {
             split_id: split_info.split_id,

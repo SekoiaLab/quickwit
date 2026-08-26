@@ -272,8 +272,6 @@ pub fn search_request_from_api_request(
         ignore_missing_indexes: false,
         split_id: search_request.split_id,
         user_agent,
-        // Computed by the root service once the query AST is resolved.
-        cost_class: 0,
     };
     Ok(search_request)
 }

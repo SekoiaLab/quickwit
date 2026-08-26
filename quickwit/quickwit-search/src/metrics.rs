@@ -145,7 +145,6 @@ pub struct SearchMetrics {
     pub root_search_requests_total: IntCounterVec<2>,
     pub root_search_request_duration_seconds: HistogramVec<2>,
     pub root_search_targeted_splits: HistogramVec<2>,
-    pub query_cost_class_total: IntCounterVec<1>,
     pub leaf_search_requests_total: IntCounterVec<2>,
     pub leaf_search_request_duration_seconds: HistogramVec<2>,
     pub leaf_search_targeted_splits: HistogramVec<2>,
@@ -243,15 +242,6 @@ impl Default for SearchMetrics {
                 ["user_agent", "status"],
                 targeted_splits_buckets.clone(),
             ),
-            query_cost_class_total: new_counter_vec(
-                "query_cost_class_total",
-                "Total number of search queries classified by their expected cost. Recorded once \
-                 per root search request, regardless of how many splits or searcher nodes end up \
-                 handling it.",
-                "search",
-                &[],
-                ["cost_class"],
-            ),
             leaf_search_requests_total: new_counter_vec(
                 "leaf_search_requests_total",
                 "Total number of leaf search gRPC requests processed.",
@@ -292,7 +282,9 @@ impl Default for SearchMetrics {
             ),
             leaf_search_permit_wait_duration_secs: new_histogram(
                 "leaf_search_permit_wait_duration_secs",
-                "Number of seconds a single split leaf search waited to acquire a search permit.",
+                "Number of seconds a single split leaf search waited for a search permit, whether \
+                 it ended up acquiring it or gave up because the leaf request was cancelled or \
+                 timed out.",
                 "search",
                 exponential_buckets(0.001, 2.0, 16).unwrap(),
             ),
