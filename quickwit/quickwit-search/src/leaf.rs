@@ -51,6 +51,7 @@ use tracing::*;
 
 use crate::collector::{IncrementalCollector, make_collector_for_split, make_merge_collector};
 use crate::metrics::SplitSearchOutcomeCounters;
+use crate::query_cost_classifier::QueryCostClass;
 use crate::root::is_metadata_count_request_with_ast;
 use crate::search_permit_provider::{SearchPermit, compute_initial_memory_allocation};
 use crate::service::{SearcherContext, deserialize_doc_mapper};
@@ -1223,6 +1224,7 @@ pub async fn multi_index_leaf_search(
     searcher_context: Arc<SearcherContext>,
     leaf_search_request: LeafSearchRequest,
     storage_resolver: &StorageResolver,
+    cost_class: QueryCostClass,
 ) -> Result<LeafSearchResponse, SearchError> {
     let search_request: Arc<SearchRequest> = leaf_search_request
         .search_request
@@ -1280,6 +1282,7 @@ pub async fn multi_index_leaf_search(
                     leaf_search_request_ref.split_offsets,
                     doc_mapper,
                     aggregation_limits,
+                    cost_class,
                 )
                 .in_current_span()
                 .await
@@ -1365,6 +1368,7 @@ pub async fn single_doc_mapping_leaf_search(
     splits: Vec<SplitIdAndFooterOffsets>,
     doc_mapper: Arc<DocMapper>,
     aggregations_limits: AggregationLimitsGuard,
+    cost_class: QueryCostClass,
 ) -> Result<LeafSearchResponse, SearchError> {
     let num_docs: u64 = splits.iter().map(|split| split.num_docs).sum();
     let num_splits = splits.len();
@@ -1391,7 +1395,7 @@ pub async fn single_doc_mapping_leaf_search(
     });
     let permit_futures = searcher_context
         .search_permit_provider
-        .get_permits(permit_sizes)
+        .get_permits(permit_sizes, cost_class)
         .await;
 
     let leaf_search_context = Arc::new(LeafSearchContext {

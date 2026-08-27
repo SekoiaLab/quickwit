@@ -38,6 +38,7 @@ use self::leaf::single_doc_mapping_leaf_search;
 use super::*;
 use crate::find_trace_ids_collector::Span;
 use crate::list_terms::leaf_list_terms;
+use crate::query_cost_classifier::QueryCostClass;
 use crate::service::SearcherContext;
 use crate::single_node_search;
 
@@ -1136,6 +1137,7 @@ async fn test_search_util(test_sandbox: &TestSandbox, query: &str) -> Vec<u32> {
         splits_offsets,
         test_sandbox.doc_mapper(),
         agg_limits,
+        QueryCostClass::Regular,
     )
     .await
     .unwrap();

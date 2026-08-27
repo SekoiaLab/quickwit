@@ -19,13 +19,14 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytesize::ByteSize;
-use quickwit_common::metrics::GaugeGuard;
+use quickwit_common::metrics::{GaugeGuard, HistogramTimer};
 use quickwit_proto::search::SplitIdAndFooterOffsets;
 #[cfg(test)]
 use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::metrics::SearchTaskMetrics;
+use crate::query_cost_classifier::QueryCostClass;
 
 /// Distributor of permits to perform split search operation.
 ///
@@ -45,6 +46,7 @@ pub enum SearchPermitMessage {
     Request {
         permit_sender: oneshot::Sender<Vec<SearchPermitFuture>>,
         permit_sizes: Vec<u64>,
+        cost_class: QueryCostClass,
     },
     UpdateMemory {
         memory_delta: i64,
@@ -113,9 +115,14 @@ impl SearchPermitProvider {
     /// returned by subsequent calls to this function.
     ///
     /// The permit memory size is capped by per_permit_initial_memory_allocation.
+    ///
+    /// `cost_class` is the [`QueryCostClass`] of the search request these splits belong to. It
+    /// is used to label the ongoing/pending task gauges, so it applies to every permit returned
+    /// by this call.
     pub async fn get_permits(
         &self,
         splits: impl IntoIterator<Item = ByteSize>,
+        cost_class: QueryCostClass,
     ) -> Vec<SearchPermitFuture> {
         let permit_sizes: Vec<u64> = splits.into_iter().map(|size| size.as_u64()).collect();
         if permit_sizes.is_empty() {
@@ -126,6 +133,7 @@ impl SearchPermitProvider {
             .send(SearchPermitMessage::Request {
                 permit_sender,
                 permit_sizes,
+                cost_class,
             })
             .expect("Receiver lives longer than sender");
         permit_receiver
@@ -157,6 +165,8 @@ struct SingleSplitPermitRequest {
 struct LeafPermitRequest {
     /// Single split permit requests for this leaf search.
     single_split_permit_requests: std::vec::IntoIter<SingleSplitPermitRequest>,
+    /// Cost class of the search request these single split requests belong to.
+    cost_class: QueryCostClass,
 }
 
 impl Ord for LeafPermitRequest {
@@ -186,9 +196,13 @@ impl PartialEq for LeafPermitRequest {
 impl Eq for LeafPermitRequest {}
 
 impl LeafPermitRequest {
-    fn from_estimated_costs(permit_sizes: Vec<u64>) -> (Self, Vec<SearchPermitFuture>) {
+    fn from_estimated_costs(
+        permit_sizes: Vec<u64>,
+        cost_class: QueryCostClass,
+    ) -> (Self, Vec<SearchPermitFuture>) {
         let mut permits = Vec::with_capacity(permit_sizes.len());
         let mut single_split_permit_requests = Vec::with_capacity(permit_sizes.len());
+        let wait_histogram = &crate::metrics::SEARCH_METRICS.leaf_search_permit_wait_duration_secs;
         for permit_size in permit_sizes {
             let (tx, rx) = oneshot::channel();
             // we keep our internal list of permits and the returned wait handles in the
@@ -198,11 +212,15 @@ impl LeafPermitRequest {
                 permit_sender: tx,
                 permit_size,
             });
-            permits.push(SearchPermitFuture(rx));
+            permits.push(SearchPermitFuture {
+                receiver: rx,
+                wait_timer: Some(wait_histogram.start_timer()),
+            });
         }
         (
             LeafPermitRequest {
                 single_split_permit_requests: single_split_permit_requests.into_iter(),
+                cost_class,
             },
             permits,
         )
@@ -238,6 +256,7 @@ impl SearchPermitActor {
             SearchPermitMessage::Request {
                 permit_sizes,
                 permit_sender,
+                cost_class,
             } => {
                 assert_ne!(
                     permit_sizes.len(),
@@ -245,7 +264,7 @@ impl SearchPermitActor {
                     "empty permit request would lead to deadlock"
                 );
                 let (leaf_permit_request, permits) =
-                    LeafPermitRequest::from_estimated_costs(permit_sizes);
+                    LeafPermitRequest::from_estimated_costs(permit_sizes, cost_class);
                 self.permits_requests.push(leaf_permit_request);
                 self.assign_available_permits();
                 // The receiver could be dropped in the (unlikely) situation
@@ -272,7 +291,9 @@ impl SearchPermitActor {
         }
     }
 
-    fn pop_next_request_if_serviceable(&mut self) -> Option<SingleSplitPermitRequest> {
+    fn pop_next_request_if_serviceable(
+        &mut self,
+    ) -> Option<(SingleSplitPermitRequest, QueryCostClass)> {
         if self.num_search_slots_available == 0 {
             return None;
         }
@@ -280,19 +301,20 @@ impl SearchPermitActor {
             .total_memory_budget
             .checked_sub(self.total_memory_allocated)?;
         let mut peeked = self.permits_requests.peek_mut()?;
+        let cost_class = peeked.cost_class;
 
         if let Some(permit_request) = peeked.pop_if_smaller_than(available_memory) {
             if peeked.is_empty() {
                 PeekMut::pop(peeked);
             }
-            return Some(permit_request);
+            return Some((permit_request, cost_class));
         }
         None
     }
 
     fn assign_available_permits(&mut self) {
-        while let Some(permit_request) = self.pop_next_request_if_serviceable() {
-            let ongoing_tasks_metric = self.metrics.ongoing_tasks;
+        while let Some((permit_request, cost_class)) = self.pop_next_request_if_serviceable() {
+            let ongoing_tasks_metric = self.metrics.ongoing_tasks.get(cost_class);
             let mut ongoing_gauge_guard = GaugeGuard::from_gauge(ongoing_tasks_metric);
             ongoing_gauge_guard.add(1);
             self.total_memory_allocated += permit_request.permit_size;
@@ -308,12 +330,21 @@ impl SearchPermitActor {
                 // created SearchPermit which releases the resources
                 .ok();
         }
-        let pending_tasks = self
-            .permits_requests
-            .iter()
-            .map(|leaf_req| leaf_req.single_split_permit_requests.as_slice().len() as i64)
-            .sum();
-        self.metrics.pending_tasks.set(pending_tasks);
+        let mut pending_tasks_regular: i64 = 0;
+        let mut pending_tasks_costly: i64 = 0;
+        for leaf_req in self.permits_requests.iter() {
+            let num_pending_tasks = leaf_req.single_split_permit_requests.as_slice().len() as i64;
+            // exhaustive match: a new cost class can't silently leave a gauge behind.
+            match leaf_req.cost_class {
+                QueryCostClass::Regular => pending_tasks_regular += num_pending_tasks,
+                QueryCostClass::Costly => pending_tasks_costly += num_pending_tasks,
+            }
+        }
+        self.metrics
+            .pending_tasks
+            .regular
+            .set(pending_tasks_regular);
+        self.metrics.pending_tasks.costly.set(pending_tasks_costly);
     }
 }
 
@@ -357,16 +388,30 @@ impl Drop for SearchPermit {
     }
 }
 
-pub struct SearchPermitFuture(oneshot::Receiver<SearchPermit>);
+pub struct SearchPermitFuture {
+    receiver: oneshot::Receiver<SearchPermit>,
+    /// Records the time spent queuing for this permit
+    wait_timer: Option<HistogramTimer>,
+}
 
 impl Future for SearchPermitFuture {
     type Output = SearchPermit;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let receiver = Pin::new(&mut self.get_mut().0);
+        let this = self.get_mut();
+        let receiver = Pin::new(&mut this.receiver);
         match receiver.poll(cx) {
-            Poll::Ready(Ok(search_permit)) => Poll::Ready(search_permit),
-            Poll::Ready(Err(_)) => panic!("Failed to acquire permit. This should never happen! Please, report on https://github.com/quickwit-oss/quickwit/issues."),
+            Poll::Ready(Ok(search_permit)) => {
+                // Record now rather than on drop, so that the measure doesn't depend on how long
+                // the caller holds onto this future once it has resolved.
+                if let Some(wait_timer) = this.wait_timer.take() {
+                    wait_timer.observe_duration();
+                }
+                Poll::Ready(search_permit)
+            }
+            Poll::Ready(Err(_)) => panic!(
+                "Failed to acquire permit. This should never happen! Please, report on https://github.com/quickwit-oss/quickwit/issues."
+            ),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -391,13 +436,44 @@ mod tests {
     #[tokio::test]
     async fn test_get_permits_empty() {
         let permit_provider = SearchPermitProvider::new(1, ByteSize::mb(100), test_metrics());
-        let permits = permit_provider.get_permits(std::iter::empty()).await;
+        let permits = permit_provider
+            .get_permits(std::iter::empty(), QueryCostClass::Regular)
+            .await;
         assert!(permits.is_empty());
 
         // Subsequent non-empty requests must still be served normally.
-        let permits = permit_provider.get_permits([ByteSize::mb(10)]).await;
+        let permits = permit_provider
+            .get_permits([ByteSize::mb(10)], QueryCostClass::Regular)
+            .await;
         assert_eq!(permits.len(), 1);
         let _permit = permits.into_iter().next().unwrap().await;
+    }
+
+    /// A wait that ends in a cancellation must still be reported, otherwise the metric hides the
+    /// longest waits.
+    #[tokio::test]
+    async fn test_abandoned_permit_wait_is_reported() {
+        let samples_before = SEARCH_METRICS
+            .leaf_search_permit_wait_duration_secs
+            .get_sample_count();
+
+        // A single search slot, so the second permit stays queued. Neither future is ever polled,
+        // so both waits can only be reported by `Drop`.
+        let permit_provider = SearchPermitProvider::new(1, ByteSize::mb(100), test_metrics());
+        let permit_futs = permit_provider
+            .get_permits(repeat_n(ByteSize::mb(10), 2), QueryCostClass::Regular)
+            .await;
+        assert_eq!(permit_futs.len(), 2);
+        drop(permit_futs);
+
+        // `SEARCH_METRICS` is process wide, so other tests may concurrently add samples of their
+        // own: only the two we are responsible for are guaranteed.
+        assert!(
+            SEARCH_METRICS
+                .leaf_search_permit_wait_duration_secs
+                .get_sample_count()
+                >= samples_before + 2
+        );
     }
 
     #[tokio::test]
@@ -405,7 +481,7 @@ mod tests {
         let permit_provider = SearchPermitProvider::new(1, ByteSize::mb(100), test_metrics());
         let mut all_futures = Vec::new();
         let first_batch_of_permits = permit_provider
-            .get_permits(repeat_n(ByteSize::mb(10), 10))
+            .get_permits(repeat_n(ByteSize::mb(10), 10), QueryCostClass::Regular)
             .await;
         assert_eq!(first_batch_of_permits.len(), 10);
         all_futures.extend(
@@ -416,7 +492,7 @@ mod tests {
         );
 
         let second_batch_of_permits = permit_provider
-            .get_permits(repeat_n(ByteSize::mb(10), 10))
+            .get_permits(repeat_n(ByteSize::mb(10), 10), QueryCostClass::Regular)
             .await;
         assert_eq!(second_batch_of_permits.len(), 10);
         all_futures.extend(
@@ -455,7 +531,7 @@ mod tests {
         let permit_provider = SearchPermitProvider::new(4, ByteSize::mb(100), test_metrics());
         let mut all_futures = Vec::new();
         let first_batch_of_permits = permit_provider
-            .get_permits(repeat_n(ByteSize::mb(10), 8))
+            .get_permits(repeat_n(ByteSize::mb(10), 8), QueryCostClass::Regular)
             .await;
         assert_eq!(first_batch_of_permits.len(), 8);
         all_futures.extend(
@@ -466,7 +542,7 @@ mod tests {
         );
 
         let second_batch_of_permits = permit_provider
-            .get_permits(repeat_n(ByteSize::mb(10), 2))
+            .get_permits(repeat_n(ByteSize::mb(10), 2), QueryCostClass::Regular)
             .await;
         all_futures.extend(
             second_batch_of_permits
@@ -476,7 +552,7 @@ mod tests {
         );
 
         let third_batch_of_permits = permit_provider
-            .get_permits(repeat_n(ByteSize::mb(10), 6))
+            .get_permits(repeat_n(ByteSize::mb(10), 6), QueryCostClass::Regular)
             .await;
         all_futures.extend(
             third_batch_of_permits
@@ -523,13 +599,13 @@ mod tests {
     async fn test_search_permit_early_drops() {
         let permit_provider = SearchPermitProvider::new(1, ByteSize::mb(100), test_metrics());
         let permit_fut1 = permit_provider
-            .get_permits(vec![ByteSize::mb(10)])
+            .get_permits([ByteSize::mb(10)], QueryCostClass::Regular)
             .await
             .into_iter()
             .next()
             .unwrap();
         let permit_fut2 = permit_provider
-            .get_permits([ByteSize::mb(10)])
+            .get_permits([ByteSize::mb(10)], QueryCostClass::Regular)
             .await
             .into_iter()
             .next()
@@ -540,7 +616,7 @@ mod tests {
         assert_eq!(*permit_provider.actor_stopped.borrow(), false);
 
         let _permit_fut3 = permit_provider
-            .get_permits([ByteSize::mb(10)])
+            .get_permits([ByteSize::mb(10)], QueryCostClass::Regular)
             .await
             .into_iter()
             .next()
@@ -564,7 +640,7 @@ mod tests {
     async fn test_memory_budget() {
         let permit_provider = SearchPermitProvider::new(100, ByteSize::mb(100), test_metrics());
         let mut permit_futs = permit_provider
-            .get_permits(repeat_n(ByteSize::mb(10), 14))
+            .get_permits(repeat_n(ByteSize::mb(10), 14), QueryCostClass::Regular)
             .await;
         let mut remaining_permit_futs = permit_futs.split_off(10).into_iter();
         assert_eq!(remaining_permit_futs.len(), 4);
@@ -594,7 +670,7 @@ mod tests {
     async fn test_concurrent_search_slots() {
         let permit_provider = SearchPermitProvider::new(10, ByteSize::mb(100), test_metrics());
         let mut permit_futs = permit_provider
-            .get_permits(repeat_n(ByteSize::mb(1), 16))
+            .get_permits(repeat_n(ByteSize::mb(1), 16), QueryCostClass::Regular)
             .await;
         let mut remaining_permit_futs = permit_futs.split_off(10).into_iter();
         assert_eq!(remaining_permit_futs.len(), 6);

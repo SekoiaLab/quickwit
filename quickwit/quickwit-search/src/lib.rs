@@ -29,6 +29,7 @@ mod list_fields;
 mod list_fields_cache;
 mod list_terms;
 mod metrics_trackers;
+mod query_cost_classifier;
 mod retry;
 mod root;
 mod scroll_context;
@@ -55,7 +56,7 @@ use quickwit_proto::metastore::{
     ListIndexesMetadataRequest, ListSplitsRequest, MetastoreService, MetastoreServiceClient,
 };
 use tantivy::schema::NamedFieldDocument;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Refer to this as `crate::Result<T>`.
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -98,22 +99,87 @@ pub use crate::service::{MockSearchService, SearchService, SearchServiceImpl};
 /// A pool of searcher clients identified by their gRPC socket address.
 pub type SearcherPool = Pool<SocketAddr, SearchServiceClient>;
 
+/// Computes the number of threads to use for the search thread pool.
+///
+/// `None` means the default Rayon thread pool size (i.e. one thread per CPU) should be used.
+///
+/// The number of threads is picked, in order of precedence, from:
+/// - the `QW_SEARCH_THREAD_POOL_NUM_CPUS` environment variable, if set
+/// - all available CPUs, if `QW_SEARCH_THREAD_POOL_USE_ALL_CPUS` is set to true
+/// - all available CPUs but one, otherwise
+fn compute_search_thread_pool_num_threads() -> Option<usize> {
+    if let Some(num_cpus) =
+        quickwit_common::get_from_env_opt::<usize>("QW_SEARCH_THREAD_POOL_NUM_CPUS", false)
+    {
+        if num_cpus == 0 {
+            warn!("QW_SEARCH_THREAD_POOL_NUM_CPUS is set to 0, ignoring it");
+        } else {
+            info!(
+                threads = num_cpus,
+                "search thread pool configured from QW_SEARCH_THREAD_POOL_NUM_CPUS"
+            );
+            return Some(num_cpus);
+        }
+    }
+    let use_all_cpus =
+        quickwit_common::get_bool_from_env("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS", false);
+    if use_all_cpus {
+        info!("search thread pool configured with default Rayon thread pool size");
+        return None;
+    }
+    let threads = usize::max(quickwit_common::num_cpus().saturating_sub(1), 1);
+    info!(threads, "search thread pool configured with one free CPU");
+    Some(threads)
+}
+
 fn search_thread_pool() -> &'static ThreadPool {
     static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
-    SEARCH_THREAD_POOL.get_or_init(|| {
-        let use_all_cpus =
-            quickwit_common::get_bool_from_env("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS", false);
-        let num_threads = if use_all_cpus {
-            info!("search thread pool configured with default Rayon thread pool size");
-            None
-        } else {
-            let threads = usize::max(quickwit_common::num_cpus().saturating_sub(1), 1);
-            info!(threads, "search thread pool configured with one free CPU");
-            Some(threads)
-        };
-        ThreadPool::new("search", num_threads)
-    })
+    SEARCH_THREAD_POOL
+        .get_or_init(|| ThreadPool::new("search", compute_search_thread_pool_num_threads()))
+}
+
+#[cfg(test)]
+mod search_thread_pool_tests {
+    // SAFETY: these tests may not be entirely sound if not run with nextest or
+    // --test-threads=1, as they mutate process-wide environment variables. As this is
+    // only test code, and it would be extremely inconvenient to run it another way, we are
+    // keeping it that way.
+
+    use super::compute_search_thread_pool_num_threads;
+
+    #[test]
+    fn test_compute_search_thread_pool_num_threads_from_env_var() {
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS") };
+        unsafe { std::env::set_var("QW_SEARCH_THREAD_POOL_NUM_CPUS", "3") };
+        assert_eq!(compute_search_thread_pool_num_threads(), Some(3));
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_NUM_CPUS") };
+    }
+
+    #[test]
+    fn test_compute_search_thread_pool_num_threads_env_var_takes_precedence() {
+        unsafe { std::env::set_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS", "true") };
+        unsafe { std::env::set_var("QW_SEARCH_THREAD_POOL_NUM_CPUS", "2") };
+        assert_eq!(compute_search_thread_pool_num_threads(), Some(2));
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_NUM_CPUS") };
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS") };
+    }
+
+    #[test]
+    fn test_compute_search_thread_pool_num_threads_use_all_cpus() {
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_NUM_CPUS") };
+        unsafe { std::env::set_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS", "true") };
+        assert_eq!(compute_search_thread_pool_num_threads(), None);
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS") };
+    }
+
+    #[test]
+    fn test_compute_search_thread_pool_num_threads_default() {
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_NUM_CPUS") };
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS") };
+        let expected = usize::max(quickwit_common::num_cpus().saturating_sub(1), 1);
+        assert_eq!(compute_search_thread_pool_num_threads(), Some(expected));
+    }
 }
 
 /// GlobalDocAddress serves as a hit address.

@@ -34,6 +34,7 @@ use tantivy::{ReloadPolicy, Term};
 use tracing::{debug, error, info, instrument};
 
 use crate::leaf::open_index_with_caches;
+use crate::query_cost_classifier::QueryCostClass;
 use crate::search_job_placer::group_jobs_by_index_id;
 use crate::search_permit_provider::compute_initial_memory_allocation;
 use crate::{ClusterClient, SearchError, SearchJob, SearcherContext, resolve_index_patterns};
@@ -334,9 +335,11 @@ pub async fn leaf_list_terms(
                 .warmup_single_split_initial_allocation,
         )
     });
+    // List terms requests don't run a query, so there is no query AST to classify: they are
+    // always considered regular cost.
     let permits = searcher_context
         .search_permit_provider
-        .get_permits(permit_sizes)
+        .get_permits(permit_sizes, QueryCostClass::Regular)
         .await;
     let leaf_search_single_split_futures: Vec<_> = splits
         .iter()
