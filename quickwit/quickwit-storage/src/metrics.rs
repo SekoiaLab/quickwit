@@ -14,22 +14,27 @@
 
 // See https://prometheus.io/docs/practices/naming/
 
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+use bytesize::ByteSize;
 use once_cell::sync::Lazy;
 use quickwit_common::metrics::{
     GaugeGuard, HistogramVec, IntCounter, IntCounterVec, IntGauge, new_counter, new_counter_vec,
     new_gauge, new_histogram_vec,
 };
+use quickwit_config::CachePolicy;
 
 /// Counters associated to storage operations.
 pub struct StorageMetrics {
-    pub shortlived_cache: CacheMetrics,
-    pub partial_request_cache: CacheMetrics,
-    pub predicate_cache: CacheMetrics,
-    pub fd_cache_metrics: CacheMetrics,
-    pub fast_field_cache: CacheMetrics,
-    pub split_footer_cache: CacheMetrics,
-    pub split_footer_disk_cache: CacheMetrics,
-    pub searcher_split_cache: CacheMetrics,
+    pub shortlived_cache: CacheMetricCounters,
+    pub partial_request_cache: ComponentCacheMetrics,
+    pub predicate_cache: ComponentCacheMetrics,
+    pub fd_cache_metrics: ComponentCacheMetrics,
+    pub fast_field_cache: ComponentCacheMetrics,
+    pub split_footer_cache: ComponentCacheMetrics,
+    pub split_footer_disk_cache: ComponentCacheMetrics,
+    pub searcher_split_cache: ComponentCacheMetrics,
     pub get_slice_timeout_successes: [IntCounter; 3],
     pub get_slice_timeout_all_timeouts: IntCounter,
     pub object_storage_requests_total: IntCounterVec<2>,
@@ -60,14 +65,14 @@ impl Default for StorageMetrics {
             get_slice_timeout_outcome_total_vec.with_label_values(["all_timeouts"]);
 
         StorageMetrics {
-            fast_field_cache: CacheMetrics::for_component("fastfields"),
-            fd_cache_metrics: CacheMetrics::for_component("fd"),
-            partial_request_cache: CacheMetrics::for_component("partial_request"),
-            predicate_cache: CacheMetrics::for_component("predicate"),
-            searcher_split_cache: CacheMetrics::for_component("searcher_split"),
-            shortlived_cache: CacheMetrics::for_component("shortlived"),
-            split_footer_cache: CacheMetrics::for_component("splitfooter"),
-            split_footer_disk_cache: CacheMetrics::for_component("splitfooter_disk"),
+            fast_field_cache: ComponentCacheMetrics::for_component("fastfields"),
+            fd_cache_metrics: ComponentCacheMetrics::for_component("fd"),
+            partial_request_cache: ComponentCacheMetrics::for_component("partial_request"),
+            predicate_cache: ComponentCacheMetrics::for_component("predicate"),
+            searcher_split_cache: ComponentCacheMetrics::for_component("searcher_split"),
+            shortlived_cache: CacheMetricCounters::new_active("shortlived"),
+            split_footer_cache: ComponentCacheMetrics::for_component("splitfooter"),
+            split_footer_disk_cache: ComponentCacheMetrics::for_component("splitfooter_disk"),
             get_slice_timeout_successes,
             get_slice_timeout_all_timeouts,
             object_storage_requests_total: new_counter_vec(
@@ -131,10 +136,24 @@ impl Default for StorageMetrics {
     }
 }
 
-/// Counters associated to a cache.
-#[derive(Clone)]
-pub struct CacheMetrics {
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct CacheConfigKey {
+    pub capacity: ByteSize,
+    pub policy: CachePolicy,
+}
+
+/// All the metrics counters associated to a component's cache.
+pub struct ComponentCacheMetrics {
     pub component_name: String,
+    pub active_cache_metrics: CacheMetricCounters,
+    /// See `get_or_create_virtual_cache` for details on why a lock is used
+    /// here.
+    virtual_caches_metrics: RwLock<HashMap<CacheConfigKey, CacheMetricCounters>>,
+}
+
+/// Counters associated to a single cache instance (virtual or not).
+#[derive(Clone)]
+pub struct CacheMetricCounters {
     pub in_cache_count: IntGauge,
     pub in_cache_num_bytes: IntGauge,
     pub hits_num_items: IntCounter,
@@ -144,11 +163,10 @@ pub struct CacheMetrics {
     pub evict_num_bytes: IntCounter,
 }
 
-impl CacheMetrics {
-    pub fn for_component(component_name: &str) -> Self {
+impl CacheMetricCounters {
+    fn new_active(component_name: &str) -> Self {
         const CACHE_METRICS_NAMESPACE: &str = "cache";
-        CacheMetrics {
-            component_name: component_name.to_string(),
+        CacheMetricCounters {
             in_cache_count: new_gauge(
                 "in_cache_count",
                 "Count of in cache by component",
@@ -195,13 +213,120 @@ impl CacheMetrics {
     }
 }
 
+impl ComponentCacheMetrics {
+    fn for_component(component_name: &str) -> Self {
+        ComponentCacheMetrics {
+            component_name: component_name.to_string(),
+            active_cache_metrics: CacheMetricCounters::new_active(component_name),
+            virtual_caches_metrics: RwLock::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_component_in_tests(component_name_prefix: &str) -> Self {
+        Self::for_component(&quickwit_common::rand::append_random_suffix(
+            component_name_prefix,
+        ))
+    }
+
+    /// Get a singleton metric instance for the given cache configuration.
+    ///
+    /// This ensures that virtual cache metrics are instantiated only once, even
+    /// if two different caches are instantiated with the same component metric
+    /// name (which is currently the case for `partial_request` that are used by
+    /// both regular searches and list field queries).
+    pub fn get_or_create_virtual_cache(
+        &self,
+        capacity: ByteSize,
+        policy: CachePolicy,
+    ) -> CacheMetricCounters {
+        if let Some(virtual_cache_metrics) = self
+            .virtual_caches_metrics
+            .read()
+            .unwrap()
+            .get(&CacheConfigKey { capacity, policy })
+        {
+            return virtual_cache_metrics.clone();
+        }
+
+        // The code path below should only be called once on init.
+
+        let mut write_lock_guard = self.virtual_caches_metrics.write().unwrap();
+        // Check again in case another thread created the metrics while we were
+        // waiting for the write lock (shouldn't happen in practice).
+        if let Some(virtual_cache_metrics) =
+            write_lock_guard.get(&CacheConfigKey { capacity, policy })
+        {
+            return virtual_cache_metrics.clone();
+        }
+
+        const CACHE_METRICS_NAMESPACE: &str = "cache";
+        let capacity_label = capacity.as_u64().to_string();
+        let policy_label = policy.to_string();
+        let labels = [
+            ("component_name", self.component_name.as_str()),
+            ("capacity", &capacity_label),
+            ("policy", &policy_label),
+        ];
+        let new_virtual_cache_metrics = CacheMetricCounters {
+            in_cache_count: new_gauge(
+                "virtual_in_cache_count",
+                "Count of in cache by component",
+                CACHE_METRICS_NAMESPACE,
+                &labels,
+            ),
+            in_cache_num_bytes: new_gauge(
+                "virtual_in_cache_num_bytes",
+                "Number of bytes in cache by component",
+                CACHE_METRICS_NAMESPACE,
+                &labels,
+            ),
+            hits_num_items: new_counter(
+                "virtual_cache_hits_total",
+                "Number of cache hits by component",
+                CACHE_METRICS_NAMESPACE,
+                &labels,
+            ),
+            hits_num_bytes: new_counter(
+                "virtual_cache_hits_bytes",
+                "Number of cache hits in bytes by component",
+                CACHE_METRICS_NAMESPACE,
+                &labels,
+            ),
+            misses_num_items: new_counter(
+                "virtual_cache_misses_total",
+                "Number of cache misses by component",
+                CACHE_METRICS_NAMESPACE,
+                &labels,
+            ),
+            evict_num_items: new_counter(
+                "virtual_cache_evict_total",
+                "Number of cache entry evicted by component",
+                CACHE_METRICS_NAMESPACE,
+                &labels,
+            ),
+            evict_num_bytes: new_counter(
+                "virtual_cache_evict_bytes",
+                "Number of cache entry evicted in bytes by component",
+                CACHE_METRICS_NAMESPACE,
+                &labels,
+            ),
+        };
+
+        write_lock_guard
+            .entry(CacheConfigKey { capacity, policy })
+            .or_insert(new_virtual_cache_metrics)
+            .clone()
+    }
+}
+
 /// Storage counters exposes a bunch a set of storage/cache related metrics through a prometheus
 /// endpoint.
 pub static STORAGE_METRICS: Lazy<StorageMetrics> = Lazy::new(StorageMetrics::default);
 
 #[cfg(test)]
-pub static CACHE_METRICS_FOR_TESTS: Lazy<CacheMetrics> =
-    Lazy::new(|| CacheMetrics::for_component("fortest"));
+pub static CACHE_METRICS_FOR_TESTS: Lazy<ComponentCacheMetrics> =
+    Lazy::new(|| ComponentCacheMetrics::for_component("fortest"));
 
 pub fn object_storage_get_slice_in_flight_guards(
     get_request_size: usize,

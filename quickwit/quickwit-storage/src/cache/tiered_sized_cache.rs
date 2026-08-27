@@ -25,12 +25,12 @@ use crate::cache::memory_sized_cache::MemorySizedCache;
 /// Lookups check memory first, then disk; a disk hit is promoted back into memory. Writes
 /// populate both tiers. When no disk tier is configured this behaves exactly like the
 /// underlying [`MemorySizedCache`], which makes it a drop-in, opt-in replacement.
-pub struct TieredSizedCache<K: Hash + Eq = String> {
+pub struct TieredSizedCache<K: Hash + Eq + Send + Sync + 'static = String> {
     memory: MemorySizedCache<K>,
     disk: Option<DiskSizedCache<K>>,
 }
 
-impl<K: Hash + Eq + Clone + Display> TieredSizedCache<K> {
+impl<K: Hash + Eq + Clone + Display + Send + Sync + 'static> TieredSizedCache<K> {
     /// Creates a tiered cache from an in-memory tier and an optional disk tier.
     pub fn new(memory: MemorySizedCache<K>, disk: Option<DiskSizedCache<K>>) -> Self {
         TieredSizedCache { memory, disk }
@@ -61,12 +61,14 @@ impl<K: Hash + Eq + Clone + Display> TieredSizedCache<K> {
 
 #[cfg(test)]
 mod tests {
+    use bytesize::ByteSize;
+
     use super::*;
     use crate::cache::disk_sized_cache::path_for;
     use crate::metrics::CACHE_METRICS_FOR_TESTS;
 
     fn memory_cache() -> MemorySizedCache<String> {
-        MemorySizedCache::with_capacity_in_bytes(1_000, &CACHE_METRICS_FOR_TESTS)
+        MemorySizedCache::from_config(&ByteSize::b(1_000).into(), &CACHE_METRICS_FOR_TESTS)
     }
 
     #[tokio::test]

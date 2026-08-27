@@ -148,10 +148,12 @@ fn compute_timestamp(start: Instant) -> LastAccessDate {
 fn record_split_added_to_disk(num_bytes: u64) {
     crate::metrics::STORAGE_METRICS
         .searcher_split_cache
+        .active_cache_metrics
         .in_cache_count
         .inc();
     crate::metrics::STORAGE_METRICS
         .searcher_split_cache
+        .active_cache_metrics
         .in_cache_num_bytes
         .add(num_bytes as i64);
 }
@@ -159,18 +161,22 @@ fn record_split_added_to_disk(num_bytes: u64) {
 fn record_split_evicted(num_bytes: u64) {
     crate::metrics::STORAGE_METRICS
         .searcher_split_cache
+        .active_cache_metrics
         .in_cache_count
         .dec();
     crate::metrics::STORAGE_METRICS
         .searcher_split_cache
+        .active_cache_metrics
         .in_cache_num_bytes
         .sub(num_bytes as i64);
     crate::metrics::STORAGE_METRICS
         .searcher_split_cache
+        .active_cache_metrics
         .evict_num_items
         .inc();
     crate::metrics::STORAGE_METRICS
         .searcher_split_cache
+        .active_cache_metrics
         .evict_num_bytes
         .inc_by(num_bytes);
 }
