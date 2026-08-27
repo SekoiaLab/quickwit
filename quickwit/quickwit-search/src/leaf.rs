@@ -48,6 +48,7 @@ use tantivy::{DateTime, Index, ReloadPolicy, Searcher, TantivyError, Term};
 use tantivy_fst::DisjunctionRegex;
 use tokio::task::{JoinError, JoinSet};
 use tracing::*;
+use ulid::Ulid;
 
 use crate::collector::{IncrementalCollector, make_collector_for_split, make_merge_collector};
 use crate::metrics::SplitSearchOutcomeCounters;
@@ -112,12 +113,21 @@ pub(crate) async fn open_split_bundle(
 
     // We wrap the top-level storage with the split cache.
     // This is before the bundle storage: at this point, this storage is reading `.split` files.
-    let index_storage_with_split_cache =
-        if let Some(split_cache) = searcher_context.split_cache_opt.as_ref() {
-            SplitCache::wrap_storage(split_cache.clone(), index_storage.clone())
-        } else {
-            index_storage.clone()
-        };
+    let index_storage_with_split_cache = if let Some(split_cache) =
+        searcher_context.split_cache_opt.as_ref()
+    {
+        let split_ulid = Ulid::from_str(&split_and_footer_offsets.split_id).with_context(|| {
+            format!("invalid split ulid `{}`", split_and_footer_offsets.split_id)
+        })?;
+        SplitCache::wrap_storage(
+            split_cache.clone(),
+            index_storage.clone(),
+            split_ulid,
+            split_and_footer_offsets.split_footer_end,
+        )
+    } else {
+        index_storage.clone()
+    };
 
     let (hotcache_bytes, bundle_storage) = BundleStorage::open_from_split_data(
         index_storage_with_split_cache,

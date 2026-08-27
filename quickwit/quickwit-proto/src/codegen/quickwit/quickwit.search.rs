@@ -43,6 +43,9 @@ pub struct ReportSplit {
     /// The storage uri. This URI does NOT include the split id.
     #[prost(string, tag = "1")]
     pub storage_uri: ::prost::alloc::string::String,
+    /// The size of the split file, in bytes.
+    #[prost(uint64, tag = "3")]
+    pub num_bytes: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, ::prost::Message)]
