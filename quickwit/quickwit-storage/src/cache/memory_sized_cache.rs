@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use itertools::Itertools;
 use quickwit_config::CacheConfig;
 
 use crate::OwnedBytes;
@@ -25,7 +26,7 @@ use crate::cache::base_cache::{AnyCache, FakeCacheEntry};
 use crate::cache::slice_address::{SliceAddress, SliceAddressKey, SliceAddressRef};
 use crate::metrics::ComponentCacheMetrics;
 
-struct CacheState<K: Hash + Eq> {
+struct CacheState<K: Hash + Eq + Send + Sync + 'static> {
     cache: AnyCache<K, OwnedBytes>,
     virtual_caches: Vec<AnyCache<K, FakeCacheEntry>>,
 }
@@ -43,11 +44,13 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> CacheState<K> {
         let virtual_caches = cache_config
             .virtual_caches
             .iter()
-            .map(|virtual_cache_config| {
-                let policy = virtual_cache_config.policy.unwrap_or(cache_config.policy());
-                let capacity = virtual_cache_config
-                    .capacity
-                    .unwrap_or(cache_config.capacity());
+            .map(|virtual_config| {
+                let policy = virtual_config.policy.unwrap_or(cache_config.policy());
+                let capacity = virtual_config.capacity.unwrap_or(cache_config.capacity());
+                (policy, capacity)
+            })
+            .unique()
+            .map(|(policy, capacity)| {
                 AnyCache::from_policy_and_capacity(
                     policy,
                     capacity,
@@ -94,7 +97,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> CacheState<K> {
 }
 
 /// A simple in-resident memory slice cache.
-pub struct MemorySizedCache<K: Hash + Eq = SliceAddress> {
+pub struct MemorySizedCache<K: Hash + Eq + Send + Sync + 'static = SliceAddress> {
     inner: Mutex<CacheState<K>>,
 }
 

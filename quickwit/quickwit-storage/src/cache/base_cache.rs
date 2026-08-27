@@ -21,6 +21,7 @@ use bytesize::ByteSize;
 use lru::LruCache;
 use mini_moka::sync::Cache as MokaCache;
 use quick_cache::unsync::Cache as QuickCache;
+use quickwit_common::rate_limited_warn;
 use quickwit_config::CachePolicy;
 use tokio::time::Instant;
 use tracing::{error, warn};
@@ -70,7 +71,8 @@ impl Capacity {
     }
 }
 
-pub(crate) enum AnyCache<K: Hash + Eq, V: ValueLen> {
+pub(crate) enum AnyCache<K: Hash + Eq + Send + Sync + 'static, V: ValueLen + Send + Sync + 'static>
+{
     Lru(Lru<K, V>),
     S3Fifo(S3Fifo<K, V>),
     TinyLfu(TinyLfu<K, V>),
@@ -364,7 +366,7 @@ impl<V: ValueLen> Drop for CapacityTracker<V> {
     }
 }
 
-pub struct TinyLfu<K: Hash + Eq, V: ValueLen> {
+pub struct TinyLfu<K: Hash + Eq + Send + Sync + 'static, V: ValueLen + Send + Sync + 'static> {
     // this field is put first so it's dropped before the cache
     // we use that to not count removed entries as "evicted", by
     // calling CapacityTracker's Drop only after its Weak has expired.
@@ -376,8 +378,12 @@ pub struct TinyLfu<K: Hash + Eq, V: ValueLen> {
     capacity: u64,
 }
 
-impl<K: Hash + Eq, V: ValueLen> Drop for TinyLfu<K, V> {
+impl<K: Hash + Eq + Send + Sync + 'static, V: ValueLen + Send + Sync + 'static> Drop
+    for TinyLfu<K, V>
+{
     fn drop(&mut self) {
+        use mini_moka::sync::ConcurrentCacheExt;
+        self.cache.sync();
         // we don't count this toward evicted entries, as we are clearing the whole cache
         self.cache_metrics
             .in_cache_count
@@ -436,12 +442,21 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: ValueLen + Clone + Send + Sync + '
         if self.capacity < value.len() as u64 {
             // The value does not fit in the cache. We simply don't store it.
             if self.capacity != 0 {
-                warn!(
+                rate_limited_warn!(
+                    limit_per_min = 1,
                     capacity_in_bytes = ?self.capacity,
                     len = value.len(),
                     "Downloaded a byte slice larger than the cache capacity."
                 );
             }
+            return;
+        }
+        if value.len() > u32::MAX as usize {
+            rate_limited_warn!(
+                limit_per_min = 1,
+                len = value.len(),
+                "tiny-lfu cache entry larger than u32::MAX"
+            );
             return;
         }
 
@@ -500,6 +515,22 @@ mod tests {
             cache.put("key".to_string(), OwnedBytes::new(&b"too big"[..]));
             assert!(cache.get(&"key".to_string()).is_none(), "policy {policy}");
         }
+    }
+
+    #[test]
+    fn test_tiny_lfu_rejects_entries_larger_than_u32_max() {
+        // moka's weigher can only represent a weight up to u32::MAX: an entry beyond that would
+        // be silently underweighted, letting the cache exceed its real configured capacity.
+        let cache_metrics =
+            ComponentCacheMetrics::for_component_in_tests("tiny_lfu_oversized_test")
+                .active_cache_metrics;
+        let mut cache: AnyCache<String, FakeCacheEntry> = AnyCache::from_policy_and_capacity(
+            CachePolicy::TinyLfu,
+            ByteSize::gb(10),
+            cache_metrics,
+        );
+        cache.put("key".to_string(), FakeCacheEntry(u32::MAX as usize + 1));
+        assert!(cache.get(&"key".to_string()).is_none());
     }
 
     #[test]

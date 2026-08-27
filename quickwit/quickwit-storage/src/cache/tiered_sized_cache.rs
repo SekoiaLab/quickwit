@@ -25,7 +25,7 @@ use crate::cache::memory_sized_cache::MemorySizedCache;
 /// Lookups check memory first, then disk; a disk hit is promoted back into memory. Writes
 /// populate both tiers. When no disk tier is configured this behaves exactly like the
 /// underlying [`MemorySizedCache`], which makes it a drop-in, opt-in replacement.
-pub struct TieredSizedCache<K: Hash + Eq = String> {
+pub struct TieredSizedCache<K: Hash + Eq + Send + Sync + 'static = String> {
     memory: MemorySizedCache<K>,
     disk: Option<DiskSizedCache<K>>,
 }

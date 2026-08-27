@@ -388,7 +388,7 @@ pub enum CachePolicy {
     S3Fifo,
     /// The current implementation (moka-rs) doesn't strictly enforce the size
     /// capacity. You can enqueue as many over-capacity items as there are
-    /// concurrent inserts.
+    /// concurrent inserts. Also it rejects records larger than 4GB.
     TinyLfu,
 }
 

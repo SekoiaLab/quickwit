@@ -249,6 +249,17 @@ impl ComponentCacheMetrics {
             return virtual_cache_metrics.clone();
         }
 
+        // The code path below should only be called once on init.
+
+        let mut write_lock_guard = self.virtual_caches_metrics.write().unwrap();
+        // Check again in case another thread created the metrics while we were
+        // waiting for the write lock (shouldn't happen in practice).
+        if let Some(virtual_cache_metrics) =
+            write_lock_guard.get(&CacheConfigKey { capacity, policy })
+        {
+            return virtual_cache_metrics.clone();
+        }
+
         const CACHE_METRICS_NAMESPACE: &str = "cache";
         let capacity_label = capacity.as_u64().to_string();
         let policy_label = policy.to_string();
@@ -302,9 +313,7 @@ impl ComponentCacheMetrics {
             ),
         };
 
-        self.virtual_caches_metrics
-            .write()
-            .unwrap()
+        write_lock_guard
             .entry(CacheConfigKey { capacity, policy })
             .or_insert(new_virtual_cache_metrics)
             .clone()
