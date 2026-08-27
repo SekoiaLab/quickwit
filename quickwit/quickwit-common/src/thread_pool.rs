@@ -14,7 +14,6 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
 
 use futures::{Future, TryFutureExt};
 use once_cell::sync::Lazy;
@@ -93,20 +92,20 @@ impl ThreadPool {
         let mut pending_tasks_guard: OwnedGaugeGuard =
             OwnedGaugeGuard::from_gauge(pending_tasks.clone());
         pending_tasks_guard.add(1i64);
-        let enqueued_at = Instant::now();
+        let queue_wait_timer = queue_wait_time.start_timer();
         let (tx, rx) = oneshot::channel();
         self.thread_pool.spawn(move || {
             drop(pending_tasks_guard);
-            queue_wait_time.observe(enqueued_at.elapsed().as_secs_f64());
+            queue_wait_timer.observe_duration();
             if tx.is_closed() {
                 return;
             }
             let _guard = span.enter();
             let mut ongoing_task_guard = GaugeGuard::from_gauge(&ongoing_tasks);
             ongoing_task_guard.add(1i64);
-            let task_started_at = Instant::now();
+            let run_timer = run_time.start_timer();
             let result = cpu_intensive_fn();
-            run_time.observe(task_started_at.elapsed().as_secs_f64());
+            run_timer.observe_duration();
             let _ = tx.send(result);
         });
         rx.map_err(|_| Panicked)

@@ -177,7 +177,7 @@ impl CostClassGauges {
     }
 }
 
-/// From 0.008s to 131.072s
+/// From 0.064s to 1048s
 fn duration_buckets() -> Vec<f64> {
     exponential_buckets(0.064, 2.0, 15).unwrap()
 }
@@ -286,7 +286,8 @@ impl Default for SearchMetrics {
                  it ended up acquiring it or gave up because the leaf request was cancelled or \
                  timed out.",
                 "search",
-                exponential_buckets(0.001, 2.0, 16).unwrap(),
+                // max resolution is 66s
+                exponential_buckets(0.001, 2.0, 17).unwrap(),
             ),
             // we need to expose the gauges here to provide a static ref to for the gauge guards
             leaf_search_single_split_tasks_ongoing: CostClassGauges {

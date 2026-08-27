@@ -17,10 +17,9 @@ use std::collections::binary_heap::PeekMut;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
 
 use bytesize::ByteSize;
-use quickwit_common::metrics::GaugeGuard;
+use quickwit_common::metrics::{GaugeGuard, HistogramTimer};
 use quickwit_proto::search::SplitIdAndFooterOffsets;
 #[cfg(test)]
 use tokio::sync::watch;
@@ -203,9 +202,7 @@ impl LeafPermitRequest {
     ) -> (Self, Vec<SearchPermitFuture>) {
         let mut permits = Vec::with_capacity(permit_sizes.len());
         let mut single_split_permit_requests = Vec::with_capacity(permit_sizes.len());
-        // All permits in this batch start waiting at the same time, as soon as the request
-        // reaches the actor.
-        let requested_at = Instant::now();
+        let wait_histogram = &crate::metrics::SEARCH_METRICS.leaf_search_permit_wait_duration_secs;
         for permit_size in permit_sizes {
             let (tx, rx) = oneshot::channel();
             // we keep our internal list of permits and the returned wait handles in the
@@ -217,7 +214,7 @@ impl LeafPermitRequest {
             });
             permits.push(SearchPermitFuture {
                 receiver: rx,
-                requested_at: Some(requested_at),
+                wait_timer: Some(wait_histogram.start_timer()),
             });
         }
         (
@@ -393,19 +390,8 @@ impl Drop for SearchPermit {
 
 pub struct SearchPermitFuture {
     receiver: oneshot::Receiver<SearchPermit>,
-    /// Taken by `observe_wait_duration`, so that the wait is reported exactly once.
-    requested_at: Option<Instant>,
-}
-
-impl SearchPermitFuture {
-    /// Reports the time spent queuing for this permit, at most once.
-    fn observe_wait_duration(&mut self) {
-        if let Some(requested_at) = self.requested_at.take() {
-            crate::metrics::SEARCH_METRICS
-                .leaf_search_permit_wait_duration_secs
-                .observe(requested_at.elapsed().as_secs_f64());
-        }
-    }
+    /// Records the time spent queuing for this permit
+    wait_timer: Option<HistogramTimer>,
 }
 
 impl Future for SearchPermitFuture {
@@ -416,7 +402,11 @@ impl Future for SearchPermitFuture {
         let receiver = Pin::new(&mut this.receiver);
         match receiver.poll(cx) {
             Poll::Ready(Ok(search_permit)) => {
-                this.observe_wait_duration();
+                // Record now rather than on drop, so that the measure doesn't depend on how long
+                // the caller holds onto this future once it has resolved.
+                if let Some(wait_timer) = this.wait_timer.take() {
+                    wait_timer.observe_duration();
+                }
                 Poll::Ready(search_permit)
             }
             Poll::Ready(Err(_)) => panic!(
@@ -424,12 +414,6 @@ impl Future for SearchPermitFuture {
             ),
             Poll::Pending => Poll::Pending,
         }
-    }
-}
-
-impl Drop for SearchPermitFuture {
-    fn drop(&mut self) {
-        self.observe_wait_duration();
     }
 }
 
