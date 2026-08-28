@@ -1420,9 +1420,7 @@ pub async fn single_doc_mapping_leaf_search(
 
     let mut join_set = JoinSet::new();
     let mut split_with_task_id = Vec::with_capacity(split_with_req.len());
-    for ((split, search_request), permit_fut) in
-        split_with_req.into_iter().zip(permit_futures.into_iter())
-    {
+    for ((split, search_request), permit_fut) in split_with_req.into_iter().zip(permit_futures) {
         let leaf_split_search_permit = permit_fut
             .instrument(info_span!("waiting_for_leaf_search_split_semaphore"))
             .await;
