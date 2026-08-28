@@ -114,7 +114,7 @@ impl Transport {
         request_headers.insert(CONTENT_TYPE, HeaderValue::from_static(DEFAULT_CONTENT_TYPE));
         request_headers.insert(USER_AGENT, HeaderValue::from_static("qw-rest-client"));
         if let Some(header_map_val) = header_map {
-            request_headers.extend(header_map_val.into_iter());
+            request_headers.extend(header_map_val);
         }
         request_builder = request_builder.headers(request_headers);
         if let Some(bytes) = body {

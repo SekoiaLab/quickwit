@@ -1059,11 +1059,11 @@ async fn analyze_split_file_cli(args: AnalyzeSplitFileArgs) -> anyhow::Result<()
                     }
                     let field_name = field_entry.name().to_string();
                     let mut postings_sorted: Vec<_> = postings_per_key.into_iter().collect();
-                    postings_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                    postings_sorted.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
                     postings_sub_keys.insert(field_name.clone(), postings_sorted);
                     let mut positions_sorted: Vec<_> = positions_per_key.into_iter().collect();
                     positions_sorted.retain(|(_, b)| *b > 0);
-                    positions_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                    positions_sorted.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
                     positions_sub_keys.insert(field_name, positions_sorted);
                 }
 
