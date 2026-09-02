@@ -33,8 +33,12 @@ impl<V> StoredItem<V> {
 
 impl<V: ValueLen + Clone> StoredItem<V> {
     pub fn payload(&mut self) -> V {
-        self.last_access_time = Instant::now();
+        self.touch();
         self.payload.clone()
+    }
+
+    pub fn touch(&mut self) {
+        self.last_access_time = Instant::now();
     }
 
     pub fn len(&self) -> usize {
