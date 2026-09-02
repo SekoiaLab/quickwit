@@ -101,10 +101,13 @@ impl FileDescriptorCache {
 
     fn put_split_file(&self, split_id: Ulid, split_file: SplitFile) {
         let mut fd_cache_lock = self.fd_cache.lock().unwrap();
-        fd_cache_lock.push(split_id, split_file);
+        let evicted = fd_cache_lock.push(split_id, split_file);
         self.fd_cache_metrics
             .in_cache_count
             .set(fd_cache_lock.len() as i64);
+        if evicted.is_some() {
+            self.fd_cache_metrics.evict_num_items.inc();
+        }
     }
 
     /// Evicts the given list of split ids from the file descriptor cache.
@@ -224,6 +227,7 @@ mod tests {
         assert_eq!(cache_metrics.in_cache_count.get(), 10);
         assert_eq!(cache_metrics.hits_num_items.get(), 20);
         assert_eq!(cache_metrics.misses_num_items.get(), 10);
+        assert_eq!(cache_metrics.evict_num_items.get(), 0);
     }
 
     // This mimics Quickwit's workload where the fd cache is much smaller than the number of
@@ -257,6 +261,9 @@ mod tests {
         assert_eq!(cache_metrics.in_cache_count.get(), 10);
         assert_eq!(cache_metrics.hits_num_items.get(), 100 * 9);
         assert_eq!(cache_metrics.misses_num_items.get(), 100);
+        // 100 distinct splits went through a 10-entry cache: the 90 oldest ones were pushed
+        // out by capacity, one at a time, as later splits were first opened.
+        assert_eq!(cache_metrics.evict_num_items.get(), 90);
     }
 
     #[tokio::test]
