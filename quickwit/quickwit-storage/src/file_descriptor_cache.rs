@@ -105,7 +105,9 @@ impl FileDescriptorCache {
         self.fd_cache_metrics
             .in_cache_count
             .set(fd_cache_lock.len() as i64);
-        if evicted.is_some() {
+        if let Some((evicted_split_id, _)) = evicted
+            && split_id != evicted_split_id
+        {
             self.fd_cache_metrics.evict_num_items.inc();
         }
     }
@@ -114,15 +116,17 @@ impl FileDescriptorCache {
     /// This method does NOT remove the actual files.
     pub fn evict_split_files(&self, split_ids: &[Ulid]) {
         let mut fd_cache_lock = self.fd_cache.lock().unwrap();
+        let mut evicted_count = 0;
         for split_id in split_ids {
-            fd_cache_lock.pop(split_id);
+            let evicted = fd_cache_lock.pop(split_id);
+            if evicted.is_some() {
+                evicted_count += 1;
+            }
         }
         self.fd_cache_metrics
             .in_cache_count
             .set(fd_cache_lock.len() as i64);
-        self.fd_cache_metrics
-            .evict_num_items
-            .inc_by(split_ids.len() as u64);
+        self.fd_cache_metrics.evict_num_items.inc_by(evicted_count);
     }
 
     pub async fn get_or_open_split_file(
