@@ -205,8 +205,8 @@ impl<K: Hash + Eq, V: ValueLen + Clone> Lru<K, V> {
             }
             return;
         }
-        if let Some(previous_data) = self.lru_cache.pop(&key) {
-            self.drop_item(previous_data.len() as u64);
+        if self.lru_cache.contains(&key) {
+            return;
         }
 
         let now = Instant::now();
@@ -334,6 +334,9 @@ impl<K: Hash + Eq, V: ValueLen + Clone> S3Fifo<K, V> {
             }
             return;
         }
+        if self.cache.contains_key(&key) {
+            return;
+        }
 
         self.cache_metrics.in_cache_count.inc();
         self.cache_metrics
@@ -459,6 +462,9 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: ValueLen + Clone + Send + Sync + '
             );
             return;
         }
+        if self.cache.contains_key(&key) {
+            return;
+        }
 
         self.cache_metrics.in_cache_count.inc();
         self.cache_metrics
@@ -569,6 +575,23 @@ mod tests {
                 num_present < 5,
                 "policy {policy}: expected some entries to be rejected or evicted"
             );
+        }
+    }
+
+    #[test]
+    fn test_any_cache_reputting_same_key_is_not_counted_as_eviction() {
+        for policy in [CachePolicy::Lru, CachePolicy::S3Fifo, CachePolicy::TinyLfu] {
+            let cache_metrics =
+                ComponentCacheMetrics::for_component_in_tests(&format!("reput_test_{policy}"))
+                    .active_cache_metrics;
+            let mut cache: AnyCache<String, OwnedBytes> =
+                AnyCache::from_policy_and_capacity(policy, ByteSize::kb(10), cache_metrics.clone());
+            cache.put("key".to_string(), OwnedBytes::new(&b"hello"[..]));
+            // cached values are assumed immutable: re-putting the same key must be a no-op,
+            // not an eviction of the existing entry.
+            cache.put("key".to_string(), OwnedBytes::new(&b"hello"[..]));
+            assert_eq!(cache_metrics.evict_num_items.get(), 0, "policy {policy}");
+            assert_eq!(cache_metrics.in_cache_count.get(), 1, "policy {policy}");
         }
     }
 }
