@@ -205,7 +205,8 @@ impl<K: Hash + Eq, V: ValueLen + Clone> Lru<K, V> {
             }
             return;
         }
-        if self.lru_cache.contains(&key) {
+        if let Some(item) = self.lru_cache.get_mut(&key) {
+            item.touch();
             return;
         }
 
@@ -334,7 +335,7 @@ impl<K: Hash + Eq, V: ValueLen + Clone> S3Fifo<K, V> {
             }
             return;
         }
-        if self.cache.contains_key(&key) {
+        if self.cache.get(&key).is_some() {
             return;
         }
 
@@ -462,7 +463,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: ValueLen + Clone + Send + Sync + '
             );
             return;
         }
-        if self.cache.contains_key(&key) {
+        if self.cache.get(&key).is_some() {
             return;
         }
 
