@@ -36,6 +36,7 @@ regex = { workspace = true }
 serde = { workspace = true }
 siphasher = { workspace = true }
 sysinfo = { workspace = true }
+tantivy = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tikv-jemallocator = { workspace = true, optional = true }

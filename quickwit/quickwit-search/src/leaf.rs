@@ -220,7 +220,11 @@ pub(crate) async fn open_index_with_caches(
 /// This is e.g. required for term aggregation, since we don't know in advance which terms are going
 /// to be hit.
 #[instrument(skip_all)]
-pub(crate) async fn warmup(searcher: &Searcher, warmup_info: &WarmupInfo) -> anyhow::Result<()> {
+pub(crate) async fn warmup(
+    searcher: &Searcher,
+    warmup_info: &WarmupInfo,
+    cost_class: QueryCostClass,
+) -> anyhow::Result<()> {
     debug!(warmup_info=?warmup_info);
     let warm_up_terms_future = warm_up_terms(searcher, &warmup_info.terms_grouped_by_field)
         .instrument(debug_span!("warm_up_terms"));
@@ -231,9 +235,12 @@ pub(crate) async fn warmup(searcher: &Searcher, warmup_info: &WarmupInfo) -> any
         .instrument(debug_span!("warm_up_fastfields"));
     let warm_up_fieldnorms_future = warm_up_fieldnorms(searcher, warmup_info.field_norms)
         .instrument(debug_span!("warm_up_fieldnorms"));
-    let warm_up_automatons_future =
-        warm_up_automatons(searcher, &warmup_info.automatons_grouped_by_field)
-            .instrument(debug_span!("warm_up_automatons"));
+    let warm_up_automatons_future = warm_up_automatons(
+        searcher,
+        &warmup_info.automatons_grouped_by_field,
+        cost_class,
+    )
+    .instrument(debug_span!("warm_up_automatons"));
 
     tokio::try_join!(
         warm_up_terms_future,
@@ -331,11 +338,12 @@ async fn warm_up_term_ranges(
 async fn warm_up_automatons(
     searcher: &Searcher,
     terms_grouped_by_field: &HashMap<Field, HashSet<Automaton>>,
+    cost_class: QueryCostClass,
 ) -> anyhow::Result<()> {
     let mut warm_up_futures = Vec::new();
     let cpu_intensive_executor = |task| async {
         crate::search_thread_pool()
-            .run_cpu_intensive_with_identified_caller(task, "automaton_warmup")
+            .run_cpu_intensive_with_extra_tags(task, "automaton_warmup", cost_class.as_label())
             .await
             .map_err(|_| std::io::Error::other("task panicked"))?
     };
@@ -549,7 +557,7 @@ async fn leaf_search_single_split(
 
     let warmup_start = Instant::now();
     leaf_search_state_guard.set_state(SplitSearchState::WarmUp);
-    warmup(&searcher, &warmup_info).await?;
+    warmup(&searcher, &warmup_info, ctx.cost_class).await?;
     let warmup_end = Instant::now();
     let warmup_duration: Duration = warmup_end.duration_since(warmup_start);
     let warmup_size = ByteSize(byte_range_cache.get_num_bytes());
@@ -615,7 +623,7 @@ async fn leaf_search_single_split(
     };
     let search_request_and_result: Option<(SearchRequest, LeafSearchResponse)> =
         crate::search_thread_pool()
-            .run_cpu_intensive_with_identified_caller(cpu_task, "split_search")
+            .run_cpu_intensive_with_extra_tags(cpu_task, "split_search", ctx.cost_class.as_label())
             .await
             .map_err(|_| {
                 crate::SearchError::Internal(format!("leaf search panicked. split={split_id}"))
@@ -1309,9 +1317,10 @@ pub async fn multi_index_leaf_search(
     }
 
     crate::search_thread_pool()
-        .run_cpu_intensive_with_identified_caller(
+        .run_cpu_intensive_with_extra_tags(
             || incremental_merge_collector.finalize().map_err(Into::into),
             "finalize",
+            cost_class.as_label(),
         )
         .instrument(info_span!("incremental_merge_finalize"))
         .await
@@ -1416,6 +1425,7 @@ pub async fn single_doc_mapping_leaf_search(
         incremental_merge_collector: incremental_merge_collector.clone(),
         doc_mapper: doc_mapper.clone(),
         split_filter: split_filter.clone(),
+        cost_class,
     });
 
     let mut join_set = JoinSet::new();
@@ -1489,9 +1499,10 @@ pub async fn single_doc_mapping_leaf_search(
 
     let leaf_search_response_reresult: Result<Result<LeafSearchResponse, _>, _> =
         crate::search_thread_pool()
-            .run_cpu_intensive_with_identified_caller(
+            .run_cpu_intensive_with_extra_tags(
                 || incremental_merge_collector.finalize(),
                 "finalize",
+                cost_class.as_label(),
             )
             .instrument(info_span!("incremental_merge_intermediate"))
             .await
@@ -1567,6 +1578,7 @@ struct LeafSearchContext {
     incremental_merge_collector: Arc<Mutex<IncrementalCollector>>,
     doc_mapper: Arc<DocMapper>,
     split_filter: Arc<RwLock<CanSplitDoBetter>>,
+    cost_class: QueryCostClass,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2232,7 +2244,11 @@ mod tests {
             )]),
         ))
         .collect();
-        assert!(warm_up_automatons(&searcher, &valid).await.is_ok());
+        assert!(
+            warm_up_automatons(&searcher, &valid, QueryCostClass::Regular)
+                .await
+                .is_ok()
+        );
 
         // Valid regexes on a JSON sub-field also warm up successfully.
         let json_path =
@@ -2245,7 +2261,11 @@ mod tests {
             )]),
         ))
         .collect();
-        assert!(warm_up_automatons(&searcher, &valid_json).await.is_ok());
+        assert!(
+            warm_up_automatons(&searcher, &valid_json, QueryCostClass::Regular)
+                .await
+                .is_ok()
+        );
 
         // An unbuildable regex (here, invalid syntax) must cause warmup to fail
         // rather than fall back to warming the patterns individually.
@@ -2254,7 +2274,7 @@ mod tests {
             HashSet::from([Automaton::Regex(None, vec!["(".to_string()])]),
         ))
         .collect();
-        let error = warm_up_automatons(&searcher, &invalid)
+        let error = warm_up_automatons(&searcher, &invalid, QueryCostClass::Regular)
             .await
             .unwrap_err()
             .to_string();
@@ -2269,7 +2289,7 @@ mod tests {
             HashSet::from([Automaton::Regex(Some(json_path), vec!["(".to_string()])]),
         ))
         .collect();
-        let error = warm_up_automatons(&searcher, &invalid_json)
+        let error = warm_up_automatons(&searcher, &invalid_json, QueryCostClass::Regular)
             .await
             .unwrap_err()
             .to_string();

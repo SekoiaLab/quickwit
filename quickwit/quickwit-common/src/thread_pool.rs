@@ -21,8 +21,8 @@ use tokio::sync::oneshot;
 use tracing::error;
 
 use crate::metrics::{
-    GaugeGuard, HistogramVec, IntGaugeVec, OwnedGaugeGuard, exponential_buckets, new_gauge_vec,
-    new_histogram_vec,
+    Histogram, HistogramTimer, HistogramVec, IntGauge, IntGaugeVec, OwnedGaugeGuard,
+    exponential_buckets, new_gauge_vec, new_histogram_vec,
 };
 
 /// An executor backed by a thread pool to run CPU-intensive tasks.
@@ -54,58 +54,48 @@ impl ThreadPool {
         }
     }
 
-    /// Returns the underlying rayon thread pool.
+    /// Returns a Tantivy [`tantivy::Executor`] backed by this thread pool.
     ///
-    /// Using the underlying Rayon thread pool directly is discouraged, as it
-    /// will not update the metrics and create an observability blind spot.
-    /// Unfortunately it is sometimes necessary to provide the raw pool
-    /// directly to Tantivy.
-    pub fn get_underlying_rayon_thread_pool(&self) -> Arc<rayon::ThreadPool> {
-        self.thread_pool.clone()
+    /// Tasks that Tantivy schedules through it are tracked by metrics.
+    pub fn get_executor(
+        &self,
+        caller: &'static str,
+        cost_class: &'static str,
+    ) -> tantivy::Executor {
+        tantivy::Executor::InstrumentedThreadPool(
+            self.thread_pool.clone(),
+            Arc::new(ThreadPoolTaskInstrumentation {
+                pool_name: self.name,
+                caller,
+                cost_class,
+            }),
+        )
     }
 
     /// Same as `run_cpu_intensive` but with a caller identifier recorded in the
     /// metrics.
-    pub fn run_cpu_intensive_with_identified_caller<F, R>(
+    pub fn run_cpu_intensive_with_extra_tags<F, R>(
         &self,
         cpu_intensive_fn: F,
         caller: &'static str,
+        cost_class: &'static str,
     ) -> impl Future<Output = Result<R, Panicked>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         let span = tracing::Span::current();
-        let ongoing_tasks = THREAD_POOL_METRICS
-            .ongoing_tasks
-            .with_label_values([self.name, caller]);
-        let pending_tasks = THREAD_POOL_METRICS
-            .pending_tasks
-            .with_label_values([self.name, caller]);
-        let queue_wait_time = THREAD_POOL_METRICS
-            .queue_wait_time_secs
-            .with_label_values([self.name, caller]);
-        let run_time = THREAD_POOL_METRICS
-            .run_time_secs
-            .with_label_values([self.name, caller]);
-        let ongoing_tasks = ongoing_tasks.clone();
-        let mut pending_tasks_guard: OwnedGaugeGuard =
-            OwnedGaugeGuard::from_gauge(pending_tasks.clone());
-        pending_tasks_guard.add(1i64);
-        let queue_wait_timer = queue_wait_time.start_timer();
+        let queued_task = QueuedTask::new(self.name, caller, cost_class);
         let (tx, rx) = oneshot::channel();
         self.thread_pool.spawn(move || {
-            drop(pending_tasks_guard);
-            queue_wait_timer.observe_duration();
             if tx.is_closed() {
+                // dropping `queued_task` still records the time it spent queued
                 return;
             }
             let _guard = span.enter();
-            let mut ongoing_task_guard = GaugeGuard::from_gauge(&ongoing_tasks);
-            ongoing_task_guard.add(1i64);
-            let run_timer = run_time.start_timer();
+            let running_task = queued_task.start();
             let result = cpu_intensive_fn();
-            run_timer.observe_duration();
+            drop(running_task);
             let _ = tx.send(result);
         });
         rx.map_err(|_| Panicked)
@@ -134,9 +124,84 @@ impl ThreadPool {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.run_cpu_intensive_with_identified_caller(cpu_intensive_fn, "unknown")
+        self.run_cpu_intensive_with_extra_tags(cpu_intensive_fn, "unknown", "NA")
     }
 }
+
+/// Tracks a task submitted to a [`ThreadPool`] while it waits in the queue.
+///
+/// Dropping it without calling [`Self::start`] records the time spent queued but
+/// no run time, which is what happens to tasks cancelled before they run.
+struct QueuedTask {
+    ongoing_tasks: IntGauge,
+    run_time: Histogram,
+    pending_tasks_guard: OwnedGaugeGuard,
+    queue_wait_timer: HistogramTimer,
+}
+
+impl QueuedTask {
+    /// Must be called when submitting the task, not once a worker picks it up,
+    /// for the queue wait time to be measured correctly.
+    fn new(pool_name: &'static str, caller: &'static str, cost_class: &'static str) -> QueuedTask {
+        let labels = [pool_name, caller, cost_class];
+        let mut pending_tasks_guard = OwnedGaugeGuard::from_gauge(
+            THREAD_POOL_METRICS.pending_tasks.with_label_values(labels),
+        );
+        pending_tasks_guard.add(1i64);
+        QueuedTask {
+            ongoing_tasks: THREAD_POOL_METRICS.ongoing_tasks.with_label_values(labels),
+            run_time: THREAD_POOL_METRICS.run_time_secs.with_label_values(labels),
+            pending_tasks_guard,
+            queue_wait_timer: THREAD_POOL_METRICS
+                .queue_wait_time_secs
+                .with_label_values(labels)
+                .start_timer(),
+        }
+    }
+
+    fn start(self) -> RunningTaskGuard {
+        drop(self.pending_tasks_guard);
+        self.queue_wait_timer.observe_duration();
+        let mut ongoing_tasks_guard = OwnedGaugeGuard::from_gauge(self.ongoing_tasks);
+        ongoing_tasks_guard.add(1i64);
+        RunningTaskGuard {
+            _ongoing_tasks_guard: ongoing_tasks_guard,
+            _run_timer: self.run_time.start_timer(),
+        }
+    }
+}
+
+/// Tracks a task that is running. Dropping it records the run time.
+struct RunningTaskGuard {
+    _ongoing_tasks_guard: OwnedGaugeGuard,
+    _run_timer: HistogramTimer,
+}
+
+/// Records tasks that Tantivy schedules on a [`ThreadPool`] into the same
+/// metrics as the ones scheduled by Quickwit itself.
+struct ThreadPoolTaskInstrumentation {
+    pool_name: &'static str,
+    caller: &'static str,
+    cost_class: &'static str,
+}
+
+impl tantivy::TaskInstrumentation for ThreadPoolTaskInstrumentation {
+    fn enqueue(&self) -> Box<dyn tantivy::EnqueuedTask> {
+        Box::new(QueuedTask::new(
+            self.pool_name,
+            self.caller,
+            self.cost_class,
+        ))
+    }
+}
+
+impl tantivy::EnqueuedTask for QueuedTask {
+    fn run(self: Box<Self>) -> Box<dyn tantivy::RunningTask> {
+        Box::new(self.start())
+    }
+}
+
+impl tantivy::RunningTask for RunningTaskGuard {}
 
 /// Run a small (<200ms) CPU-intensive task on a dedicated thread pool with a few threads.
 ///
@@ -172,10 +237,10 @@ impl fmt::Display for Panicked {
 impl std::error::Error for Panicked {}
 
 struct ThreadPoolMetrics {
-    ongoing_tasks: IntGaugeVec<2>,
-    pending_tasks: IntGaugeVec<2>,
-    queue_wait_time_secs: HistogramVec<2>,
-    run_time_secs: HistogramVec<2>,
+    ongoing_tasks: IntGaugeVec<3>,
+    pending_tasks: IntGaugeVec<3>,
+    queue_wait_time_secs: HistogramVec<3>,
+    run_time_secs: HistogramVec<3>,
 }
 
 /// From 1ms to ~32.768s
@@ -191,14 +256,14 @@ impl Default for ThreadPoolMetrics {
                 "number of tasks being currently processed by threads in the thread pool",
                 "thread_pool",
                 &[],
-                ["pool", "caller"],
+                ["pool", "caller", "cost_class"],
             ),
             pending_tasks: new_gauge_vec(
                 "pending_tasks",
                 "number of tasks waiting in the queue before being processed by the thread pool",
                 "thread_pool",
                 &[],
-                ["pool", "caller"],
+                ["pool", "caller", "cost_class"],
             ),
             queue_wait_time_secs: new_histogram_vec(
                 "queue_wait_time_secs",
@@ -206,7 +271,7 @@ impl Default for ThreadPoolMetrics {
                  the thread pool",
                 "thread_pool",
                 &[],
-                ["pool", "caller"],
+                ["pool", "caller", "cost_class"],
                 wait_and_run_time_buckets(),
             ),
             run_time_secs: new_histogram_vec(
@@ -215,7 +280,7 @@ impl Default for ThreadPoolMetrics {
                  has been picked up from the queue",
                 "thread_pool",
                 &[],
-                ["pool", "caller"],
+                ["pool", "caller", "cost_class"],
                 wait_and_run_time_buckets(),
             ),
         }

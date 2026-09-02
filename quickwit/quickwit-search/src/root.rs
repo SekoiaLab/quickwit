@@ -57,6 +57,7 @@ use crate::service::SearcherContext;
 use crate::{
     SearchError, SearchJobPlacer, SearchPlanResponseRest, SearchServiceClient,
     extract_split_and_footer_offsets, list_relevant_splits_with_secondary_time,
+    query_cost_classifier,
 };
 
 /// Maximum accepted scroll TTL.
@@ -797,14 +798,16 @@ pub(crate) async fn search_partial_hits_phase(
     // Wrap into result for merge_fruits
     let leaf_search_results: Vec<tantivy::Result<LeafSearchResponse>> =
         leaf_search_responses.into_iter().map(Ok).collect_vec();
+    let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
     let span = info_span!("merge_fruits");
     let mut leaf_search_response = crate::search_thread_pool()
-        .run_cpu_intensive_with_identified_caller(
+        .run_cpu_intensive_with_extra_tags(
             move || {
                 let _span_guard = span.enter();
                 merge_collector.merge_fruits(leaf_search_results)
             },
             "root_merge",
+            cost_class.as_label(),
         )
         .await
         .context("failed to merge leaf search responses")?
