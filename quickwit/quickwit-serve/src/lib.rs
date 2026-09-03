@@ -28,6 +28,7 @@ mod indexing_api;
 mod ingest_api;
 mod jaeger_api;
 mod load_shield;
+
 mod metrics;
 mod metrics_api;
 mod node_info_handler;
@@ -38,6 +39,7 @@ mod rest;
 mod rest_api_response;
 mod search_api;
 pub(crate) mod simple_list;
+mod soft_delete_api;
 pub mod tcp_listener;
 mod template_api;
 mod ui_handler;
@@ -65,15 +67,17 @@ use quickwit_common::pubsub::{EventBroker, EventSubscriptionHandle};
 use quickwit_common::rate_limiter::RateLimiterSettings;
 use quickwit_common::retry::RetryParams;
 use quickwit_common::runtimes::RuntimesConfig;
+use quickwit_common::spawn_named_task;
 use quickwit_common::tower::{
-    BalanceChannel, BoxFutureInfaillible, BufferLayer, Change, CircuitBreakerEvaluator,
+    BalanceChannel, BoxFutureInfaillible, BoxLayer, BufferLayer, Change, CircuitBreakerEvaluator,
     ConstantRate, EstimateRateLayer, EventListenerLayer, GrpcMetricsLayer, LoadShedLayer,
     RateLimitLayer, RetryLayer, RetryPolicy, SmaRateEstimator, TimeoutLayer,
 };
 use quickwit_common::uri::Uri;
-use quickwit_common::{get_bool_from_env, spawn_named_task};
 use quickwit_config::service::QuickwitService;
-use quickwit_config::{ClusterConfig, IngestApiConfig, NodeConfig};
+use quickwit_config::{
+    ClusterConfig, IngestApiConfig, NodeConfig, is_delete_task_service_disabled,
+};
 use quickwit_control_plane::control_plane::{ControlPlane, ControlPlaneEventSubscriber};
 use quickwit_control_plane::{IndexerNodeInfo, IndexerPool};
 use quickwit_index_management::{IndexService as IndexManager, IndexServiceError};
@@ -101,7 +105,7 @@ use quickwit_proto::ingest::router::IngestRouterServiceClient;
 use quickwit_proto::ingest::{IngestV2Error, RateLimitingCause};
 use quickwit_proto::metastore::{
     EntityKind, ListIndexesMetadataRequest, MetastoreError, MetastoreService,
-    MetastoreServiceClient,
+    MetastoreServiceClient, MetastoreServiceTowerLayerStack,
 };
 use quickwit_proto::search::ReportSplitsRequest;
 use quickwit_proto::types::NodeId;
@@ -109,7 +113,7 @@ use quickwit_search::{
     SearchJobPlacer, SearchService, SearchServiceClient, SearcherContext, SearcherPool,
     create_search_client_from_channel, start_searcher_service,
 };
-use quickwit_storage::{SplitCache, StorageResolver};
+use quickwit_storage::{DiskSizedCache, SplitCache, StorageResolver};
 use tcp_listener::TcpListenerResolver;
 use tokio::sync::oneshot;
 use tonic_health::ServingStatus;
@@ -136,7 +140,6 @@ const READINESS_REPORTING_INTERVAL: Duration = if cfg!(any(test, feature = "test
 
 const METASTORE_CLIENT_MAX_CONCURRENCY_ENV_KEY: &str = "QW_METASTORE_CLIENT_MAX_CONCURRENCY";
 const DEFAULT_METASTORE_CLIENT_MAX_CONCURRENCY: usize = 6;
-const DISABLE_DELETE_TASK_SERVICE_ENV_KEY: &str = "QW_DISABLE_DELETE_TASK_SERVICE";
 
 pub type EnvFilterReloadFn = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
 
@@ -150,6 +153,30 @@ fn get_metastore_client_max_concurrency() -> usize {
         DEFAULT_METASTORE_CLIENT_MAX_CONCURRENCY,
         false,
     )
+}
+
+/// Configures per-method retry layers on a metastore tower layer stack.
+///
+/// All methods get a standard retry. `stage_splits` and `publish_splits` replace it
+/// with a harder retry because those calls happen after significant indexing work and
+/// losing them to a transient failure is particularly costly.
+fn stack_metastore_retry_layer(
+    tower: MetastoreServiceTowerLayerStack,
+) -> MetastoreServiceTowerLayerStack {
+    let mut tower = tower.stack_layer(RetryLayer::new(RetryPolicy::from(RetryParams::standard())));
+    let harder_retry_params = RetryParams {
+        base_delay: Duration::from_secs(1),
+        max_delay: Duration::from_secs(20),
+        // adding just 2 more retries bumps the retry duration from ~2s to ~12s
+        max_attempts: 5,
+    };
+    tower.stage_splits_layers = vec![BoxLayer::new(RetryLayer::new(RetryPolicy::from(
+        harder_retry_params,
+    )))];
+    tower.publish_splits_layers = vec![BoxLayer::new(RetryLayer::new(RetryPolicy::from(
+        harder_retry_params,
+    )))];
+    tower
 }
 
 static CP_GRPC_CLIENT_METRICS_LAYER: Lazy<GrpcMetricsLayer> =
@@ -229,27 +256,27 @@ async fn balance_channel_for_service(
     let service_change_stream = cluster_change_stream.filter_map(move |cluster_change| {
         Box::pin(async move {
             match cluster_change {
-                ClusterChange::Add(node) if node.enabled_services().contains(&service) => {
+                ClusterChange::Add(node) if node.is_service_enabled(service) => {
                     let chitchat_id = node.chitchat_id();
                     info!(
-                        node_id = chitchat_id.node_id,
+                        node_id = %chitchat_id.node_id,
                         generation_id = chitchat_id.generation_id,
                         "adding node `{}` to {} pool",
                         chitchat_id.node_id,
                         service.as_str().replace('_', " "),
                     );
-                    Some(Change::Insert(node.grpc_advertise_addr(), node.channel()))
+                    Some(Change::Insert(node.grpc_advertise_addr, node.channel()))
                 }
-                ClusterChange::Remove(node) if node.enabled_services().contains(&service) => {
+                ClusterChange::Remove(node) if node.is_service_enabled(service) => {
                     let chitchat_id = node.chitchat_id();
                     info!(
-                        node_id = chitchat_id.node_id,
+                        node_id = %chitchat_id.node_id,
                         generation_id = chitchat_id.generation_id,
                         "removing node `{}` from {} pool",
                         chitchat_id.node_id,
                         service.as_str().replace('_', " "),
                     );
-                    Some(Change::Remove(node.grpc_advertise_addr()))
+                    Some(Change::Remove(node.grpc_advertise_addr))
                 }
                 _ => None,
             }
@@ -317,7 +344,7 @@ async fn start_control_plane_if_needed(
         )
         .await?;
 
-        let self_node_id: NodeId = cluster.self_node_id().into();
+        let self_node_id: NodeId = cluster.self_node_id();
 
         let control_plane_mailbox = setup_control_plane(
             universe,
@@ -502,8 +529,8 @@ pub async fn serve_quickwit(
             {
                 bail!("could not find any metastore node in the cluster");
             }
-            MetastoreServiceClient::tower()
-                .stack_layer(RetryLayer::new(RetryPolicy::from(RetryParams::standard())))
+
+            stack_metastore_retry_layer(MetastoreServiceClient::tower())
                 .stack_layer(TimeoutLayer::new(GRPC_METASTORE_SERVICE_TIMEOUT))
                 .stack_layer(METASTORE_GRPC_CLIENT_METRICS_LAYER.clone())
                 .stack_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
@@ -546,6 +573,7 @@ pub async fn serve_quickwit(
             ingester_pool.clone(),
             storage_resolver.clone(),
             event_broker.clone(),
+            is_delete_task_service_disabled(),
         )
         .await
         .context("failed to start indexing service")?;
@@ -630,9 +658,32 @@ pub async fn serve_quickwit(
             None
         };
 
+    let split_footer_disk_cache_opt: Option<DiskSizedCache<String>> = if let Some(capacity) =
+        node_config.searcher_config.split_footer_disk_cache_capacity
+    {
+        match DiskSizedCache::open(
+            node_config
+                .data_dir_path
+                .join("searcher-split-footer-cache"),
+            capacity.as_u64(),
+            &quickwit_storage::STORAGE_METRICS.split_footer_disk_cache,
+        )
+        .await
+        {
+            Ok(disk_cache) => Some(disk_cache),
+            Err(error) => {
+                error!(%error, "failed to open the persistent split footer cache, disabling it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let searcher_context = Arc::new(SearcherContext::new(
         node_config.searcher_config.clone(),
         split_cache_opt,
+        split_footer_disk_cache_opt,
     ));
 
     let (search_job_placer, search_service) = setup_searcher(
@@ -676,7 +727,7 @@ pub async fn serve_quickwit(
             search_job_placer,
             storage_resolver.clone(),
             event_broker.clone(),
-            !get_bool_from_env(DISABLE_DELETE_TASK_SERVICE_ENV_KEY, false),
+            !is_delete_task_service_disabled(),
         )
         .await
         .context("failed to start janitor service")?;
@@ -888,7 +939,7 @@ async fn setup_ingest_v2(
     ingester_pool: IngesterPool,
 ) -> anyhow::Result<(IngestRouter, IngestRouterServiceClient, Option<Ingester>)> {
     // Instantiate ingest router.
-    let self_node_id: NodeId = cluster.self_node_id().into();
+    let self_node_id: NodeId = cluster.self_node_id();
     let grpc_compression_encoding_opt = node_config.ingest_api_config.grpc_compression_encoding();
     let replication_factor = node_config
         .ingest_api_config
@@ -958,12 +1009,12 @@ async fn setup_ingest_v2(
                 ClusterChange::Add(node) if node.is_indexer() => {
                     let chitchat_id = node.chitchat_id();
                     info!(
-                        node_id = chitchat_id.node_id,
+                        node_id = %chitchat_id.node_id,
                         generation_id = chitchat_id.generation_id,
                         "adding node `{}` to ingester pool",
                         chitchat_id.node_id,
                     );
-                    let node_id: NodeId = node.node_id().into();
+                    let node_id: NodeId = node.node_id.clone();
 
                     if node.is_self_node() {
                         // Here, since the service is available locally, we bypass the network stack
@@ -982,7 +1033,7 @@ async fn setup_ingest_v2(
                             .stack_layer(INGEST_GRPC_CLIENT_METRICS_LAYER.clone())
                             .stack_layer(TimeoutLayer::new(GRPC_INGESTER_SERVICE_TIMEOUT))
                             .build_from_channel(
-                                node.grpc_advertise_addr(),
+                                node.grpc_advertise_addr,
                                 node.channel(),
                                 max_message_size,
                                 grpc_compression_encoding_opt,
@@ -993,12 +1044,12 @@ async fn setup_ingest_v2(
                 ClusterChange::Remove(node) if node.is_indexer() => {
                     let chitchat_id = node.chitchat_id();
                     info!(
-                        node_id = chitchat_id.node_id,
+                        node_id = %chitchat_id.node_id,
                         generation_id = chitchat_id.generation_id,
                         "removing node `{}` from ingester pool",
                         chitchat_id.node_id,
                     );
-                    Some(Change::Remove(node.node_id().into()))
+                    Some(Change::Remove(node.node_id.clone()))
                 }
                 _ => None,
             }
@@ -1025,7 +1076,7 @@ async fn setup_searcher(
     )
     .await?;
     let search_service_clone = search_service.clone();
-    let max_message_size = node_config.grpc_config.max_message_size;
+    let max_message_size = node_config.grpc_config.max_search_message_size;
     let searcher_change_stream = cluster_change_stream.filter_map(move |cluster_change| {
         let search_service_clone = search_service_clone.clone();
         Box::pin(async move {
@@ -1033,12 +1084,12 @@ async fn setup_searcher(
                 ClusterChange::Add(node) if node.is_searcher() => {
                     let chitchat_id = node.chitchat_id();
                     info!(
-                        node_id = chitchat_id.node_id,
+                        node_id = %chitchat_id.node_id,
                         generation_id = chitchat_id.generation_id,
                         "adding node `{}` to searcher pool",
                         chitchat_id.node_id,
                     );
-                    let grpc_addr = node.grpc_advertise_addr();
+                    let grpc_addr = node.grpc_advertise_addr;
 
                     if node.is_self_node() {
                         let search_client =
@@ -1058,12 +1109,12 @@ async fn setup_searcher(
                 ClusterChange::Remove(node) if node.is_searcher() => {
                     let chitchat_id = node.chitchat_id();
                     info!(
-                        node_id = chitchat_id.node_id,
+                        node_id = %chitchat_id.node_id,
                         generation_id = chitchat_id.generation_id,
                         "removing node `{}` from searcher pool",
                         chitchat_id.node_id,
                     );
-                    Some(Change::Remove(node.grpc_advertise_addr()))
+                    Some(Change::Remove(node.grpc_advertise_addr))
                 }
                 _ => None,
             }
@@ -1141,7 +1192,7 @@ fn setup_indexer_pool(
                 ClusterChange::Add(node) if node.is_indexer() => {
                     let chitchat_id = node.chitchat_id();
                     info!(
-                        node_id = chitchat_id.node_id,
+                        node_id = %chitchat_id.node_id,
                         generation_id = chitchat_id.generation_id,
                         "adding node `{}` to indexer pool",
                         chitchat_id.node_id,
@@ -1151,9 +1202,9 @@ fn setup_indexer_pool(
             };
             match cluster_change {
                 ClusterChange::Add(node) | ClusterChange::Update(node) if node.is_indexer() => {
-                    let node_id = node.node_id().to_owned();
-                    let indexing_tasks = node.indexing_tasks().to_vec();
-                    let indexing_capacity = node.indexing_capacity();
+                    let node_id = node.node_id.clone();
+                    let indexing_tasks = node.indexing_tasks.to_vec();
+                    let indexing_capacity = node.indexing_cpu_capacity;
 
                     if node.is_self_node() {
                         // Here, since the service is available locally, we bypass the network stack
@@ -1185,7 +1236,7 @@ fn setup_indexer_pool(
                             .stack_layer(INDEXING_GRPC_CLIENT_METRICS_LAYER.clone())
                             .stack_layer(TimeoutLayer::new(GRPC_INDEXING_SERVICE_TIMEOUT))
                             .build_from_channel(
-                                node.grpc_advertise_addr(),
+                                node.grpc_advertise_addr,
                                 node.channel(),
                                 max_message_size,
                                 None,
@@ -1206,12 +1257,12 @@ fn setup_indexer_pool(
                 ClusterChange::Remove(node) if node.is_indexer() => {
                     let chitchat_id = node.chitchat_id();
                     info!(
-                        node_id = chitchat_id.node_id,
+                        node_id = %chitchat_id.node_id,
                         generation_id = chitchat_id.generation_id,
                         "removing node `{}` from indexer pool",
                         chitchat_id.node_id,
                     );
-                    Some(Change::Remove(node.node_id().to_owned()))
+                    Some(Change::Remove(node.node_id.clone()))
                 }
                 _ => None,
             }
@@ -1553,7 +1604,8 @@ mod tests {
     #[tokio::test]
     async fn test_setup_searcher() {
         let node_config = NodeConfig::for_test();
-        let searcher_context = Arc::new(SearcherContext::new(SearcherConfig::default(), None));
+        let searcher_context =
+            Arc::new(SearcherContext::new(SearcherConfig::default(), None, None));
         let metastore = metastore_for_test();
         let (change_stream, change_stream_tx) = ClusterChangeStream::new_unbounded();
         let storage_resolver = StorageResolver::unconfigured();
@@ -1608,5 +1660,41 @@ mod tests {
             .await
             .unwrap();
         assert!(!searcher_client.is_local());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stack_metastore_retry_layer() {
+        use quickwit_proto::metastore::{ListIndexesMetadataRequest, MetastoreError};
+
+        let mut mock = MockMetastoreService::new();
+        mock.expect_list_indexes_metadata()
+            .times(3)
+            .returning(|_| Err(MetastoreError::Unavailable("transient".to_string())));
+
+        let client =
+            stack_metastore_retry_layer(MetastoreServiceClient::tower()).build_from_mock(mock);
+        let err = client
+            .list_indexes_metadata(ListIndexesMetadataRequest::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetastoreError::Unavailable(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stack_metastore_retry_layer_harder_retry() {
+        use quickwit_proto::metastore::{MetastoreError, StageSplitsRequest};
+
+        let mut mock = MockMetastoreService::new();
+        mock.expect_stage_splits()
+            .times(5)
+            .returning(|_| Err(MetastoreError::Unavailable("transient".to_string())));
+
+        let client =
+            stack_metastore_retry_layer(MetastoreServiceClient::tower()).build_from_mock(mock);
+        let err = client
+            .stage_splits(StageSplitsRequest::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetastoreError::Unavailable(_)));
     }
 }

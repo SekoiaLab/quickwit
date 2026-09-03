@@ -458,10 +458,26 @@ impl MergePipeline {
             ListSplitsRequest::try_from_list_splits_query(&list_splits_query)?;
         let immature_splits_stream = ctx
             .protect_future(self.params.metastore.list_splits(list_splits_request))
-            .await?;
+            .await
+            .inspect_err(|error| {
+                error!(
+                    %error,
+                    index_id=%self.params.pipeline_id.index_uid.index_id,
+                    source_id=%self.params.pipeline_id.source_id,
+                    "failed to list immature splits from the metastore"
+                );
+            })?;
         let immature_splits = ctx
             .protect_future(immature_splits_stream.collect_splits_metadata())
-            .await?;
+            .await
+            .inspect_err(|error| {
+                error!(
+                    %error,
+                    index_id=%self.params.pipeline_id.index_uid.index_id,
+                    source_id=%self.params.pipeline_id.source_id,
+                    "failed to collect immature splits metadata from the metastore"
+                );
+            })?;
         info!(
             index_uid=%self.params.pipeline_id.index_uid,
             source_id=%self.params.pipeline_id.source_id,
@@ -599,7 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_pipeline_simple() -> anyhow::Result<()> {
-        let node_id = NodeId::from("test-node");
+        let node_id = NodeId::from_str("test-node");
         let index_uid = IndexUid::for_test("test-index", 0);
         let source_id = "test-source".to_string();
         let pipeline_id = MergePipelineId {

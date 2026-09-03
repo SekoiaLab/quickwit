@@ -32,7 +32,6 @@ members = [
   "quickwit-search",
   "quickwit-serve",
   "quickwit-storage",
-  "quickwit-telemetry",
 ]
 
 # The following list excludes `quickwit-metastore-utils`
@@ -65,7 +64,6 @@ default-members = [
   "quickwit-search",
   "quickwit-serve",
   "quickwit-storage",
-  "quickwit-telemetry",
 ]
 
 [workspace.package]
@@ -91,7 +89,7 @@ bitpacking = "0.9.3"
 bytes = { version = "1", features = ["serde"] }
 bytesize = { version = "1.3", features = ["serde"] }
 bytestring = "1.5"
-chitchat = "0.10.0"
+chitchat = "0.11.0"
 chrono = { version = "0.4", default-features = false, features = [
   "clock",
   "std",
@@ -102,11 +100,11 @@ colored = "3.0"
 console-subscriber = "0.5"
 criterion = { version = "0.8", features = ["async_tokio"] }
 cron = "0.15"
-dialoguer = "0.12"
+dialoguer = { version = "0.12", default-features = false }
 dotenvy = "0.15"
 dyn-clone = "1.0"
 enum-iterator = "2.3"
-env_logger = "0.11"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
 fail = "0.5"
 flate2 = "1.1"
 flume = "0.12"
@@ -131,27 +129,23 @@ http-serde = "2.1"
 humantime = "2.3"
 hyper = { version = "1.8", features = ["client", "http1", "http2", "server"] }
 hyper-rustls = "0.27"
-hyper-util = { version = "0.1", features = ["full"] }
+hyper-util = { version = "0.1", default-features = false, features = [
+  "client-legacy",
+  "server-auto",
+  "server-graceful",
+  "service",
+  "tokio",
+] }
 indexmap = { version = "2.12", features = ["serde"] }
 indicatif = "0.18"
 itertools = "0.14"
 json_comments = "0.2"
 libz-sys = "1.1"
-# Lindera tokenizer 0.30+ versions (tested up to 0.32.3) are currently broken due to upstream build failures.
-# The dictionary crates attempt to download artifacts from S3 URLs that return 404 Not Found.
-# Version 0.29.0 is the latest version that builds correctly. It also explicitly depends on lindera-core 0.29
-# and lindera-dictionary 0.29.
-lindera-core = "0.29"
-lindera-dictionary = "0.29"
-lindera-tokenizer = { version = "0.29", features = [
-  "cc-cedict",
-  "ipadic",
-  "ko-dic",
-] }
 lru = "0.16"
 matches = "0.1"
 md5 = "0.8"
 mime_guess = "2.0"
+mini-moka = "0.10.3"
 mockall = "0.14"
 mrecordlog = { git = "https://github.com/quickwit-oss/mrecordlog", rev = "306c0a7" }
 new_string_template = "1.5"
@@ -175,7 +169,7 @@ pprof = { version = "0.15", features = ["flamegraph"] }
 predicates = "3"
 prettyplease = "0.2"
 proc-macro2 = "1.0"
-prometheus = { version = "0.14", features = ["process"] }
+prometheus = { version = "0.14", default-features = false, features = ["process"] }
 proptest = "1"
 prost = { version = "0.14", default-features = false, features = [
   "derive",
@@ -187,6 +181,7 @@ pulsar = { version = "6.6", default-features = false, features = [
   "compression",
   "tokio-runtime",
 ] }
+quick_cache = "0.6.18"
 quote = "1.0"
 rand = "0.9"
 rand_distr = "0.5"
@@ -245,7 +240,10 @@ tokio = { version = "1.48", features = ["full"] }
 tokio-metrics = { version = "0.4", features = ["rt"] }
 tokio-rustls = { version = "0.26", default-features = false }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = { version = "0.7", features = ["full"] }
+tokio-util = { version = "0.7", default-features = false, features = [
+  "compat",
+  "io-util",
+] }
 toml = "0.9"
 tonic = { version = "0.14", features = [
   "_tls-any",
@@ -295,9 +293,8 @@ vrl = { version = "0.29", default-features = false, features = [
   "value",
 ] }
 warp = { version = "0.4", features = ["server", "test"] }
-whichlang = "0.1"
 wiremock = "0.6"
-zstd = "0.13"
+zstd = { version = "0.13", default-features = false }
 
 aws-config = "1.8"
 aws-credential-types = { version = "1.2", features = ["hardcoded-credentials"] }
@@ -353,10 +350,9 @@ quickwit-rest-client = { path = "quickwit-rest-client" }
 quickwit-search = { path = "quickwit-search" }
 quickwit-serve = { path = "quickwit-serve" }
 quickwit-storage = { path = "quickwit-storage" }
-quickwit-telemetry = { path = "quickwit-telemetry" }
 
 
-tantivy = { git = "https://github.com/SekoiaLab/tantivy/", rev = "e9aede4", default-features = false, features = [
+tantivy = { git = "https://github.com/SekoiaLab/tantivy.git", tag = "v0.26.1_20260901", default-features = false, features = [
   "lz4-compression",
   "mmap",
   "quickwit",
@@ -371,7 +367,7 @@ encoding_rs = "=0.8.35"
 
 [patch.crates-io]
 sasl2-sys = { git = "https://github.com/quickwit-oss/rust-sasl/", rev = "085a4c7" }
-tantivy-fst = { git = "https://github.com/SekoiaLab/fst/", rev = "1997e450c52712357a2ffdbf0446263357ee0c02" }
+tantivy-fst = { git = "https://github.com/SekoiaLab/fst/", rev = "39ccb1c9283034815e22eb663d673a9e37023e7c" }
 
 ## this patched version of tracing helps better understand what happens inside futures (when are
 ## they polled, how long does poll take...)

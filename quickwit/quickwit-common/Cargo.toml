@@ -18,7 +18,6 @@ backtrace = { workspace = true, optional = true }
 bytesize = { workspace = true }
 coarsetime = { workspace = true }
 dyn-clone = { workspace = true }
-env_logger = { workspace = true }
 fnv = { workspace = true }
 futures = { workspace = true }
 home = { workspace = true }
@@ -37,6 +36,7 @@ regex = { workspace = true }
 serde = { workspace = true }
 siphasher = { workspace = true }
 sysinfo = { workspace = true }
+tantivy = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tikv-jemallocator = { workspace = true, optional = true }
@@ -50,9 +50,12 @@ tonic = { workspace = true, features = [
 ] }
 tower = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
-testsuite = ["hyper-util"]
+testsuite = [
+    "hyper-util",
+]
 named_tasks = ["tokio/tracing"]
 jemalloc-profiled = [
     "named_tasks",

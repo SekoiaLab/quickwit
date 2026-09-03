@@ -138,6 +138,12 @@ impl RpcName for AdviseResetShardsRequest {
     }
 }
 
+impl RpcName for SwapIndexingPipelinesRequest {
+    fn rpc_name() -> &'static str {
+        "swap_indexing_pipelines"
+    }
+}
+
 impl GetOrCreateOpenShardsFailureReason {
     pub fn create_failure(
         &self,
@@ -151,6 +157,24 @@ impl GetOrCreateOpenShardsFailureReason {
             source_id: subrequest.source_id,
             reason: *self as i32,
         }
+    }
+}
+
+impl RpcName for EnableMaintenanceModeRequest {
+    fn rpc_name() -> &'static str {
+        "enable_maintenance_mode"
+    }
+}
+
+impl RpcName for DisableMaintenanceModeRequest {
+    fn rpc_name() -> &'static str {
+        "disable_maintenance_mode"
+    }
+}
+
+impl RpcName for GetMaintenanceModeRequest {
+    fn rpc_name() -> &'static str {
+        "get_maintenance_mode"
     }
 }
 

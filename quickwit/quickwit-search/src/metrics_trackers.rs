@@ -19,10 +19,12 @@ use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use pin_project::{pin_project, pinned_drop};
-use quickwit_proto::search::{LeafSearchResponse, SearchResponse};
+use quickwit_proto::search::{LeafSearchResponse, SearchResponse, SplitsByOutcome};
+use tracing::{Span, record_all};
 
 use crate::SearchError;
-use crate::metrics::{SEARCH_METRICS, queue_label};
+use crate::metrics::SEARCH_METRICS;
+use crate::query_cost_classifier::QueryCostClass;
 
 // planning
 
@@ -34,20 +36,27 @@ pub struct SearchPlanMetricsFuture<F> {
     #[pin]
     pub tracked: F,
     pub start: Instant,
-    pub is_success: Option<bool>,
+    pub status: Option<Result<(), &'static str>>,
+    pub user_agent: String,
+    pub req_span: Span,
 }
 
 #[pinned_drop]
 impl<F> PinnedDrop for SearchPlanMetricsFuture<F> {
     fn drop(self: Pin<&mut Self>) {
-        let status = match self.is_success {
+        let status = match self.status {
             // this is a partial success, actual status will be recorded during the search step
-            Some(true) => return,
-            Some(false) => "plan-error",
-            None => "plan-cancelled",
+            Some(Ok(())) => return,
+            Some(Err(error)) => error,
+            None => {
+                record_all!(self.req_span, elapsed_ms = self.start.elapsed().as_millis());
+                let _guard = self.req_span.enter();
+                tracing::info!("root search planning cancelled");
+                "plan-cancelled"
+            }
         };
 
-        let label_values = [status];
+        let label_values = [normalize_user_agent(&self.user_agent), status];
         SEARCH_METRICS
             .root_search_requests_total
             .with_label_values(label_values)
@@ -68,9 +77,15 @@ where F: Future<Output = crate::Result<R>>
         let this = self.project();
         let response = ready!(this.tracked.poll(cx));
         if let Err(err) = &response {
+            record_all!(this.req_span, elapsed_ms = this.start.elapsed().as_millis());
+            let _guard = this.req_span.enter();
             tracing::error!(?err, "root search planning failed");
         }
-        *this.is_success = Some(response.is_ok());
+        *this.status = match &response {
+            Ok(_) => Some(Ok(())),
+            Err(SearchError::TooManySplits(_)) => Some(Err("too-many-splits")),
+            Err(_) => Some(Err("plan-error")),
+        };
         Poll::Ready(Ok(response?))
     }
 }
@@ -85,13 +100,19 @@ pub struct RootSearchMetricsFuture<F> {
     pub start: Instant,
     pub num_targeted_splits: usize,
     pub status: Option<&'static str>,
+    pub user_agent: String,
+    pub req_span: Span,
 }
 
 #[pinned_drop]
 impl<F> PinnedDrop for RootSearchMetricsFuture<F> {
     fn drop(self: Pin<&mut Self>) {
+        if self.status.is_none() {
+            let _guard = self.req_span.enter();
+            tracing::info!("root search cancelled");
+        }
         let status = self.status.unwrap_or("cancelled");
-        let label_values = [status];
+        let label_values = [normalize_user_agent(&self.user_agent), status];
         SEARCH_METRICS
             .root_search_requests_total
             .with_label_values(label_values)
@@ -107,6 +128,48 @@ impl<F> PinnedDrop for RootSearchMetricsFuture<F> {
     }
 }
 
+struct SplitsByOutcomeDisp(SplitsByOutcome);
+
+impl std::fmt::Display for SplitsByOutcomeDisp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructure to make sure we update this if a state is added
+        let SplitsByOutcome {
+            pruned_before_warmup,
+            pruned_after_warmup,
+            cancel_before_warmup,
+            cancel_warmup,
+            cancel_cpu_queue,
+            cancel_cpu,
+            processed,
+            processed_from_metadata,
+            cache_hit,
+        } = self.0;
+        let mut sep = "{";
+        for (name, val) in [
+            ("pruned_before_warmup", pruned_before_warmup),
+            ("pruned_after_warmup", pruned_after_warmup),
+            ("cancel_before_warmup", cancel_before_warmup),
+            ("cancel_warmup", cancel_warmup),
+            ("cancel_cpu_queue", cancel_cpu_queue),
+            ("cancel_cpu", cancel_cpu),
+            ("processed", processed),
+            ("processed_from_metadata", processed_from_metadata),
+            ("cache_hit", cache_hit),
+        ] {
+            if val > 0 {
+                write!(f, "{sep}{name}={val}")?;
+                sep = ",";
+            }
+        }
+        if sep == "{" {
+            write!(f, "{{}}")?;
+        } else {
+            write!(f, "}}")?;
+        }
+        Ok(())
+    }
+}
+
 impl<F> Future for RootSearchMetricsFuture<F>
 where F: Future<Output = crate::Result<SearchResponse>>
 {
@@ -115,18 +178,27 @@ where F: Future<Output = crate::Result<SearchResponse>>
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let response = ready!(this.tracked.poll(cx));
+        record_all!(this.req_span, elapsed_ms = this.start.elapsed().as_millis());
+        let _guard = this.req_span.enter();
         if let Err(err) = &response {
             tracing::error!(?err, "root search failed");
-        }
-        if let Ok(resp) = &response {
+            *this.status = Some("error");
+        } else if let Ok(resp) = &response {
+            let s = resp.splits_by_outcome.unwrap_or_default();
             if resp.failed_splits.is_empty() {
                 *this.status = Some("success");
+                tracing::info!(splits_by_outcome = %SplitsByOutcomeDisp(s), "root search success");
             } else {
                 *this.status = Some("partial-success");
+                tracing::error!(
+                    failed_splits = resp.failed_splits.len(),
+                    first_failed_split = ?resp.failed_splits.first().unwrap(),
+                    splits_by_outcome = %SplitsByOutcomeDisp(s),
+                    "root search partial success"
+                );
             }
-        } else {
-            *this.status = Some("error");
         }
+
         Poll::Ready(Ok(response?))
     }
 }
@@ -141,7 +213,7 @@ pub struct LeafSearchMetricsFuture<F> {
     pub start: Instant,
     pub targeted_splits: usize,
     pub status: Option<&'static str>,
-    pub is_broad_search: bool,
+    pub cost_class: QueryCostClass,
 }
 
 #[pinned_drop]
@@ -149,7 +221,7 @@ impl<F> PinnedDrop for LeafSearchMetricsFuture<F> {
     fn drop(self: Pin<&mut Self>) {
         let label_values = [
             self.status.unwrap_or("cancelled"),
-            queue_label(self.is_broad_search),
+            self.cost_class.as_label(),
         ];
         SEARCH_METRICS
             .leaf_search_requests_total
@@ -180,5 +252,98 @@ where F: Future<Output = Result<LeafSearchResponse, SearchError>>
             Err(_) => Some("error"),
         };
         Poll::Ready(Ok(response?))
+    }
+}
+
+/// Simplify the user agent to limit the metric's cardinality.
+pub fn normalize_user_agent(user_agent: &str) -> &str {
+    let ua = user_agent.trim();
+
+    // Browsers always start with "Mozilla/"
+    if ua.starts_with("Mozilla") {
+        return "browser";
+    }
+
+    let lower = ua.to_ascii_lowercase();
+
+    // Well-known CLI / library prefixes (match on the start of the lower-cased
+    // string so version numbers don't matter).
+    const CLI_PREFIXES: &[&str] = &[
+        "curl",
+        "wget",
+        "python-httpx",
+        "python-requests",
+        "elasticsearch-py",
+        "go-http-client",
+        "java",
+        "okhttp",
+        "axios",
+        "ruby",
+        "node-fetch",
+        "node",
+    ];
+    if let Some(&prefix) = CLI_PREFIXES.iter().find(|p| lower.starts_with(*p)) {
+        return prefix;
+    }
+
+    // Keep short service names verbatim; truncate anything exotic.
+    if ua.len() <= 64 { ua } else { "other" }
+}
+
+#[cfg(test)]
+mod tests {
+    use quickwit_proto::search::SplitsByOutcome;
+
+    use super::SplitsByOutcomeDisp;
+
+    fn disp(s: SplitsByOutcome) -> String {
+        format!("{}", SplitsByOutcomeDisp(s))
+    }
+
+    #[test]
+    fn test_splits_by_outcome_disp_all_zero() {
+        assert_eq!(disp(SplitsByOutcome::default()), "{}");
+    }
+
+    #[test]
+    fn test_splits_by_outcome_disp_single_field() {
+        assert_eq!(
+            disp(SplitsByOutcome {
+                processed: 3,
+                ..Default::default()
+            }),
+            "{processed=3}"
+        );
+    }
+
+    #[test]
+    fn test_splits_by_outcome_disp_multiple_fields() {
+        assert_eq!(
+            disp(SplitsByOutcome {
+                pruned_before_warmup: 2,
+                processed: 1,
+                ..Default::default()
+            }),
+            "{pruned_before_warmup=2,processed=1}"
+        );
+    }
+
+    #[test]
+    fn test_splits_by_outcome_disp_all_fields() {
+        assert_eq!(
+            disp(SplitsByOutcome {
+                pruned_before_warmup: 1,
+                pruned_after_warmup: 2,
+                cancel_before_warmup: 3,
+                cancel_warmup: 4,
+                cancel_cpu_queue: 5,
+                cancel_cpu: 6,
+                processed: 7,
+                processed_from_metadata: 8,
+                cache_hit: 9,
+            }),
+            "{pruned_before_warmup=1,pruned_after_warmup=2,cancel_before_warmup=3,cancel_warmup=4,\
+             cancel_cpu_queue=5,cancel_cpu=6,processed=7,processed_from_metadata=8,cache_hit=9}"
+        );
     }
 }

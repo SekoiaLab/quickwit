@@ -476,11 +476,11 @@ mod tests {
                     num_hits: 0,
                     hits: Vec::new(),
                     elapsed_time_micros: 0,
-                    errors: Vec::new(),
                     aggregation_postcard: None,
                     scroll_id: None,
                     failed_splits: Vec::new(),
                     num_successful_splits: 1,
+                    splits_by_outcome: None,
                 })
             });
         let mock_search_service = Arc::new(mock_search_service);
@@ -509,11 +509,11 @@ mod tests {
                     num_hits: 0,
                     hits: Vec::new(),
                     elapsed_time_micros: 0,
-                    errors: Vec::new(),
                     aggregation_postcard: None,
                     scroll_id: None,
                     failed_splits: Vec::new(),
                     num_successful_splits: 1,
+                    splits_by_outcome: None,
                 })
             });
         let mock_search_service = Arc::new(mock_search_service);

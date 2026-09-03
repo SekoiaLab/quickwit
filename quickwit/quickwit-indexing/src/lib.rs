@@ -35,9 +35,12 @@ pub use crate::split_store::{IndexingSplitStore, get_tantivy_directory_from_spli
 
 pub mod actors;
 mod controlled_directory;
+pub mod mature_merge;
+pub mod mature_merge_plan;
 pub mod merge_policy;
 mod metrics;
 pub mod models;
+mod soft_delete_query;
 pub mod source;
 mod split_store;
 #[cfg(any(test, feature = "testsuite"))]
@@ -69,6 +72,7 @@ pub async fn start_indexing_service(
     ingester_pool: IngesterPool,
     storage_resolver: StorageResolver,
     event_broker: EventBroker,
+    is_delete_task_service_disabled: bool,
 ) -> anyhow::Result<Mailbox<IndexingService>> {
     info!("starting indexer service");
     let ingest_api_service_mailbox = universe.get_one::<IngestApiService>();
@@ -88,6 +92,7 @@ pub async fn start_indexing_service(
         ingester_pool,
         storage_resolver,
         event_broker,
+        is_delete_task_service_disabled,
     )
     .await?;
     let (indexing_service, _) = universe.spawn_builder().spawn(indexing_service);
