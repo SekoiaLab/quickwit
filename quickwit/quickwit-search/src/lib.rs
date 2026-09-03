@@ -49,7 +49,7 @@ mod tests;
 
 pub use collector::QuickwitAggregations;
 use metrics::SEARCH_METRICS;
-use quickwit_common::thread_pool::ThreadPool;
+use quickwit_common::thread_pool::SearchThreadPool;
 use quickwit_common::tower::Pool;
 use quickwit_doc_mapper::DocMapper;
 use quickwit_proto::metastore::{
@@ -132,11 +132,11 @@ fn compute_search_thread_pool_num_threads() -> Option<usize> {
     Some(threads)
 }
 
-fn search_thread_pool() -> &'static ThreadPool {
-    static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
+fn search_thread_pool() -> &'static SearchThreadPool {
+    static SEARCH_THREAD_POOL: OnceLock<SearchThreadPool> = OnceLock::new();
 
     SEARCH_THREAD_POOL
-        .get_or_init(|| ThreadPool::new("search", compute_search_thread_pool_num_threads()))
+        .get_or_init(|| SearchThreadPool::new("search", compute_search_thread_pool_num_threads()))
 }
 
 #[cfg(test)]
