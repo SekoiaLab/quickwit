@@ -19,7 +19,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use fnv::FnvHasher;
 use lru::LruCache;
@@ -34,12 +34,26 @@ const TEMP_MARKER: &str = ".tmp";
 /// Global counter used to build unique temporary file names.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Default minimum delay between two on-disk mtime refreshes for the same entry.
+const DEFAULT_MTIME_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Book-keeping stored in the in-memory LRU index for each on-disk entry.
+#[derive(Clone, Copy)]
+struct CacheEntry {
+    num_bytes: u64,
+    /// Last time this entry's on-disk mtime was refreshed to reflect an access.
+    /// Used only to debounce metadata writes.
+    last_mtime_refresh: SystemTime,
+}
+
 struct DiskCacheIndex {
-    /// Maps the on-disk file name to the size of its content.
+    /// Maps the on-disk file name to its book-keeping.
     /// The LRU order tracks the recency of accesses for eviction.
-    lru_cache: LruCache<String, u64>,
+    lru_cache: LruCache<String, CacheEntry>,
     num_bytes: u64,
     capacity_in_bytes: u64,
+    /// Minimum delay between two on-disk mtime refreshes for the same entry.
+    mtime_refresh_interval: Duration,
     cache_counters: &'static CacheMetricCounters,
 }
 
@@ -58,13 +72,31 @@ impl DiskCacheIndex {
         self.cache_counters.evict_num_bytes.inc_by(num_bytes);
     }
 
+    /// Records an access to `file_name`: refreshes the in-memory LRU recency and reports whether
+    /// the on-disk mtime is due for a (debounced) refresh, updating the debounce timestamp if so.
+    ///
+    /// Returns `None` if the entry is not tracked by this tier.
+    fn record_access(&mut self, file_name: &str) -> Option<bool> {
+        let entry = self.lru_cache.get_mut(file_name)?;
+        let interval = self.mtime_refresh_interval;
+        let due = entry
+            .last_mtime_refresh
+            .elapsed()
+            .map(|elapsed| elapsed >= interval)
+            .unwrap_or(true);
+        if due {
+            entry.last_mtime_refresh = SystemTime::now();
+        }
+        Some(due)
+    }
+
     /// Evicts the least recently used entries until `incoming` extra bytes would fit
     /// under the capacity. Returns the file names that must be deleted from disk.
     fn evict_to_fit(&mut self, incoming: u64) -> Vec<String> {
         let mut victims = Vec::new();
         while self.num_bytes + incoming > self.capacity_in_bytes {
-            if let Some((file_name, num_bytes)) = self.lru_cache.pop_lru() {
-                self.drop_item(num_bytes);
+            if let Some((file_name, entry)) = self.lru_cache.pop_lru() {
+                self.drop_item(entry.num_bytes);
                 victims.push(file_name);
             } else {
                 break;
@@ -109,8 +141,33 @@ impl<K: Display> DiskSizedCache<K> {
     where
         K: 'static,
     {
+        Self::open_with_interval(
+            root_path,
+            capacity_in_bytes,
+            DEFAULT_MTIME_REFRESH_INTERVAL,
+            cache_counters,
+        )
+        .await
+    }
+
+    /// Opens a disk cache with an explicit mtime-refresh debounce interval (see
+    /// [`DEFAULT_MTIME_REFRESH_INTERVAL`]). Mainly useful for tests.
+    pub async fn open_with_interval(
+        root_path: PathBuf,
+        capacity_in_bytes: u64,
+        mtime_refresh_interval: Duration,
+        cache_counters: &'static ComponentCacheMetrics,
+    ) -> io::Result<Self>
+    where
+        K: 'static,
+    {
         tokio::task::spawn_blocking(move || {
-            Self::open_blocking(root_path, capacity_in_bytes, cache_counters)
+            Self::open_blocking(
+                root_path,
+                capacity_in_bytes,
+                mtime_refresh_interval,
+                cache_counters,
+            )
         })
         .await
         .map_err(io::Error::other)?
@@ -119,6 +176,7 @@ impl<K: Display> DiskSizedCache<K> {
     fn open_blocking(
         root_path: PathBuf,
         capacity_in_bytes: u64,
+        mtime_refresh_interval: Duration,
         cache_counters: &'static ComponentCacheMetrics,
     ) -> io::Result<Self> {
         let start = Instant::now();
@@ -171,11 +229,18 @@ impl<K: Display> DiskSizedCache<K> {
             lru_cache: LruCache::unbounded(),
             num_bytes: 0,
             capacity_in_bytes,
+            mtime_refresh_interval,
             cache_counters: &cache_counters.active_cache_metrics,
         };
-        for (file_name, num_bytes, _) in entries {
+        for (file_name, num_bytes, modified) in entries {
             index.record_item(num_bytes);
-            index.lru_cache.put(file_name, num_bytes);
+            index.lru_cache.put(
+                file_name,
+                CacheEntry {
+                    num_bytes,
+                    last_mtime_refresh: modified,
+                },
+            );
         }
         let victims = index.evict_to_fit(0);
 
@@ -202,17 +267,29 @@ impl<K: Display> DiskSizedCache<K> {
     /// Returns the cached payload for the given key, if present on disk.
     pub async fn get(&self, key: &K) -> Option<OwnedBytes> {
         let file_name = key.to_string();
-        {
+        let refresh_mtime = {
             let mut index = self.index.lock().unwrap();
-            // `LruCache::get` refreshes the recency of the entry.
-            if index.lru_cache.get(&file_name).is_none() {
-                index.cache_counters.misses_num_items.inc();
-                return None;
+            // `record_access` refreshes the in-memory recency of the entry and tells us whether the
+            // on-disk mtime is (debounced) due for a refresh.
+            match index.record_access(&file_name) {
+                Some(due) => due,
+                None => {
+                    index.cache_counters.misses_num_items.inc();
+                    return None;
+                }
             }
-        }
+        };
         // Offload the blocking read so we don't stall the async runtime worker.
         let path = path_for(&self.root_path, &file_name);
-        let read_res = tokio::task::spawn_blocking(move || std::fs::read(path)).await;
+        let read_res = tokio::task::spawn_blocking(move || {
+            let buffer = std::fs::read(&path)?;
+            // Keep the on-disk mtime in step with the in-memory LRU recency we just refreshed.
+            if refresh_mtime && let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+                let _ = file.set_modified(SystemTime::now());
+            }
+            io::Result::Ok(buffer)
+        })
+        .await;
         match read_res {
             Ok(Ok(buffer)) => {
                 let index = self.index.lock().unwrap();
@@ -227,13 +304,13 @@ impl<K: Display> DiskSizedCache<K> {
                 // The file vanished (e.g. concurrent eviction or manual deletion): drop the
                 // stale index entry and report a miss.
                 let mut index = self.index.lock().unwrap();
-                if let Some(num_bytes) = index.lru_cache.pop(&file_name) {
-                    index.num_bytes -= num_bytes;
+                if let Some(entry) = index.lru_cache.pop(&file_name) {
+                    index.num_bytes -= entry.num_bytes;
                     index.cache_counters.in_cache_count.dec();
                     index
                         .cache_counters
                         .in_cache_num_bytes
-                        .sub(num_bytes as i64);
+                        .sub(entry.num_bytes as i64);
                 }
                 index.cache_counters.misses_num_items.inc();
                 None
@@ -246,6 +323,28 @@ impl<K: Display> DiskSizedCache<K> {
                 None
             }
         }
+    }
+
+    /// Records an access to `key` that was served by a higher cache tier, without reading the file.
+    pub fn touch(&self, key: &K) {
+        let file_name = key.to_string();
+        let refresh_mtime = {
+            let mut index = self.index.lock().unwrap();
+            match index.record_access(&file_name) {
+                Some(due) => due,
+                None => return,
+            }
+        };
+        if !refresh_mtime {
+            return;
+        }
+        let path = path_for(&self.root_path, &file_name);
+        // Fire-and-forget: refreshing the mtime must not add latency to the hot in-memory hit path.
+        tokio::task::spawn_blocking(move || {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+                let _ = file.set_modified(SystemTime::now());
+            }
+        });
     }
 
     /// Stores the given payload on disk under the given key.
@@ -300,7 +399,13 @@ impl<K: Display> DiskSizedCache<K> {
             }
             let victims = index.evict_to_fit(num_bytes);
             index.record_item(num_bytes);
-            index.lru_cache.put(file_name, num_bytes);
+            index.lru_cache.put(
+                file_name,
+                CacheEntry {
+                    num_bytes,
+                    last_mtime_refresh: SystemTime::now(),
+                },
+            );
             victims
         };
         if !victims.is_empty() {
@@ -347,9 +452,16 @@ mod tests {
     use crate::metrics::CACHE_METRICS_FOR_TESTS;
 
     async fn open_cache(root_path: PathBuf, capacity_in_bytes: u64) -> DiskSizedCache<String> {
-        DiskSizedCache::open(root_path, capacity_in_bytes, &CACHE_METRICS_FOR_TESTS)
-            .await
-            .unwrap()
+        // Use a zero debounce interval so every access deterministically refreshes the on-disk
+        // recency, making the recency-ordering tests independent of wall-clock timing.
+        DiskSizedCache::open_with_interval(
+            root_path,
+            capacity_in_bytes,
+            Duration::ZERO,
+            &CACHE_METRICS_FOR_TESTS,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -480,6 +592,57 @@ mod tests {
         let cache = open_cache(tmp_dir.path().to_path_buf(), 1_000).await;
         assert!(!leftover.try_exists().unwrap());
         assert!(cache.get(&"a".to_string()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_refreshes_recency_across_reopen() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        {
+            let cache = open_cache(tmp_dir.path().to_path_buf(), 6).await;
+            // "a" is written first, "b" second: ordered purely by first-write time, "a" is older.
+            cache
+                .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cache
+                .put("b".to_string(), OwnedBytes::new(&b"bbb"[..]))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Reading "a" must refresh its on-disk recency, making it newer than "b".
+            assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"aaa"[..]);
+        }
+        // Reopen with room for a single entry: the recently *read* "a" must survive over the more
+        // recently *written* but never-read "b". This is what fails if recency is rebuilt from
+        // first-write time instead of last-access time.
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 3).await;
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"aaa"[..]);
+        assert!(cache.get(&"b".to_string()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_touch_refreshes_recency_across_reopen() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        {
+            let cache = open_cache(tmp_dir.path().to_path_buf(), 6).await;
+            // "a" written first, "b" second: by first-write time, "a" is the eviction candidate.
+            cache
+                .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cache
+                .put("b".to_string(), OwnedBytes::new(&b"bbb"[..]))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Simulate an access served by a higher tier (no read on this tier). It must still make
+            // "a" the most-recently-used entry on disk.
+            cache.touch(&"a".to_string());
+            // `touch` refreshes the mtime off-thread; give it a moment to land before reopening.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Reopen with room for a single entry: the touched "a" must survive over "b".
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 3).await;
+        assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"aaa"[..]);
+        assert!(cache.get(&"b".to_string()).await.is_none());
     }
 
     #[tokio::test]
