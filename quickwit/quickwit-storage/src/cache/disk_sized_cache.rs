@@ -15,6 +15,7 @@
 use std::fmt::Display;
 use std::hash::Hasher;
 use std::io;
+use std::io::Read;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -41,9 +42,9 @@ const DEFAULT_MTIME_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 #[derive(Clone, Copy)]
 struct CacheEntry {
     num_bytes: u64,
-    /// Last time this entry's on-disk mtime was refreshed to reflect an access.
-    /// Used only to debounce metadata writes.
-    last_mtime_refresh: SystemTime,
+    /// Monotonic instant of the last in-process on-disk mtime refresh for this entry, if any.
+    /// Used only to debounce metadata writes; `None` means no refresh has happened yet.
+    last_mtime_refresh: Option<Instant>,
 }
 
 struct DiskCacheIndex {
@@ -73,19 +74,20 @@ impl DiskCacheIndex {
     }
 
     /// Records an access to `file_name`: refreshes the in-memory LRU recency and reports whether
-    /// the on-disk mtime is due for a (debounced) refresh, updating the debounce timestamp if so.
+    /// the on-disk mtime is due for a refresh, updating the debounce timestamp if so.
     ///
+    /// When `force_refresh` is set the mtime is always considered due.
     /// Returns `None` if the entry is not tracked by this tier.
-    fn record_access(&mut self, file_name: &str) -> Option<bool> {
+    fn record_access(&mut self, file_name: &str, force_refresh: bool) -> Option<bool> {
         let entry = self.lru_cache.get_mut(file_name)?;
         let interval = self.mtime_refresh_interval;
-        let due = entry
-            .last_mtime_refresh
-            .elapsed()
-            .map(|elapsed| elapsed >= interval)
-            .unwrap_or(true);
+        let due = force_refresh
+            || match entry.last_mtime_refresh {
+                Some(last) => last.elapsed() >= interval,
+                None => true,
+            };
         if due {
-            entry.last_mtime_refresh = SystemTime::now();
+            entry.last_mtime_refresh = Some(Instant::now());
         }
         Some(due)
     }
@@ -232,13 +234,13 @@ impl<K: Display> DiskSizedCache<K> {
             mtime_refresh_interval,
             cache_counters: &cache_counters.active_cache_metrics,
         };
-        for (file_name, num_bytes, modified) in entries {
+        for (file_name, num_bytes, _modified) in entries {
             index.record_item(num_bytes);
             index.lru_cache.put(
                 file_name,
                 CacheEntry {
                     num_bytes,
-                    last_mtime_refresh: modified,
+                    last_mtime_refresh: None,
                 },
             );
         }
@@ -267,26 +269,29 @@ impl<K: Display> DiskSizedCache<K> {
     /// Returns the cached payload for the given key, if present on disk.
     pub async fn get(&self, key: &K) -> Option<OwnedBytes> {
         let file_name = key.to_string();
-        let refresh_mtime = {
+        {
             let mut index = self.index.lock().unwrap();
-            // `record_access` refreshes the in-memory recency of the entry and tells us whether the
-            // on-disk mtime is (debounced) due for a refresh.
-            match index.record_access(&file_name) {
-                Some(due) => due,
-                None => {
-                    index.cache_counters.misses_num_items.inc();
-                    return None;
-                }
+            // Reaching the disk tier means the entry was not served from memory, i.e. it has not
+            // been accessed for a while, so we always refresh its recency (`force_refresh`).
+            if index.record_access(&file_name, true).is_none() {
+                index.cache_counters.misses_num_items.inc();
+                return None;
             }
-        };
+        }
         // Offload the blocking read so we don't stall the async runtime worker.
         let path = path_for(&self.root_path, &file_name);
         let read_res = tokio::task::spawn_blocking(move || {
-            let buffer = std::fs::read(&path)?;
+            // Open once for read + write so the payload read and the recency (mtime) refresh share
+            // a single file opening.
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            let mut buffer =
+                Vec::with_capacity(file.metadata().map(|m| m.len() as usize).unwrap_or(0));
+            file.read_to_end(&mut buffer)?;
             // Keep the on-disk mtime in step with the in-memory LRU recency we just refreshed.
-            if refresh_mtime && let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
-                let _ = file.set_modified(SystemTime::now());
-            }
+            let _ = file.set_modified(SystemTime::now());
             io::Result::Ok(buffer)
         })
         .await;
@@ -330,7 +335,7 @@ impl<K: Display> DiskSizedCache<K> {
         let file_name = key.to_string();
         let refresh_mtime = {
             let mut index = self.index.lock().unwrap();
-            match index.record_access(&file_name) {
+            match index.record_access(&file_name, false) {
                 Some(due) => due,
                 None => return,
             }
@@ -403,7 +408,7 @@ impl<K: Display> DiskSizedCache<K> {
                 file_name,
                 CacheEntry {
                     num_bytes,
-                    last_mtime_refresh: SystemTime::now(),
+                    last_mtime_refresh: Some(Instant::now()),
                 },
             );
             victims
