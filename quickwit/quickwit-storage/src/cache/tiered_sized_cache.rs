@@ -42,6 +42,10 @@ impl<K: Hash + Eq + Clone + Display + Send + Sync + 'static> TieredSizedCache<K>
     /// performs (off-thread) I/O, so an in-memory hit stays fully synchronous and cheap.
     pub async fn get(&self, key: &K) -> Option<OwnedBytes> {
         if let Some(bytes) = self.memory.get(key) {
+            // Propagate the access down to keep L2 in sync.
+            if let Some(disk) = &self.disk {
+                disk.touch(key);
+            }
             return Some(bytes);
         }
         let bytes = self.disk.as_ref()?.get(key).await?;
@@ -61,6 +65,9 @@ impl<K: Hash + Eq + Clone + Display + Send + Sync + 'static> TieredSizedCache<K>
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
     use bytesize::ByteSize;
 
     use super::*;
@@ -69,6 +76,18 @@ mod tests {
 
     fn memory_cache() -> MemorySizedCache<String> {
         MemorySizedCache::from_config(&ByteSize::b(1_000).into(), &CACHE_METRICS_FOR_TESTS)
+    }
+
+    async fn open_disk(root_path: PathBuf, capacity_in_bytes: u64) -> DiskSizedCache<String> {
+        // Zero debounce so accesses deterministically refresh the on-disk recency in tests.
+        DiskSizedCache::open_with_interval(
+            root_path,
+            capacity_in_bytes,
+            Duration::ZERO,
+            &CACHE_METRICS_FOR_TESTS,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -131,5 +150,34 @@ mod tests {
         // After a disk hit, deleting the file must not lose the value: it lives in memory now.
         std::fs::remove_file(path_for(tmp_dir.path(), "a")).unwrap();
         assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"hello"[..]);
+    }
+
+    #[tokio::test]
+    async fn test_memory_hit_refreshes_disk_recency_across_reopen() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        {
+            let disk = open_disk(tmp_dir.path().to_path_buf(), 6).await;
+            let cache = TieredSizedCache::new(memory_cache(), Some(disk));
+            // Both entries land in memory (L1) and on disk (L2). By first-write time "a" is older.
+            cache
+                .put("a".to_string(), OwnedBytes::new(&b"aaa"[..]))
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cache
+                .put("b".to_string(), OwnedBytes::new(&b"bbb"[..]))
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // "a" is served purely from the in-memory tier (it never re-reads disk), yet this must
+            // still refresh its disk recency so it outranks the more recently written "b".
+            assert_eq!(cache.get(&"a".to_string()).await.unwrap(), &b"aaa"[..]);
+            // The propagated mtime refresh happens off-thread; let it land before reopening.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Reopen the disk tier alone (simulating a restart) with room for a single entry: the
+        // memory-hot "a" must have survived over "b", which a naive write-time ordering would
+        // evict.
+        let disk = open_disk(tmp_dir.path().to_path_buf(), 3).await;
+        assert!(disk.get(&"a".to_string()).await.is_some());
+        assert!(disk.get(&"b".to_string()).await.is_none());
     }
 }
