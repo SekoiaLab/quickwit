@@ -19,11 +19,12 @@ use std::io::Read;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use fnv::FnvHasher;
 use lru::LruCache;
+use quickwit_common::rate_limited_error;
 use tracing::{info, warn};
 
 use crate::OwnedBytes;
@@ -38,6 +39,13 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Default minimum delay between two on-disk mtime refreshes for the same entry.
 const DEFAULT_MTIME_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Number of shard-scanning threads to run per CPU when opening the cache.
+/// Stat-ing files is latency-bound rather than CPU-bound, so oversubscribing pays off.
+const SCAN_THREADS_PER_CPU: usize = 4;
+
+/// Upper bound on the number of shard-scanning threads.
+const MAX_SCAN_THREADS: usize = 128;
+
 /// Book-keeping stored in the in-memory LRU index for each on-disk entry.
 #[derive(Clone, Copy)]
 struct CacheEntry {
@@ -45,6 +53,9 @@ struct CacheEntry {
     /// Monotonic instant of the last in-process on-disk mtime refresh for this entry, if any.
     /// Used only to debounce metadata writes; `None` means no refresh has happened yet.
     last_mtime_refresh: Option<Instant>,
+    /// Identifies this particular entry. A key that is evicted
+    /// and inserted again gets a fresh generation.
+    generation: u64,
 }
 
 struct DiskCacheIndex {
@@ -55,6 +66,8 @@ struct DiskCacheIndex {
     capacity_in_bytes: u64,
     /// Minimum delay between two on-disk mtime refreshes for the same entry.
     mtime_refresh_interval: Duration,
+    /// Hands out [`CacheEntry::generation`] values.
+    generation_counter: u64,
     cache_counters: &'static CacheMetricCounters,
 }
 
@@ -73,12 +86,50 @@ impl DiskCacheIndex {
         self.cache_counters.evict_num_bytes.inc_by(num_bytes);
     }
 
-    /// Records an access to `file_name`: refreshes the in-memory LRU recency and reports whether
-    /// the on-disk mtime is due for a refresh, updating the debounce timestamp if so.
+    /// Inserts a new entry for `file_name` and accounts for its bytes. The caller must have
+    /// checked that the key is not already tracked.
+    fn insert_entry(
+        &mut self,
+        file_name: String,
+        num_bytes: u64,
+        last_mtime_refresh: Option<Instant>,
+    ) {
+        self.generation_counter += 1;
+        self.record_item(num_bytes);
+        self.lru_cache.put(
+            file_name,
+            CacheEntry {
+                num_bytes,
+                last_mtime_refresh,
+                generation: self.generation_counter,
+            },
+        );
+    }
+
+    /// Drops the entry for `file_name`, whose file turned out to be missing, but only if it is
+    /// still the exact entry that was read, i.e. `generation` still matches.
+    fn drop_vanished_entry(&mut self, file_name: &str, generation: u64) {
+        if self.lru_cache.peek(file_name).map(|entry| entry.generation) != Some(generation) {
+            return;
+        }
+        let Some(entry) = self.lru_cache.pop(file_name) else {
+            return;
+        };
+        // Not counted as an eviction: the file is already gone, we are only clearing book-keeping.
+        self.num_bytes -= entry.num_bytes;
+        self.cache_counters.in_cache_count.dec();
+        self.cache_counters
+            .in_cache_num_bytes
+            .sub(entry.num_bytes as i64);
+    }
+
+    /// Records an access to `file_name`: refreshes the in-memory LRU recency and reports the
+    /// entry's generation together with whether the on-disk mtime is due for a refresh, updating
+    /// the debounce timestamp if so.
     ///
     /// When `force_refresh` is set the mtime is always considered due.
     /// Returns `None` if the entry is not tracked by this tier.
-    fn record_access(&mut self, file_name: &str, force_refresh: bool) -> Option<bool> {
+    fn record_access(&mut self, file_name: &str, force_refresh: bool) -> Option<(u64, bool)> {
         let entry = self.lru_cache.get_mut(file_name)?;
         let interval = self.mtime_refresh_interval;
         let due = force_refresh
@@ -89,7 +140,7 @@ impl DiskCacheIndex {
         if due {
             entry.last_mtime_refresh = Some(Instant::now());
         }
-        Some(due)
+        Some((entry.generation, due))
     }
 
     /// Evicts the least recently used entries until `incoming` extra bytes would fit
@@ -184,65 +235,28 @@ impl<K: Display> DiskSizedCache<K> {
         let start = Instant::now();
         std::fs::create_dir_all(&root_path)?;
 
-        let mut entries: Vec<(String, u64, SystemTime)> = Vec::new();
+        let mut shard_paths: Vec<PathBuf> = Vec::new();
         for shard_entry_res in std::fs::read_dir(&root_path)? {
             let shard_entry = shard_entry_res?;
             // Entries live inside shard sub-directories; only recurse into those.
-            match shard_entry.file_type() {
-                Ok(file_type) if file_type.is_dir() => {}
-                _ => continue,
-            }
-            let Ok(shard_dir_iter) = std::fs::read_dir(shard_entry.path()) else {
-                continue;
-            };
-
-            for dir_entry_res in shard_dir_iter {
-                let Ok(dir_entry) = dir_entry_res else {
-                    continue;
-                };
-
-                if let Ok(file_type) = dir_entry.file_type()
-                    && !file_type.is_file()
-                {
-                    continue;
-                }
-                let Ok(file_name) = dir_entry.file_name().into_string() else {
-                    continue;
-                };
-
-                if file_name.contains(TEMP_MARKER) {
-                    // Leftover temporary file from an interrupted write: clean it up.
-                    let _ = std::fs::remove_file(dir_entry.path());
-                    continue;
-                }
-                let Ok(metadata) = dir_entry.metadata() else {
-                    continue;
-                };
-                if !metadata.is_file() {
-                    continue;
-                }
-                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                entries.push((file_name, metadata.len(), modified));
+            if matches!(shard_entry.file_type(), Ok(file_type) if file_type.is_dir()) {
+                shard_paths.push(shard_entry.path());
             }
         }
-        entries.sort_by_key(|(_, _, modified)| *modified);
+        let mut entries = scan_shards(&shard_paths);
+        // Shards are scanned concurrently, so recency has to be restored globally.
+        entries.sort_unstable_by_key(|(_, _, modified)| *modified);
 
         let mut index = DiskCacheIndex {
             lru_cache: LruCache::unbounded(),
             num_bytes: 0,
             capacity_in_bytes,
             mtime_refresh_interval,
+            generation_counter: 0,
             cache_counters: &cache_counters.active_cache_metrics,
         };
         for (file_name, num_bytes, _modified) in entries {
-            index.record_item(num_bytes);
-            index.lru_cache.put(
-                file_name,
-                CacheEntry {
-                    num_bytes,
-                    last_mtime_refresh: None,
-                },
-            );
+            index.insert_entry(file_name, num_bytes, None);
         }
         let victims = index.evict_to_fit(0);
 
@@ -269,15 +283,16 @@ impl<K: Display> DiskSizedCache<K> {
     /// Returns the cached payload for the given key, if present on disk.
     pub async fn get(&self, key: &K) -> Option<OwnedBytes> {
         let file_name = key.to_string();
-        {
+        let generation = {
             let mut index = self.index.lock().unwrap();
             // Reaching the disk tier means the entry was not served from memory, i.e. it has not
             // been accessed for a while, so we always refresh its recency (`force_refresh`).
-            if index.record_access(&file_name, true).is_none() {
+            let Some((generation, _due)) = index.record_access(&file_name, true) else {
                 index.cache_counters.misses_num_items.inc();
                 return None;
-            }
-        }
+            };
+            generation
+        };
         // Offload the blocking read so we don't stall the async runtime worker.
         let path = path_for(&self.root_path, &file_name);
         let read_res = tokio::task::spawn_blocking(move || {
@@ -306,23 +321,17 @@ impl<K: Display> DiskSizedCache<K> {
                 Some(OwnedBytes::new(buffer))
             }
             Ok(Err(_)) => {
-                // The file vanished (e.g. concurrent eviction or manual deletion): drop the
-                // stale index entry and report a miss.
+                // The file vanished (e.g. concurrent eviction or manual deletion): drop the stale
+                // index entry, unless a concurrent `put` replaced it while we were reading.
                 let mut index = self.index.lock().unwrap();
-                if let Some(entry) = index.lru_cache.pop(&file_name) {
-                    index.num_bytes -= entry.num_bytes;
-                    index.cache_counters.in_cache_count.dec();
-                    index
-                        .cache_counters
-                        .in_cache_num_bytes
-                        .sub(entry.num_bytes as i64);
-                }
+                index.drop_vanished_entry(&file_name, generation);
                 index.cache_counters.misses_num_items.inc();
                 None
             }
             Err(_join_error) => {
                 // The blocking read task failed unexpectedly. Keep the index entry (the file is
                 // likely still valid) and just report a miss.
+                rate_limited_error!(limit_per_min = 6, file_name, "disk read task panicked");
                 let index = self.index.lock().unwrap();
                 index.cache_counters.misses_num_items.inc();
                 None
@@ -336,7 +345,7 @@ impl<K: Display> DiskSizedCache<K> {
         let refresh_mtime = {
             let mut index = self.index.lock().unwrap();
             match index.record_access(&file_name, false) {
-                Some(due) => due,
+                Some((_generation, due)) => due,
                 None => return,
             }
         };
@@ -373,7 +382,8 @@ impl<K: Display> DiskSizedCache<K> {
                 return;
             }
             if index.lru_cache.get(&file_name).is_some() {
-                // Already cached: payloads are immutable, just keep the refreshed recency.
+                // Already cached: payloads are immutable so we don't need to
+                // overwrite them. The LRU recency was updated by `get`.
                 return;
             }
         }
@@ -403,16 +413,14 @@ impl<K: Display> DiskSizedCache<K> {
                 return;
             }
             let victims = index.evict_to_fit(num_bytes);
-            index.record_item(num_bytes);
-            index.lru_cache.put(
-                file_name,
-                CacheEntry {
-                    num_bytes,
-                    last_mtime_refresh: Some(Instant::now()),
-                },
-            );
+            index.insert_entry(file_name, num_bytes, Some(Instant::now()));
             victims
         };
+        // There is a race condition here similar to the one guarded by the
+        // generation counter: the entry might be recreated in between and the
+        // file of the new entry could be deleted here. We don't handle this
+        // explicitely as it doesn't corrupt the state (it is cleaned up on the
+        // next access).
         if !victims.is_empty() {
             let root_path = self.root_path.clone();
             let _ = tokio::task::spawn_blocking(move || remove_files(&root_path, &victims)).await;
@@ -433,6 +441,73 @@ fn shard_dir(file_name: &str) -> String {
 /// Returns the full on-disk path of an entry, including its shard sub-directory.
 pub(crate) fn path_for(root_path: &Path, file_name: &str) -> PathBuf {
     root_path.join(shard_dir(file_name)).join(file_name)
+}
+
+/// Scans every shard directory and returns the `(file_name, num_bytes, modified)` triplet of
+/// each entry found.
+///
+/// Rebuilding the index costs one `stat` syscall per cached file, which dominates the opening
+/// of a large cache. Shards are therefore scanned by several threads pulling from a shared
+/// cursor, so that a slow shard cannot hold back the others.
+fn scan_shards(shard_paths: &[PathBuf]) -> Vec<(String, u64, SystemTime)> {
+    let num_threads = std::thread::available_parallelism()
+        .map(|num_cpus| num_cpus.get() * SCAN_THREADS_PER_CPU)
+        .unwrap_or(SCAN_THREADS_PER_CPU)
+        .min(MAX_SCAN_THREADS)
+        .min(shard_paths.len());
+    let next_shard_idx = AtomicUsize::new(0);
+    let entries = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..num_threads {
+            scope.spawn(|| {
+                loop {
+                    let shard_idx = next_shard_idx.fetch_add(1, Ordering::Relaxed);
+                    let Some(shard_path) = shard_paths.get(shard_idx) else {
+                        break;
+                    };
+                    let shard_entries = scan_shard(shard_path);
+                    entries.lock().unwrap().extend(shard_entries);
+                }
+            });
+        }
+    });
+    entries.into_inner().unwrap()
+}
+
+/// Scans a single shard directory, deleting the leftover temporary files it may contain.
+/// Unreadable entries are skipped: a partially recovered cache is still a usable one.
+fn scan_shard(shard_path: &Path) -> Vec<(String, u64, SystemTime)> {
+    let Ok(shard_dir_iter) = std::fs::read_dir(shard_path) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for dir_entry_res in shard_dir_iter {
+        let Ok(dir_entry) = dir_entry_res else {
+            continue;
+        };
+        if let Ok(file_type) = dir_entry.file_type()
+            && !file_type.is_file()
+        {
+            continue;
+        }
+        let Ok(file_name) = dir_entry.file_name().into_string() else {
+            continue;
+        };
+        if file_name.contains(TEMP_MARKER) {
+            // Leftover temporary file from an interrupted write: clean it up.
+            let _ = std::fs::remove_file(dir_entry.path());
+            continue;
+        }
+        let Ok(metadata) = dir_entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        entries.push((file_name, metadata.len(), modified));
+    }
+    entries
 }
 
 fn write_file(root_path: &Path, file_name: &str, bytes: &[u8]) -> io::Result<()> {
@@ -564,6 +639,10 @@ mod tests {
         std::fs::remove_file(path_for(tmp_dir.path(), "a")).unwrap();
         // The stale entry should be detected and reported as a miss.
         assert!(cache.get(&"a".to_string()).await.is_none());
+        // ... and dropped from the index, so it stops counting against the capacity.
+        let index = cache.index.lock().unwrap();
+        assert!(!index.lru_cache.contains("a"));
+        assert_eq!(index.num_bytes, 0);
     }
 
     #[tokio::test]
@@ -679,6 +758,42 @@ mod tests {
         for i in 0..64 {
             let key = format!("key-{i}");
             assert_eq!(cache.get(&key).await.unwrap(), &b"payload"[..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_restores_recency_across_shards() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        {
+            let cache = open_cache(tmp_dir.path().to_path_buf(), 100_000).await;
+            for i in 0..32u64 {
+                cache
+                    .put(format!("key-{i}"), OwnedBytes::new(&b"aaa"[..]))
+                    .await;
+            }
+        }
+        // Impose a known recency order over entries that are spread across shards: "key-0" is the
+        // least recent, "key-31" the most recent.
+        let now = SystemTime::now();
+        for i in 0..32u64 {
+            let path = path_for(tmp_dir.path(), &format!("key-{i}"));
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(now - Duration::from_secs(32 - i))
+                .unwrap();
+        }
+        // Reopen with room for the 4 most recent entries only. Shards are scanned concurrently, so
+        // this only holds if recency is rebuilt globally rather than shard by shard.
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 12).await;
+        for i in 0..28u64 {
+            let key = format!("key-{i}");
+            assert!(cache.get(&key).await.is_none(), "{key} should be evicted");
+        }
+        for i in 28..32u64 {
+            let key = format!("key-{i}");
+            assert!(
+                cache.get(&key).await.is_some(),
+                "{key} should have survived"
+            );
         }
     }
 }
