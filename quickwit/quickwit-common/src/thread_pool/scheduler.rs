@@ -34,6 +34,7 @@ use once_cell::sync::Lazy;
 use tracing::error;
 
 use crate::metrics::{IntCounter, IntGauge, new_counter, new_gauge};
+use crate::rate_limited_error;
 
 /// Identifies a query (leaf search) whose split-processing tasks should be
 /// scheduled and fair-shared together. Must be unique among currently active
@@ -192,19 +193,20 @@ impl Scheduler {
         guard
     }
 
-    /// Registers a new query with its total split count. Must be called
-    /// exactly once per query, before any [`Self::enqueue_fifo`],
-    /// [`Self::enqueue_fair`] or [`Self::set_waiting_for_permit`] call for
-    /// that `query_id`.
+    /// Registers a new query with its total split count. Must be called exactly
+    /// once per query, before any [`Self::enqueue_fair`] or
+    /// [`Self::set_waiting_for_permit`] call for that `query_id`.
     ///
-    /// Returns one guard per split, meant to be wrapped into that split's own
-    /// cleanup guard on the caller side, so the query's entry can never leak
-    /// regardless of how each split's processing ends.
+    /// Returns one guard per split to track the number of remaining splits for
+    /// the query.
     pub fn register_query(
         self: &Arc<Self>,
         query_id: QueryId,
         total_splits: usize,
     ) -> Vec<SchedulerSplitGuard> {
+        if total_splits == 0 {
+            return Vec::new();
+        }
         let mut state = self.lock_state();
         state.queries.insert(
             query_id,
@@ -264,8 +266,8 @@ impl Scheduler {
         }
     }
 
-    /// Schedules a task belonging to `query_id`. The query must already have
-    /// been [`Self::register_query`]-ed.
+    /// Schedules a task belonging to `query_id`. The query is expected to
+    /// already have been [`Self::register_query`]-ed.
     pub fn enqueue_fair<F>(self: &Arc<Self>, query_id: QueryId, job: F)
     where F: FnOnce() + Send + 'static {
         let scheduler = self.clone();
@@ -274,11 +276,21 @@ impl Scheduler {
             scheduler.on_task_complete(query_id);
         });
         let mut state = self.lock_state();
-        let query = state
-            .queries
-            .get_mut(&query_id)
-            .expect("query must be registered before tasks are enqueued for it");
-        query.ready.push_back(wrapped);
+        match state.queries.get_mut(&query_id) {
+            Some(query) => query.ready.push_back(wrapped),
+            None => {
+                debug_assert!(
+                    false,
+                    "query must be registered before tasks are enqueued for it"
+                );
+                rate_limited_error!(
+                    limit_per_min = 1,
+                    ?query_id,
+                    "query not registered on the scheduler, fall back to FIFO"
+                );
+                state.high_priority_queue.push_back(wrapped);
+            }
+        }
         if state.active_pump_workers < self.num_threads {
             state.active_pump_workers += 1;
             let scheduler = self.clone();
