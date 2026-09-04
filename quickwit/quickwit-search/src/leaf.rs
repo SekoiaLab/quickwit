@@ -1464,6 +1464,7 @@ pub async fn single_doc_mapping_leaf_search(
         let leaf_split_search_permit = permit_fut
             .instrument(info_span!("waiting_for_leaf_search_split_semaphore"))
             .await;
+        leaf_search_state_guard.set_state(SplitSearchState::Start);
         crate::search_thread_pool().set_waiting_for_permit(query_id, total_permits - (index + 1));
 
         let Some(simplified_search_request) =
@@ -1545,6 +1546,7 @@ pub async fn single_doc_mapping_leaf_search(
 
 #[derive(Copy, Clone)]
 enum SplitSearchState {
+    WarmupQueue,
     Start,
     CacheHit,
     ProcessedFromMetadata,
@@ -1559,6 +1561,7 @@ enum SplitSearchState {
 impl SplitSearchState {
     pub fn inc(self, counters: &SplitSearchOutcomeCounters) {
         match self {
+            SplitSearchState::WarmupQueue => counters.cancel_warmup_queue.inc(),
             SplitSearchState::Start => counters.cancel_before_warmup.inc(),
             SplitSearchState::CacheHit => counters.cache_hit.inc(),
             SplitSearchState::ProcessedFromMetadata => counters.processed_from_metadata.inc(),
@@ -1593,7 +1596,7 @@ impl SplitSearchStateGuard {
         scheduler_guard: SchedulerSplitGuard,
     ) -> Self {
         SplitSearchStateGuard {
-            state: SplitSearchState::Start,
+            state: SplitSearchState::WarmupQueue,
             local_split_search_outcome_counters,
             scheduler_guard,
         }

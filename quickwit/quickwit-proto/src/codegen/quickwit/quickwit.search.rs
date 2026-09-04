@@ -309,6 +309,9 @@ pub struct SplitsByOutcome {
     /// Cancelled during CPU processing (error or timeout)
     #[prost(uint64, tag = "9")]
     pub cancel_cpu: u64,
+    /// Cancelled while waiting for a search permit
+    #[prost(uint64, tag = "10")]
+    pub cancel_warmup_queue: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

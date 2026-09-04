@@ -380,6 +380,8 @@ message SplitsByOutcome {
     uint64 cancel_cpu_queue = 8;
     // Cancelled during CPU processing (error or timeout)
     uint64 cancel_cpu = 9;
+    // Cancelled while waiting for a search permit
+    uint64 cancel_warmup_queue = 10;
 }
 
 message ResourceStats {
