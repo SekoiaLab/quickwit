@@ -1021,6 +1021,7 @@ fn get_relation_from_split_outcome(
     };
     // Destructure to make sure we update this if a state is added.
     let SplitsByOutcome {
+        cancel_warmup_queue: _,
         cancel_before_warmup: _,
         cancel_warmup: _,
         cancel_cpu_queue: _,

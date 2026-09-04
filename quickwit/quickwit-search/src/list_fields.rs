@@ -370,7 +370,7 @@ pub async fn leaf_list_fields(
         merge_leaf_list_fields(filtered_list_fields_sorted_iters)
     };
     let fields = search_thread_pool()
-        .run_cpu_intensive_with_extra_tags(
+        .run_cpu_intensive(
             cpu_task,
             "leaf_list_fields",
             QueryCostClass::Regular.as_label(),
@@ -448,7 +448,7 @@ pub async fn root_list_fields(
     }
     let leaf_list_fields_protos: Vec<ListFieldsResponse> = try_join_all(leaf_request_tasks).await?;
     let fields = search_thread_pool()
-        .run_cpu_intensive_with_extra_tags(
+        .run_cpu_intensive(
             move || {
                 let leaf_list_fields = leaf_list_fields_protos
                     .into_iter()

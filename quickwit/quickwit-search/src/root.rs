@@ -801,7 +801,7 @@ pub(crate) async fn search_partial_hits_phase(
     let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
     let span = info_span!("merge_fruits");
     let mut leaf_search_response = crate::search_thread_pool()
-        .run_cpu_intensive_with_extra_tags(
+        .run_cpu_intensive(
             move || {
                 let _span_guard = span.enter();
                 merge_collector.merge_fruits(leaf_search_results)

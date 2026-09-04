@@ -290,7 +290,7 @@ pub struct SplitsByOutcome {
     pub pruned_before_warmup: u64,
     #[prost(uint64, tag = "2")]
     pub pruned_after_warmup: u64,
-    /// Cancelled before warmup started (error or timeout)
+    /// Cancelled while setting up the warmup (footer error or timeout)
     #[prost(uint64, tag = "3")]
     pub cancel_before_warmup: u64,
     #[prost(uint64, tag = "4")]
@@ -309,6 +309,9 @@ pub struct SplitsByOutcome {
     /// Cancelled during CPU processing (error or timeout)
     #[prost(uint64, tag = "9")]
     pub cancel_cpu: u64,
+    /// Cancelled while waiting for a search permit
+    #[prost(uint64, tag = "10")]
+    pub cancel_warmup_queue: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

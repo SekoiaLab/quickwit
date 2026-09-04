@@ -368,7 +368,7 @@ message LeafSearchRequest {
 message SplitsByOutcome {
     uint64 pruned_before_warmup = 1;
     uint64 pruned_after_warmup = 2;
-    // Cancelled before warmup started (error or timeout)
+    // Cancelled while setting up the warmup (footer error or timeout)
     uint64 cancel_before_warmup = 3;
     uint64 processed = 4;
     uint64 processed_from_metadata = 5;
@@ -380,6 +380,8 @@ message SplitsByOutcome {
     uint64 cancel_cpu_queue = 8;
     // Cancelled during CPU processing (error or timeout)
     uint64 cancel_cpu = 9;
+    // Cancelled while waiting for a search permit
+    uint64 cancel_warmup_queue = 10;
 }
 
 message ResourceStats {
