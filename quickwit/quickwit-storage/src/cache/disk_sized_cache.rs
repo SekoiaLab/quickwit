@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use fnv::FnvHasher;
 use lru::LruCache;
+use quickwit_common::rate_limited_error;
 use tracing::{info, warn};
 
 use crate::OwnedBytes;
@@ -330,6 +331,7 @@ impl<K: Display> DiskSizedCache<K> {
             Err(_join_error) => {
                 // The blocking read task failed unexpectedly. Keep the index entry (the file is
                 // likely still valid) and just report a miss.
+                rate_limited_error!(limit_per_min = 6, file_name, "disk read task panicked");
                 let index = self.index.lock().unwrap();
                 index.cache_counters.misses_num_items.inc();
                 None
@@ -380,7 +382,8 @@ impl<K: Display> DiskSizedCache<K> {
                 return;
             }
             if index.lru_cache.get(&file_name).is_some() {
-                // Already cached: payloads are immutable, just keep the refreshed recency.
+                // Already cached: payloads are immutable so we don't need to
+                // overwrite them. The LRU recency was updated by `get`.
                 return;
             }
         }
@@ -413,6 +416,11 @@ impl<K: Display> DiskSizedCache<K> {
             index.insert_entry(file_name, num_bytes, Some(Instant::now()));
             victims
         };
+        // There is a race condition here similar to the one guarded by the
+        // generation counter: the entry might be recreated in between and the
+        // file of the new entry could be deleted here. We don't handle this
+        // explicitely as it doesn't corrupt the state (it is cleaned up on the
+        // next access).
         if !victims.is_empty() {
             let root_path = self.root_path.clone();
             let _ = tokio::task::spawn_blocking(move || remove_files(&root_path, &victims)).await;
