@@ -351,17 +351,8 @@ fn pump_loop(scheduler: &Arc<Scheduler>) {
             error!("task running in the thread pool scheduler panicked");
         }
         if Instant::now() >= yield_deadline {
-            // Drain all currently pending externally-submitted work.
-            loop {
-                match std::panic::catch_unwind(rayon::yield_now) {
-                    Ok(Some(rayon::Yield::Executed)) => continue,
-                    Ok(_) => break,
-                    Err(_) => {
-                        error!("externally-submitted rayon task panicked while yielding");
-                        break;
-                    }
-                }
-            }
+            // Drain all currently pending externally-submitted work
+            while rayon::yield_now() == Some(rayon::Yield::Executed) {}
             yield_deadline = Instant::now() + PUMP_LOOP_YIELD_INTERVAL;
         }
     }
@@ -432,13 +423,15 @@ mod tests {
         let order: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
 
         let _guards = scheduler.register_query(QueryId(1), 1);
-        // Block the single worker so both tasks below are enqueued before either runs.
+
+        // Step 1: Block the single worker so both tasks from step 2 stay in the
+        // queue.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         scheduler.enqueue_fair(QueryId(1), move || {
             release_rx.recv().unwrap();
         });
-        wait_until(|| scheduler.state.lock().unwrap().active_pump_workers == 1);
 
+        // Step 2: Add two tasks that remain queued by the scheduler
         let order_clone = order.clone();
         scheduler.enqueue_fair(QueryId(1), move || {
             order_clone.lock().unwrap().push("query")
@@ -446,6 +439,8 @@ mod tests {
         let order_clone = order.clone();
         scheduler.enqueue_fifo(move || order_clone.lock().unwrap().push("level0"));
 
+        // Step 3: Release the blocked worker to validate that the priority
+        // queue is picked up first
         release_tx.send(()).unwrap();
         wait_until(|| order.lock().unwrap().len() == 2);
         assert_eq!(*order.lock().unwrap(), vec!["level0", "query"]);
@@ -457,12 +452,9 @@ mod tests {
         let _guards = scheduler.register_query(QueryId(1), 1);
 
         scheduler.enqueue_fair(QueryId(1), || panic!("boom"));
-        wait_until(|| {
-            let state = scheduler.state.lock().unwrap();
-            match state.queries.get(&QueryId(1)) {
-                Some(query) => query.running_count == 0,
-                None => false,
-            }
+        wait_until(|| match scheduler.lock_state().queries.get(&QueryId(1)) {
+            Some(query) => query.running_count == 0,
+            None => false,
         });
     }
 
@@ -474,12 +466,14 @@ mod tests {
         let _guards1 = scheduler.register_query(QueryId(1), 100);
         let _guards2 = scheduler.register_query(QueryId(2), 2);
 
+        // Step 1: Block the single worker so both tasks from step 2 stay in the
+        // queue.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         scheduler.enqueue_fair(QueryId(1), move || {
             release_rx.recv().unwrap();
         });
-        wait_until(|| scheduler.state.lock().unwrap().active_pump_workers == 1);
 
+        // Step 2: Add two tasks that remain queued by the scheduler
         let order_clone = order.clone();
         scheduler.enqueue_fair(QueryId(1), move || {
             order_clone.lock().unwrap().push(QueryId(1))
@@ -489,9 +483,10 @@ mod tests {
             order_clone.lock().unwrap().push(QueryId(2))
         });
 
+        // Step 3: Release the blocked worker to validate that query 2 with
+        // fewer remaining splits is picked up first.
         release_tx.send(()).unwrap();
         wait_until(|| order.lock().unwrap().len() == 2);
-        // query 2 has far fewer remaining splits, so it should be picked first.
         assert_eq!(*order.lock().unwrap(), vec![QueryId(2), QueryId(1)]);
     }
 
@@ -598,7 +593,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             });
         }
-        wait_until(|| scheduler.state.lock().unwrap().active_pump_workers >= 1);
+        wait_until(|| scheduler.lock_state().active_pump_workers >= 1);
 
         let (tx, rx) = std::sync::mpsc::channel();
         scheduler.rayon_pool.spawn(move || tx.send(()).unwrap());
@@ -610,34 +605,13 @@ mod tests {
     fn test_query_state_cleaned_up_once_remaining_reaches_zero() {
         let scheduler = test_scheduler(2);
         let mut guards = scheduler.register_query(QueryId(1), 2);
-        assert!(
-            scheduler
-                .state
-                .lock()
-                .unwrap()
-                .queries
-                .contains_key(&QueryId(1))
-        );
+        assert!(scheduler.lock_state().queries.contains_key(&QueryId(1)));
 
         drop(guards.pop().unwrap());
-        assert!(
-            scheduler
-                .state
-                .lock()
-                .unwrap()
-                .queries
-                .contains_key(&QueryId(1))
-        );
+        assert!(scheduler.lock_state().queries.contains_key(&QueryId(1)));
 
         drop(guards.pop().unwrap());
-        assert!(
-            !scheduler
-                .state
-                .lock()
-                .unwrap()
-                .queries
-                .contains_key(&QueryId(1))
-        );
+        assert!(!scheduler.lock_state().queries.contains_key(&QueryId(1)));
     }
 
     #[test]
@@ -652,6 +626,47 @@ mod tests {
             });
         }
         wait_until(|| ran.load(Ordering::SeqCst) == 3);
-        wait_until(|| scheduler.state.lock().unwrap().active_pump_workers == 0);
+        wait_until(|| scheduler.lock_state().active_pump_workers == 0);
+    }
+
+    #[test]
+    fn test_more_waiting_for_permit_runs_last() {
+        let scheduler = test_scheduler(1);
+        let order: Arc<StdMutex<Vec<QueryId>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        let _guards1 = scheduler.register_query(QueryId(1), 20);
+        let _guards2 = scheduler.register_query(QueryId(2), 10);
+        scheduler.set_waiting_for_permit(QueryId(1), 5);
+
+        // Step 1: Block the single worker so both tasks from step 2 stay in
+        // the queue.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        scheduler.enqueue_fair(QueryId(1), move || {
+            release_rx.recv().unwrap();
+        });
+
+        // Step 2: Add one task per query that remain in the queue.
+        let order_clone = order.clone();
+        scheduler.enqueue_fair(QueryId(1), move || {
+            order_clone.lock().unwrap().push(QueryId(1))
+        });
+        let order_clone = order.clone();
+        scheduler.enqueue_fair(QueryId(2), move || {
+            order_clone.lock().unwrap().push(QueryId(2))
+        });
+
+        // Step 3: Release the blocked worker to validate that query 2, which
+        // has no splits waiting on a permit, is picked up before query 1.
+        release_tx.send(()).unwrap();
+        wait_until(|| order.lock().unwrap().len() == 2);
+        assert_eq!(*order.lock().unwrap(), vec![QueryId(2), QueryId(1)]);
+    }
+
+    #[test]
+    fn test_register_query_with_zero_splits_returns_no_guards() {
+        let scheduler = test_scheduler(1);
+        let guards = scheduler.register_query(QueryId(1), 0);
+        assert!(guards.is_empty());
+        assert!(!scheduler.lock_state().queries.contains_key(&QueryId(1)));
     }
 }

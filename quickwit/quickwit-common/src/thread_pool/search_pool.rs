@@ -117,3 +117,44 @@ impl SearchThreadPool {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::thread_pool::scheduler::QueryId;
+
+    #[test]
+    fn test_externally_submitted_panic_during_yield_does_not_stop_pump_loop() {
+        crate::setup_logging_for_tests();
+        let search_pool = SearchThreadPool::new("test", Some(1));
+        let query_id = QueryId::next();
+        let _guards = search_pool.register_query(query_id, 100_000);
+
+        // Keep the worker continuously busy so externally-submitted work
+        // can only ever be serviced through a pump loop's periodic yield.
+        let mut futures = Vec::with_capacity(2_000);
+        for _ in 0..2_000 {
+            futures.push(search_pool.run_cpu_intensive_fair(
+                || std::thread::sleep(Duration::from_millis(10)),
+                query_id,
+                "test",
+                "test",
+            ));
+        }
+
+        // Submitted directly to the raw rayon pool, bypassing the scheduler
+        // entirely.
+        search_pool.thread_pool.rayon_pool.spawn(|| panic!("boom"));
+
+        // Confirm the unique pump loop kept yielding to external work afterward.
+        let (tx, rx) = std::sync::mpsc::channel();
+        search_pool
+            .thread_pool
+            .rayon_pool
+            .spawn(move || tx.send(()).unwrap());
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("pump loop stopped yielding to external work after the panic");
+    }
+}

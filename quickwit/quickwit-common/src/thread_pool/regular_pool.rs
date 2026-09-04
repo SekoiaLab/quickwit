@@ -38,7 +38,7 @@ impl ThreadPool {
         let mut rayon_pool_builder = rayon::ThreadPoolBuilder::new()
             .thread_name(move |thread_id| format!("quickwit-{name}-{thread_id}"))
             .panic_handler(move |_my_panic| {
-                error!("task running in the quickwit {name} thread pool panicked");
+                error!(pool_name = name, "task running in the thread pool panicked");
             });
         if let Some(num_threads) = num_threads_opt {
             rayon_pool_builder = rayon_pool_builder.num_threads(num_threads);
