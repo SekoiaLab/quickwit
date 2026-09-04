@@ -19,7 +19,7 @@ use std::io::Read;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use fnv::FnvHasher;
@@ -37,6 +37,13 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Default minimum delay between two on-disk mtime refreshes for the same entry.
 const DEFAULT_MTIME_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Number of shard-scanning threads to run per CPU when opening the cache.
+/// Stat-ing files is latency-bound rather than CPU-bound, so oversubscribing pays off.
+const SCAN_THREADS_PER_CPU: usize = 4;
+
+/// Upper bound on the number of shard-scanning threads.
+const MAX_SCAN_THREADS: usize = 128;
 
 /// Book-keeping stored in the in-memory LRU index for each on-disk entry.
 #[derive(Clone, Copy)]
@@ -227,48 +234,17 @@ impl<K: Display> DiskSizedCache<K> {
         let start = Instant::now();
         std::fs::create_dir_all(&root_path)?;
 
-        let mut entries: Vec<(String, u64, SystemTime)> = Vec::new();
+        let mut shard_paths: Vec<PathBuf> = Vec::new();
         for shard_entry_res in std::fs::read_dir(&root_path)? {
             let shard_entry = shard_entry_res?;
             // Entries live inside shard sub-directories; only recurse into those.
-            match shard_entry.file_type() {
-                Ok(file_type) if file_type.is_dir() => {}
-                _ => continue,
-            }
-            let Ok(shard_dir_iter) = std::fs::read_dir(shard_entry.path()) else {
-                continue;
-            };
-
-            for dir_entry_res in shard_dir_iter {
-                let Ok(dir_entry) = dir_entry_res else {
-                    continue;
-                };
-
-                if let Ok(file_type) = dir_entry.file_type()
-                    && !file_type.is_file()
-                {
-                    continue;
-                }
-                let Ok(file_name) = dir_entry.file_name().into_string() else {
-                    continue;
-                };
-
-                if file_name.contains(TEMP_MARKER) {
-                    // Leftover temporary file from an interrupted write: clean it up.
-                    let _ = std::fs::remove_file(dir_entry.path());
-                    continue;
-                }
-                let Ok(metadata) = dir_entry.metadata() else {
-                    continue;
-                };
-                if !metadata.is_file() {
-                    continue;
-                }
-                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                entries.push((file_name, metadata.len(), modified));
+            if matches!(shard_entry.file_type(), Ok(file_type) if file_type.is_dir()) {
+                shard_paths.push(shard_entry.path());
             }
         }
-        entries.sort_by_key(|(_, _, modified)| *modified);
+        let mut entries = scan_shards(&shard_paths);
+        // Shards are scanned concurrently, so recency has to be restored globally.
+        entries.sort_unstable_by_key(|(_, _, modified)| *modified);
 
         let mut index = DiskCacheIndex {
             lru_cache: LruCache::unbounded(),
@@ -457,6 +433,73 @@ fn shard_dir(file_name: &str) -> String {
 /// Returns the full on-disk path of an entry, including its shard sub-directory.
 pub(crate) fn path_for(root_path: &Path, file_name: &str) -> PathBuf {
     root_path.join(shard_dir(file_name)).join(file_name)
+}
+
+/// Scans every shard directory and returns the `(file_name, num_bytes, modified)` triplet of
+/// each entry found.
+///
+/// Rebuilding the index costs one `stat` syscall per cached file, which dominates the opening
+/// of a large cache. Shards are therefore scanned by several threads pulling from a shared
+/// cursor, so that a slow shard cannot hold back the others.
+fn scan_shards(shard_paths: &[PathBuf]) -> Vec<(String, u64, SystemTime)> {
+    let num_threads = std::thread::available_parallelism()
+        .map(|num_cpus| num_cpus.get() * SCAN_THREADS_PER_CPU)
+        .unwrap_or(SCAN_THREADS_PER_CPU)
+        .min(MAX_SCAN_THREADS)
+        .min(shard_paths.len());
+    let next_shard_idx = AtomicUsize::new(0);
+    let entries = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..num_threads {
+            scope.spawn(|| {
+                loop {
+                    let shard_idx = next_shard_idx.fetch_add(1, Ordering::Relaxed);
+                    let Some(shard_path) = shard_paths.get(shard_idx) else {
+                        break;
+                    };
+                    let shard_entries = scan_shard(shard_path);
+                    entries.lock().unwrap().extend(shard_entries);
+                }
+            });
+        }
+    });
+    entries.into_inner().unwrap()
+}
+
+/// Scans a single shard directory, deleting the leftover temporary files it may contain.
+/// Unreadable entries are skipped: a partially recovered cache is still a usable one.
+fn scan_shard(shard_path: &Path) -> Vec<(String, u64, SystemTime)> {
+    let Ok(shard_dir_iter) = std::fs::read_dir(shard_path) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for dir_entry_res in shard_dir_iter {
+        let Ok(dir_entry) = dir_entry_res else {
+            continue;
+        };
+        if let Ok(file_type) = dir_entry.file_type()
+            && !file_type.is_file()
+        {
+            continue;
+        }
+        let Ok(file_name) = dir_entry.file_name().into_string() else {
+            continue;
+        };
+        if file_name.contains(TEMP_MARKER) {
+            // Leftover temporary file from an interrupted write: clean it up.
+            let _ = std::fs::remove_file(dir_entry.path());
+            continue;
+        }
+        let Ok(metadata) = dir_entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        entries.push((file_name, metadata.len(), modified));
+    }
+    entries
 }
 
 fn write_file(root_path: &Path, file_name: &str, bytes: &[u8]) -> io::Result<()> {
@@ -707,6 +750,42 @@ mod tests {
         for i in 0..64 {
             let key = format!("key-{i}");
             assert_eq!(cache.get(&key).await.unwrap(), &b"payload"[..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_restores_recency_across_shards() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        {
+            let cache = open_cache(tmp_dir.path().to_path_buf(), 100_000).await;
+            for i in 0..32u64 {
+                cache
+                    .put(format!("key-{i}"), OwnedBytes::new(&b"aaa"[..]))
+                    .await;
+            }
+        }
+        // Impose a known recency order over entries that are spread across shards: "key-0" is the
+        // least recent, "key-31" the most recent.
+        let now = SystemTime::now();
+        for i in 0..32u64 {
+            let path = path_for(tmp_dir.path(), &format!("key-{i}"));
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(now - Duration::from_secs(32 - i))
+                .unwrap();
+        }
+        // Reopen with room for the 4 most recent entries only. Shards are scanned concurrently, so
+        // this only holds if recency is rebuilt globally rather than shard by shard.
+        let cache = open_cache(tmp_dir.path().to_path_buf(), 12).await;
+        for i in 0..28u64 {
+            let key = format!("key-{i}");
+            assert!(cache.get(&key).await.is_none(), "{key} should be evicted");
+        }
+        for i in 28..32u64 {
+            let key = format!("key-{i}");
+            assert!(
+                cache.get(&key).await.is_some(),
+                "{key} should have survived"
+            );
         }
     }
 }
