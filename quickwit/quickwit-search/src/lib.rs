@@ -511,16 +511,30 @@ pub(crate) fn merge_splits_by_outcome(
     acc_opt: &mut Option<SplitsByOutcome>,
 ) {
     if let Some(new) = new_opt {
+        // Destructure to ensure all fields are accounted for.
+        let SplitsByOutcome {
+            cancel_warmup_queue,
+            pruned_before_warmup,
+            pruned_after_warmup,
+            cancel_before_warmup,
+            cancel_warmup,
+            cancel_cpu_queue,
+            cancel_cpu,
+            processed,
+            processed_from_metadata,
+            cache_hit,
+        } = new;
         if let Some(acc) = acc_opt {
-            acc.pruned_before_warmup += new.pruned_before_warmup;
-            acc.pruned_after_warmup += new.pruned_after_warmup;
-            acc.cancel_before_warmup += new.cancel_before_warmup;
-            acc.cancel_warmup += new.cancel_warmup;
-            acc.cancel_cpu_queue += new.cancel_cpu_queue;
-            acc.cancel_cpu += new.cancel_cpu;
-            acc.processed += new.processed;
-            acc.processed_from_metadata += new.processed_from_metadata;
-            acc.cache_hit += new.cache_hit;
+            acc.cancel_warmup_queue += cancel_warmup_queue;
+            acc.pruned_before_warmup += pruned_before_warmup;
+            acc.pruned_after_warmup += pruned_after_warmup;
+            acc.cancel_before_warmup += cancel_before_warmup;
+            acc.cancel_warmup += cancel_warmup;
+            acc.cancel_cpu_queue += cancel_cpu_queue;
+            acc.cancel_cpu += cancel_cpu;
+            acc.processed += processed;
+            acc.processed_from_metadata += processed_from_metadata;
+            acc.cache_hit += cache_hit;
         } else {
             *acc_opt = Some(new);
         }

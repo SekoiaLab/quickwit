@@ -290,7 +290,7 @@ pub struct SplitsByOutcome {
     pub pruned_before_warmup: u64,
     #[prost(uint64, tag = "2")]
     pub pruned_after_warmup: u64,
-    /// Cancelled before warmup started (error or timeout)
+    /// Cancelled while setting up the warmup (footer error or timeout)
     #[prost(uint64, tag = "3")]
     pub cancel_before_warmup: u64,
     #[prost(uint64, tag = "4")]
