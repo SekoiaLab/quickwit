@@ -19,11 +19,14 @@
 //! queue and uses rayon only to own OS threads that continuously drain it (the
 //! "pump loop" pattern).
 //!
-//! Two tiers of priority exist:
+//! Three tiers of priority exist:
 //! - High priority: always runs first and processed in strict FIFO order. Meant for short and rarer
 //!   tasks such as merging/finalizing a query's results.
-//! - Per-query tasks: tries to be fair among queries, with a bias towards queries that are closer
-//!   to completion.
+//! - Per-query: tries to be fair among queries, with a bias towards queries that are closer to
+//!   completion.
+//! - External: tasks submitted to the rayon threadpool without going through the scheduler are
+//!   executed before all other tasks, but with some latency because they need the pump loops to
+//!   yield to be picked up.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,9 +94,12 @@ impl Drop for RunningCountGuard {
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// How long a pump loop keeps grabbing tasks before handing its worker back
-/// to rayon's own scheduler (see [`pump_loop`]).
-const PUMP_LOOP_YIELD_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a pump loop keeps grabbing tasks before handing its worker back to
+/// rayon's own scheduler (see [`pump_loop`]).
+///
+/// Setting this too low adds un-necessary context work, setting this too high
+/// adds latency to tasks submitted directly to the rayon threadpool.
+const PUMP_LOOP_YIELD_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Per-query scheduling state.
 struct QueryState {
@@ -329,7 +335,7 @@ impl Scheduler {
 /// Tantivy Executor), so the pump loop needs to periodically yield to let rayon
 /// schedule those tasks.
 fn pump_loop(scheduler: &Arc<Scheduler>) {
-    let yield_deadline = Instant::now() + PUMP_LOOP_YIELD_INTERVAL;
+    let mut yield_deadline = Instant::now() + PUMP_LOOP_YIELD_INTERVAL;
     loop {
         let job = {
             let mut state = scheduler.lock_state();
@@ -345,9 +351,18 @@ fn pump_loop(scheduler: &Arc<Scheduler>) {
             error!("task running in the thread pool scheduler panicked");
         }
         if Instant::now() >= yield_deadline {
-            let replacement = scheduler.clone();
-            scheduler.rayon_pool.spawn(move || pump_loop(&replacement));
-            return;
+            // Drain all currently pending externally-submitted work.
+            loop {
+                match std::panic::catch_unwind(rayon::yield_now) {
+                    Ok(Some(rayon::Yield::Executed)) => continue,
+                    Ok(_) => break,
+                    Err(_) => {
+                        error!("externally-submitted rayon task panicked while yielding");
+                        break;
+                    }
+                }
+            }
+            yield_deadline = Instant::now() + PUMP_LOOP_YIELD_INTERVAL;
         }
     }
 }
@@ -572,8 +587,7 @@ mod tests {
         // rayon pool outside the scheduler (e.g. Tantivy's own internal
         // parallelism via `ThreadPool::get_executor`), which only gets
         // picked up by a worker that actually returns to rayon's scheduling
-        // loop. No core is ever permanently sacrificed for this: pump loops
-        // just periodically hand their worker back and re-queue themselves.
+        // loop.
         let scheduler = test_scheduler(2);
         let _guards = scheduler.register_query(QueryId(1), 100_000);
 
@@ -581,14 +595,14 @@ mod tests {
         // tasks, well over one yield interval in total.
         for _ in 0..2_000 {
             scheduler.enqueue_fair(QueryId(1), || {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(10));
             });
         }
         wait_until(|| scheduler.state.lock().unwrap().active_pump_workers >= 1);
 
         let (tx, rx) = std::sync::mpsc::channel();
         scheduler.rayon_pool.spawn(move || tx.send(()).unwrap());
-        rx.recv_timeout(Duration::from_secs(2))
+        rx.recv_timeout(Duration::from_secs(1))
             .expect("directly-injected rayon work starved: pump loops never yielded");
     }
 
