@@ -22,8 +22,8 @@ use super::ThreadPoolTaskInstrumentation;
 
 /// An executor backed by a thread pool to run CPU-intensive tasks.
 ///
-/// tokio::spawn_blocking should only used for IO-bound tasks, as it has not limit on its
-/// thread count.
+/// tokio::spawn_blocking should only be used for IO-bound tasks, as it has not
+/// limit on its thread count.
 ///
 /// Unlike [`super::SearchThreadPool`], dispatches FIFO straight onto the raw
 /// rayon pool, with no per-query priority/fairness layer.

@@ -73,6 +73,22 @@ impl Drop for SchedulerSplitGuard {
     }
 }
 
+/// Ensures the running count of the query is decremented after the job
+/// completes even if the job itself panics.
+struct RunningCountGuard {
+    scheduler: Arc<Scheduler>,
+    query_id: QueryId,
+}
+
+impl Drop for RunningCountGuard {
+    fn drop(&mut self) {
+        let mut state = self.scheduler.lock_state();
+        if let Some(query) = state.queries.get_mut(&self.query_id) {
+            query.running_count = query.running_count.saturating_sub(1);
+        }
+    }
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 /// How long a pump loop keeps grabbing tasks before handing its worker back
@@ -238,9 +254,8 @@ impl Scheduler {
         }
     }
 
-    /// Called by [`SplitGuard::drop`] exactly once per split of `query_id`,
-    /// decrementing `remaining` and removing the query's entry once it hits
-    /// zero.
+    /// Should be called exactly once per split of `query_id` when we know for
+    /// sure that the split won't be submitted again to the fair scheduler.
     fn split_resolved(&self, query_id: QueryId) {
         let mut state = self.lock_state();
         let Some(query) = state.queries.get_mut(&query_id) else {
@@ -272,8 +287,11 @@ impl Scheduler {
     where F: FnOnce() + Send + 'static {
         let scheduler = self.clone();
         let wrapped: Job = Box::new(move || {
+            let _running_guard = RunningCountGuard {
+                scheduler,
+                query_id,
+            };
             job();
-            scheduler.on_task_complete(query_id);
         });
         let mut state = self.lock_state();
         match state.queries.get_mut(&query_id) {
@@ -295,13 +313,6 @@ impl Scheduler {
             state.active_pump_workers += 1;
             let scheduler = self.clone();
             self.rayon_pool.spawn(move || pump_loop(&scheduler));
-        }
-    }
-
-    fn on_task_complete(&self, query_id: QueryId) {
-        let mut state = self.lock_state();
-        if let Some(query) = state.queries.get_mut(&query_id) {
-            query.running_count = query.running_count.saturating_sub(1);
         }
     }
 }
@@ -423,6 +434,21 @@ mod tests {
         release_tx.send(()).unwrap();
         wait_until(|| order.lock().unwrap().len() == 2);
         assert_eq!(*order.lock().unwrap(), vec!["level0", "query"]);
+    }
+
+    #[test]
+    fn test_on_task_complete_runs_even_if_job_panics() {
+        let scheduler = test_scheduler(1);
+        let _guards = scheduler.register_query(QueryId(1), 1);
+
+        scheduler.enqueue_fair(QueryId(1), || panic!("boom"));
+        wait_until(|| {
+            let state = scheduler.state.lock().unwrap();
+            match state.queries.get(&QueryId(1)) {
+                Some(query) => query.running_count == 0,
+                None => false,
+            }
+        });
     }
 
     #[test]
