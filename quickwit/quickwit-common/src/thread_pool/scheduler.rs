@@ -33,11 +33,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use once_cell::sync::Lazy;
 use tracing::error;
 
-use crate::metrics::{IntCounter, IntGauge, new_counter, new_gauge};
 use crate::rate_limited_error;
+use crate::thread_pool::metrics::SCHEDULER_METRICS;
 
 /// Identifies a query (leaf search) whose split-processing tasks should be
 /// scheduled and fair-shared together. Must be unique among currently active
@@ -98,7 +97,8 @@ type Job = Box<dyn FnOnce() + Send>;
 /// rayon's own scheduler (see [`pump_loop`]).
 ///
 /// Setting this too low adds un-necessary context work, setting this too high
-/// adds latency to tasks submitted directly to the rayon threadpool.
+/// adds latency to tasks submitted directly to the rayon threadpool. Long
+/// running tasks might take longer than this interval to yield (no preemption).
 const PUMP_LOOP_YIELD_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Per-query scheduling state.
@@ -131,8 +131,10 @@ struct SchedulerState {
     /// Always-first, uncapped tasks (e.g. finalize/root_merge).
     high_priority_queue: VecDeque<Job>,
     queries: HashMap<QueryId, QueryState>,
-    /// Number of pump loops currently alive, bounded by `num_threads`.
-    active_pump_workers: usize,
+    /// Number of pump loops currently spawned, bounded by `num_threads`. In the
+    /// rare case where externally scheduled tasks are keeping the rayon pool
+    /// busy, some pumps might be scheduled but not running.
+    scheduled_pump_workers: usize,
 }
 
 impl SchedulerState {
@@ -161,16 +163,12 @@ impl SchedulerState {
             return Some(job);
         }
         let cap = self.current_cap(num_threads);
-        let best_query_id = self
-            .queries
-            .iter()
-            .filter(|(_, query)| query.running_count < cap && !query.ready.is_empty())
-            .min_by_key(|(_, query)| query.priority_key())
-            .map(|(query_id, _)| *query_id)?;
         let query = self
             .queries
-            .get_mut(&best_query_id)
-            .expect("query looked up right above must still be present");
+            .iter_mut()
+            .filter(|(_, query)| query.running_count < cap && !query.ready.is_empty())
+            .min_by_key(|(_, query)| query.priority_key())
+            .map(|(_, query)| query)?;
         let job = query
             .ready
             .pop_front()
@@ -197,15 +195,12 @@ impl Scheduler {
             state: Mutex::new(SchedulerState {
                 high_priority_queue: VecDeque::new(),
                 queries: HashMap::new(),
-                active_pump_workers: 0,
+                scheduled_pump_workers: 0,
             }),
         })
     }
 
-    /// Locks `state`, adding how long the calling thread had to wait to
-    /// acquire it to [`SchedulerMetrics::lock_wait_time_nanos_total`]. The
-    /// lock only ever guards brief in-memory bookkeeping, so a fast-growing
-    /// total directly indicates contention.
+    /// Locks `state` and track the wait duration.
     fn lock_state(&self) -> MutexGuard<'_, SchedulerState> {
         let wait_start = Instant::now();
         let guard = self.state.lock().unwrap();
@@ -280,8 +275,8 @@ impl Scheduler {
     where F: FnOnce() + Send + 'static {
         let mut state = self.lock_state();
         state.high_priority_queue.push_back(Box::new(job));
-        if state.active_pump_workers < self.num_threads {
-            state.active_pump_workers += 1;
+        if state.scheduled_pump_workers < self.num_threads {
+            state.scheduled_pump_workers += 1;
             let scheduler = self.clone();
             self.rayon_pool.spawn(move || pump_loop(&scheduler));
         }
@@ -315,8 +310,8 @@ impl Scheduler {
                 state.high_priority_queue.push_back(wrapped);
             }
         }
-        if state.active_pump_workers < self.num_threads {
-            state.active_pump_workers += 1;
+        if state.scheduled_pump_workers < self.num_threads {
+            state.scheduled_pump_workers += 1;
             let scheduler = self.clone();
             self.rayon_pool.spawn(move || pump_loop(&scheduler));
         }
@@ -335,6 +330,9 @@ impl Scheduler {
 /// Tantivy Executor), so the pump loop needs to periodically yield to let rayon
 /// schedule those tasks.
 fn pump_loop(scheduler: &Arc<Scheduler>) {
+    let Ok(_reset_thread_on_drop) = configure_thread_for_pump(scheduler) else {
+        return;
+    };
     let mut yield_deadline = Instant::now() + PUMP_LOOP_YIELD_INTERVAL;
     loop {
         let job = {
@@ -342,7 +340,7 @@ fn pump_loop(scheduler: &Arc<Scheduler>) {
             match state.pick_next(scheduler.num_threads) {
                 Some(job) => job,
                 None => {
-                    state.active_pump_workers -= 1;
+                    state.scheduled_pump_workers -= 1;
                     return;
                 }
             }
@@ -351,43 +349,59 @@ fn pump_loop(scheduler: &Arc<Scheduler>) {
             error!("task running in the thread pool scheduler panicked");
         }
         if Instant::now() >= yield_deadline {
-            // Drain all currently pending externally-submitted work
-            while rayon::yield_now() == Some(rayon::Yield::Executed) {}
+            yield_for_external_work();
             yield_deadline = Instant::now() + PUMP_LOOP_YIELD_INTERVAL;
         }
     }
 }
 
-struct SchedulerMetrics {
-    /// Number of queries currently registered with the scheduler.
-    queries: IntGauge,
-    /// Cumulative time (in nanoseconds) callers have spent waiting to
-    /// acquire `Scheduler::state`. The lock only ever guards brief in-memory
-    /// bookkeeping, so a fast-growing total directly indicates contention.
-    lock_wait_time_nanos_total: IntCounter,
+thread_local! {
+    /// A flag indicating whether the current thread is running a pump loop.
+    static IN_PUMP_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Flag indicating that a pump loop was just requeued.
+    static PUMP_LOOP_REQUEUED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-impl Default for SchedulerMetrics {
-    fn default() -> Self {
-        SchedulerMetrics {
-            queries: new_gauge(
-                "scheduler_queries",
-                "number of queries currently registered with the CPU scheduler",
-                "thread_pool",
-                &[],
-            ),
-            lock_wait_time_nanos_total: new_counter(
-                "scheduler_lock_wait_time_nanos_total",
-                "cumulative time, in nanoseconds, spent waiting to acquire the CPU scheduler's \
-                 internal lock",
-                "thread_pool",
-                &[],
-            ),
+/// Configures the [IN_PUMP_LOOP] flag on the thread to avoid running a pump
+/// loop from another pump loop's yield.
+///
+/// Returns an error if called from within a pump loop.
+fn configure_thread_for_pump(scheduler: &Arc<Scheduler>) -> Result<ResetPumpThreadOnDrop, ()> {
+    let is_inside_another_pump = IN_PUMP_LOOP.with(|in_pump_loop| in_pump_loop.replace(true));
+    if is_inside_another_pump {
+        PUMP_LOOP_REQUEUED.with(|pump_loop_requeued| pump_loop_requeued.set(true));
+        let scheduler_clone = scheduler.clone();
+        scheduler
+            .rayon_pool
+            .spawn(move || pump_loop(&scheduler_clone));
+        return Err(());
+    }
+    Ok(ResetPumpThreadOnDrop)
+}
+
+/// Drain all currently pending externally-submitted work.
+fn yield_for_external_work() {
+    let mut last_yield_was_a_requeued_pump = false;
+    while rayon::yield_now() == Some(rayon::Yield::Executed) {
+        let this_yield_is_a_requeued_pump =
+            PUMP_LOOP_REQUEUED.with(|pump_loop_requeued| pump_loop_requeued.replace(false));
+        if last_yield_was_a_requeued_pump && this_yield_is_a_requeued_pump {
+            break;
         }
+        last_yield_was_a_requeued_pump = this_yield_is_a_requeued_pump;
     }
 }
 
-static SCHEDULER_METRICS: Lazy<SchedulerMetrics> = Lazy::new(SchedulerMetrics::default);
+/// A guard that resets the pump loop flags on the current thread when dropped.
+#[must_use]
+struct ResetPumpThreadOnDrop;
+
+impl Drop for ResetPumpThreadOnDrop {
+    fn drop(&mut self) {
+        IN_PUMP_LOOP.with(|in_pump_loop| in_pump_loop.set(false));
+        PUMP_LOOP_REQUEUED.with(|pump_loop_requeued| pump_loop_requeued.set(false));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -593,12 +607,107 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             });
         }
-        wait_until(|| scheduler.lock_state().active_pump_workers >= 1);
+        wait_until(|| scheduler.lock_state().scheduled_pump_workers >= 1);
 
         let (tx, rx) = std::sync::mpsc::channel();
         scheduler.rayon_pool.spawn(move || tx.send(()).unwrap());
         rx.recv_timeout(Duration::from_secs(1))
             .expect("directly-injected rayon work starved: pump loops never yielded");
+    }
+
+    #[test]
+    fn test_pump_loop_reentrant_pickup_does_not_recurse() {
+        // A same-thread nested `pump_loop` call is indistinguishable from a
+        // flat one when only observing cross-thread concurrency (both run
+        // strictly sequentially on that one thread), so this directly
+        // exercises `configure_thread_for_pump`'s reentrant branch instead:
+        // it must never let `pump_loop` fall through into running its loop
+        // again on a thread that's already inside one, or a continuous
+        // stream of re-queued bootstraps picked up by that same thread's
+        // own future yields would recurse one stack frame deeper every
+        // `PUMP_LOOP_YIELD_INTERVAL`, forever, instead of bailing out.
+        let scheduler = test_scheduler(1);
+
+        // Job 1 permanently occupies the pool's one real thread. Job 2
+        // stays queued, unconsumed -- a reentrant call that wrongly
+        // recurses into running its own loop would pick it up and block
+        // on it forever, instead of bailing out immediately.
+        let (blocker1_tx, blocker1_rx) = std::sync::mpsc::channel::<()>();
+        scheduler.enqueue_fifo(move || blocker1_rx.recv().unwrap());
+        let (blocker2_tx, blocker2_rx) = std::sync::mpsc::channel::<()>();
+        scheduler.enqueue_fifo(move || blocker2_rx.recv().unwrap());
+        assert_eq!(scheduler.lock_state().scheduled_pump_workers, 1);
+
+        // Simulate a thread already being inside a pump loop, and
+        // `enqueue_fifo` having just bumped `scheduled_pump_workers` for
+        // the bootstrap it spawned onto that same thread's local deque --
+        // then simulate `yield_now()` picking that bootstrap up by
+        // calling `pump_loop` reentrantly. Run this on a dedicated,
+        // non-rayon thread so a hang (recursion) can be detected with a
+        // timeout instead of blocking the test itself.
+        let scheduler_clone = scheduler.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            IN_PUMP_LOOP.with(|in_pump_loop| in_pump_loop.set(true));
+            scheduler_clone.lock_state().scheduled_pump_workers += 1;
+            pump_loop(&scheduler_clone);
+            done_tx.send(()).unwrap();
+        });
+
+        done_rx.recv_timeout(Duration::from_secs(1)).expect(
+            "reentrant pump_loop call recursed: it blocked running the queued job itself instead \
+             of bailing out",
+        );
+
+        blocker1_tx.send(()).unwrap();
+        blocker2_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn test_staged_second_pump_runs_concurrently_once_its_thread_is_freed() {
+        // Make sure pump loops cannot call each other recursively:
+
+        // Phase 1: Create a pool with 1 thread blocked (parked)
+        let scheduler = test_scheduler(2);
+        let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
+        scheduler.rayon_pool.spawn(move || park_rx.recv().unwrap());
+
+        // Phase 2: Register a query with many 5ms tasks, they can only run on
+        // one pump as the other is stuck in the rayon threadpool's queue.
+        const TASK_DURATION: Duration = Duration::from_millis(5);
+        let _guards = scheduler.register_query(QueryId(1), 100_000);
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        const TASKS_PER_YIELD_INTERVAL: usize =
+            (PUMP_LOOP_YIELD_INTERVAL.as_millis() / TASK_DURATION.as_millis()) as usize;
+        const NUMBER_OF_TASKS: usize = TASKS_PER_YIELD_INTERVAL * 10;
+        for _ in 0..NUMBER_OF_TASKS {
+            let concurrent = concurrent.clone();
+            let max_concurrent = max_concurrent.clone();
+            let completed = completed.clone();
+            scheduler.enqueue_fair(QueryId(1), move || {
+                let current = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                max_concurrent.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+                concurrent.fetch_sub(1, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert_eq!(scheduler.lock_state().scheduled_pump_workers, 2);
+
+        // Phase 3: Give pump 1 time to actually reach a yield checkpoint. When
+        // it does, it will try to schedule the second pump. It should not do so
+        // and instead resume processing the rest of the tasks.
+        std::thread::sleep(PUMP_LOOP_YIELD_INTERVAL * 2);
+        assert_eq!(max_concurrent.load(Ordering::SeqCst), 1);
+        assert!(completed.load(Ordering::SeqCst) > TASKS_PER_YIELD_INTERVAL);
+
+        // Phase 4: Free the second thread, the staged pump must grab it and start
+        // running concurrently with pump 1.
+        park_tx.send(()).unwrap();
+
+        wait_until(|| max_concurrent.load(Ordering::SeqCst) == 2);
     }
 
     #[test]
@@ -626,7 +735,7 @@ mod tests {
             });
         }
         wait_until(|| ran.load(Ordering::SeqCst) == 3);
-        wait_until(|| scheduler.lock_state().active_pump_workers == 0);
+        wait_until(|| scheduler.lock_state().scheduled_pump_workers == 0);
     }
 
     #[test]

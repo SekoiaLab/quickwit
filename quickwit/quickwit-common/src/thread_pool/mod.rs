@@ -13,16 +13,14 @@
 // limitations under the License.
 
 use futures::{Future, TryFutureExt};
-use once_cell::sync::Lazy;
+use metrics::THREAD_POOL_METRICS;
 use tokio::sync::oneshot;
 
-use crate::metrics::{
-    Histogram, HistogramTimer, HistogramVec, IntGauge, IntGaugeVec, OwnedGaugeGuard,
-    exponential_buckets, new_gauge_vec, new_histogram_vec,
-};
+use crate::metrics::{Histogram, HistogramTimer, IntGauge, OwnedGaugeGuard};
 
 pub mod scheduler;
 
+mod metrics;
 mod regular_pool;
 mod search_pool;
 
@@ -134,56 +132,3 @@ impl tantivy::EnqueuedTask for QueuedTask {
 }
 
 impl tantivy::RunningTask for RunningTaskGuard {}
-
-struct ThreadPoolMetrics {
-    ongoing_tasks: IntGaugeVec<3>,
-    pending_tasks: IntGaugeVec<3>,
-    queue_wait_time_secs: HistogramVec<3>,
-    run_time_secs: HistogramVec<3>,
-}
-
-/// From 1ms to ~32.768s
-fn wait_and_run_time_buckets() -> Vec<f64> {
-    exponential_buckets(0.001, 2.0, 16).unwrap()
-}
-
-impl Default for ThreadPoolMetrics {
-    fn default() -> Self {
-        ThreadPoolMetrics {
-            ongoing_tasks: new_gauge_vec(
-                "ongoing_tasks",
-                "number of tasks being currently processed by threads in the thread pool",
-                "thread_pool",
-                &[],
-                ["pool", "caller", "cost_class"],
-            ),
-            pending_tasks: new_gauge_vec(
-                "pending_tasks",
-                "number of tasks waiting in the queue before being processed by the thread pool",
-                "thread_pool",
-                &[],
-                ["pool", "caller", "cost_class"],
-            ),
-            queue_wait_time_secs: new_histogram_vec(
-                "queue_wait_time_secs",
-                "amount of time a task waited in the queue before being picked up by a thread in \
-                 the thread pool",
-                "thread_pool",
-                &[],
-                ["pool", "caller", "cost_class"],
-                wait_and_run_time_buckets(),
-            ),
-            run_time_secs: new_histogram_vec(
-                "run_time_secs",
-                "amount of time spent actually running a task on a thread pool worker, once it \
-                 has been picked up from the queue",
-                "thread_pool",
-                &[],
-                ["pool", "caller", "cost_class"],
-                wait_and_run_time_buckets(),
-            ),
-        }
-    }
-}
-
-static THREAD_POOL_METRICS: Lazy<ThreadPoolMetrics> = Lazy::new(ThreadPoolMetrics::default);
