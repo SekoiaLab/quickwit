@@ -1422,7 +1422,7 @@ pub async fn single_doc_mapping_leaf_search(
         .search_thread_pool
         .register_query(num_splits);
     let split_outcome_counters = Arc::new(SplitSearchOutcomeCounters::new_unregistered());
-    let leaf_search_ctx: Vec<SplitSearchContext> = scheduler_split_guards
+    let split_search_ctxs: Vec<SplitSearchContext> = scheduler_split_guards
         .into_iter()
         .map(|scheduler_guard| SplitSearchContext {
             state_guard: SplitSearchStateGuard::new(split_outcome_counters.clone()),
@@ -1467,7 +1467,7 @@ pub async fn single_doc_mapping_leaf_search(
     for (((split, search_request), permit_fut), mut split_search_ctx) in split_with_req
         .into_iter()
         .zip(permit_futures)
-        .zip(leaf_search_ctx)
+        .zip(split_search_ctxs)
     {
         let leaf_split_search_permit = permit_fut
             .instrument(info_span!("waiting_for_leaf_search_split_semaphore"))
