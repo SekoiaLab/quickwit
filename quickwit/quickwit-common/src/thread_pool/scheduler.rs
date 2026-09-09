@@ -243,15 +243,13 @@ impl Scheduler {
 
     /// Schedules a high priority task: always dispatched before any per-query
     /// task, and processed FIFO. Long tasks (>100ms) are not recommended.
-    pub fn enqueue_fifo<F>(self: &Arc<Self>, job: F)
-    where F: FnOnce() + Send + 'static {
-        let _ = self.tx.send(ActorMessage::EnqueueFifo(Box::new(job)));
+    pub fn enqueue_fifo(self: &Arc<Self>, job: Job) {
+        let _ = self.tx.send(ActorMessage::EnqueueFifo(job));
     }
 
     /// Schedules a task belonging to `query_id`. The query is expected to
     /// already have been [`Self::register_query`]-ed.
-    fn enqueue_fair<F>(self: &Arc<Self>, query_id: QueryId, job: F)
-    where F: FnOnce() + Send + 'static {
+    fn enqueue_fair(self: &Arc<Self>, query_id: QueryId, job: Job) {
         let tx = self.tx.downgrade();
         let wrapped: Job = Box::new(move || {
             let _running_guard = RunningCountGuard { tx, query_id };
@@ -542,13 +540,13 @@ mod tests {
             "test",
         );
         let order_clone = order.clone();
-        scheduler.enqueue_fifo(move || order_clone.lock().unwrap().push("level0"));
+        scheduler.enqueue_fifo(Box::new(move || order_clone.lock().unwrap().push("fifo")));
 
         // Step 3: Release the blocked worker to validate that the priority
         // queue is picked up first
         release_tx.send(()).unwrap();
         wait_until(|| order.lock().unwrap().len() == 2).await;
-        assert_eq!(*order.lock().unwrap(), vec!["level0", "query"]);
+        assert_eq!(*order.lock().unwrap(), vec!["fifo", "query"]);
 
         // Step 4: Ensure all tasks have completed successfully.
         let (blocker_result, query_result) = tokio::join!(blocker, query_task);
