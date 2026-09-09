@@ -37,10 +37,7 @@ use crate::leaf::open_split_bundle;
 use crate::query_cost_classifier::QueryCostClass;
 use crate::search_job_placer::group_jobs_by_index_id;
 use crate::service::SearcherContext;
-use crate::{
-    ClusterClient, SearchError, SearchJob, list_relevant_splits, resolve_index_patterns,
-    search_thread_pool,
-};
+use crate::{ClusterClient, SearchError, SearchJob, list_relevant_splits, resolve_index_patterns};
 
 /// QW_FIELD_LIST_SIZE_LIMIT defines a hard limit on the number of fields that
 /// can be returned (error otherwise).
@@ -369,7 +366,8 @@ pub async fn leaf_list_fields(
             .collect();
         merge_leaf_list_fields(filtered_list_fields_sorted_iters)
     };
-    let fields = search_thread_pool()
+    let fields = searcher_context
+        .search_thread_pool
         .run_cpu_intensive(
             cpu_task,
             "leaf_list_fields",
@@ -397,6 +395,7 @@ pub async fn root_list_fields(
     list_fields_req: ListFieldsRequest,
     cluster_client: &ClusterClient,
     mut metastore: MetastoreServiceClient,
+    searcher_context: &SearcherContext,
 ) -> crate::Result<ListFieldsResponse> {
     let indexes_metadata =
         resolve_index_patterns(&list_fields_req.index_id_patterns[..], &mut metastore).await?;
@@ -447,7 +446,8 @@ pub async fn root_list_fields(
         }
     }
     let leaf_list_fields_protos: Vec<ListFieldsResponse> = try_join_all(leaf_request_tasks).await?;
-    let fields = search_thread_pool()
+    let fields = searcher_context
+        .search_thread_pool
         .run_cpu_intensive(
             move || {
                 let leaf_list_fields = leaf_list_fields_protos

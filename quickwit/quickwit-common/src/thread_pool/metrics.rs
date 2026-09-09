@@ -15,17 +15,13 @@
 use once_cell::sync::Lazy;
 
 use crate::metrics::{
-    HistogramVec, IntCounter, IntGauge, IntGaugeVec, exponential_buckets, new_counter, new_gauge,
-    new_gauge_vec, new_histogram_vec,
+    HistogramVec, IntGauge, IntGaugeVec, exponential_buckets, new_gauge, new_gauge_vec,
+    new_histogram_vec,
 };
 
 pub(super) struct SchedulerMetrics {
     /// Number of queries currently registered with the scheduler.
     pub(super) queries: IntGauge,
-    /// Cumulative time (in nanoseconds) callers have spent waiting to
-    /// acquire `Scheduler::state`. The lock only ever guards brief in-memory
-    /// bookkeeping, so a fast-growing total directly indicates contention.
-    pub(super) lock_wait_time_nanos_total: IntCounter,
 }
 
 impl Default for SchedulerMetrics {
@@ -34,13 +30,6 @@ impl Default for SchedulerMetrics {
             queries: new_gauge(
                 "scheduler_queries",
                 "number of queries currently registered with the CPU scheduler",
-                "thread_pool",
-                &[],
-            ),
-            lock_wait_time_nanos_total: new_counter(
-                "scheduler_lock_wait_time_nanos_total",
-                "cumulative time, in nanoseconds, spent waiting to acquire the CPU scheduler's \
-                 internal lock",
                 "thread_pool",
                 &[],
             ),

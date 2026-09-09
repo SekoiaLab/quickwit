@@ -23,7 +23,7 @@ use anyhow::Context;
 use bytesize::ByteSize;
 use futures::future::try_join_all;
 use quickwit_common::pretty::PrettySample;
-use quickwit_common::thread_pool::scheduler::{QueryId, SchedulerSplitGuard};
+use quickwit_common::thread_pool::scheduler::SchedulerSplitGuard;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
 use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
 use quickwit_proto::search::{
@@ -225,7 +225,7 @@ pub(crate) async fn warmup(
     searcher: &Searcher,
     warmup_info: &WarmupInfo,
     cost_class: QueryCostClass,
-    query_id: QueryId,
+    scheduler_guard: &SchedulerSplitGuard,
 ) -> anyhow::Result<()> {
     debug!(warmup_info=?warmup_info);
     let warm_up_terms_future = warm_up_terms(searcher, &warmup_info.terms_grouped_by_field)
@@ -241,7 +241,7 @@ pub(crate) async fn warmup(
         searcher,
         &warmup_info.automatons_grouped_by_field,
         cost_class,
-        query_id,
+        &scheduler_guard,
     )
     .instrument(debug_span!("warm_up_automatons"));
 
@@ -342,12 +342,12 @@ async fn warm_up_automatons(
     searcher: &Searcher,
     terms_grouped_by_field: &HashMap<Field, HashSet<Automaton>>,
     cost_class: QueryCostClass,
-    query_id: QueryId,
+    scheduler_guard: &SchedulerSplitGuard,
 ) -> anyhow::Result<()> {
     let mut warm_up_futures = Vec::new();
     let cpu_intensive_executor = |task| async {
-        crate::search_thread_pool()
-            .run_cpu_intensive_fair(task, query_id, "automaton_warmup", cost_class.as_label())
+        scheduler_guard
+            .run_cpu_intensive_fair(task, "automaton_warmup", cost_class.as_label())
             .await
             .map_err(|_| std::io::Error::other("task panicked"))?
     };
@@ -466,7 +466,7 @@ async fn leaf_search_single_split(
     split: SplitIdAndFooterOffsets,
     aggregations_limits: AggregationLimitsGuard,
     search_permit: &mut SearchPermit,
-    mut leaf_search_state_guard: SplitSearchStateGuard,
+    mut split_search_ctx: SplitSearchContext,
 ) -> crate::Result<Option<LeafSearchResponse>> {
     rewrite_request(
         &mut search_request,
@@ -481,7 +481,9 @@ async fn leaf_search_single_split(
     // split can't have better results.
     //
     if is_metadata_count_request_with_ast(&query_ast, &search_request) {
-        leaf_search_state_guard.set_state(SplitSearchState::ProcessedFromMetadata);
+        split_search_ctx
+            .state_guard
+            .set_state(SplitSearchState::ProcessedFromMetadata);
         let effective_num_docs = split
             .num_docs
             .saturating_sub(split.soft_deleted_doc_ids.len() as u64);
@@ -495,7 +497,9 @@ async fn leaf_search_single_split(
         .leaf_search_cache
         .get(split.clone(), search_request.clone())
     {
-        leaf_search_state_guard.set_state(SplitSearchState::CacheHit);
+        split_search_ctx
+            .state_guard
+            .set_state(SplitSearchState::CacheHit);
         return Ok(Some(cached_answer));
     }
 
@@ -559,12 +563,14 @@ async fn leaf_search_single_split(
     warmup_info.simplify();
 
     let warmup_start = Instant::now();
-    leaf_search_state_guard.set_state(SplitSearchState::WarmUp);
+    split_search_ctx
+        .state_guard
+        .set_state(SplitSearchState::WarmUp);
     warmup(
         &searcher,
         &warmup_info,
         ctx.cost_class,
-        leaf_search_state_guard.scheduler_guard.query_id(),
+        &split_search_ctx.scheduler_guard,
     )
     .await?;
     let warmup_end = Instant::now();
@@ -590,11 +596,16 @@ async fn leaf_search_single_split(
 
     let ctx_clone = ctx.clone();
 
-    let query_id = leaf_search_state_guard.scheduler_guard.query_id();
+    // This is the final task for the current split. The context is dismantled
+    // and each guard is carried where it's needed.
+    let SplitSearchContext {
+        mut state_guard,
+        scheduler_guard,
+    } = split_search_ctx;
 
-    leaf_search_state_guard.set_state(SplitSearchState::CpuQueue);
+    state_guard.set_state(SplitSearchState::CpuQueue);
     let cpu_task = move || {
-        leaf_search_state_guard.set_state(SplitSearchState::Cpu);
+        state_guard.set_state(SplitSearchState::Cpu);
         let cpu_start = Instant::now();
         let cpu_thread_pool_wait_microsecs = cpu_start.duration_since(warmup_end);
         let _span_guard = span.enter();
@@ -603,7 +614,7 @@ async fn leaf_search_single_split(
         let Some(simplified_search_request) =
             simplify_search_request(search_request, &split_clone, &ctx_clone.split_filter)
         else {
-            leaf_search_state_guard.set_state(SplitSearchState::PrunedAfterWarmup);
+            state_guard.set_state(SplitSearchState::PrunedAfterWarmup);
             return Ok(None);
         };
         collector.update_search_param(&simplified_search_request);
@@ -629,21 +640,16 @@ async fn leaf_search_single_split(
         // splits by outcome are estimated at the (doc mapping) leaf
         // response level to account for all early returns, so it is
         // left None here
-        leaf_search_state_guard.set_state(SplitSearchState::Processed);
+        state_guard.set_state(SplitSearchState::Processed);
         Result::<_, TantivyError>::Ok(Some((simplified_search_request, leaf_search_response)))
     };
-    let search_request_and_result: Option<(SearchRequest, LeafSearchResponse)> =
-        crate::search_thread_pool()
-            .run_cpu_intensive_fair(
-                cpu_task,
-                query_id,
-                "split_search",
-                ctx.cost_class.as_label(),
-            )
-            .await
-            .map_err(|_| {
-                crate::SearchError::Internal(format!("leaf search panicked. split={split_id}"))
-            })??;
+    let search_request_and_result: Option<(SearchRequest, LeafSearchResponse)> = scheduler_guard
+        .run_cpu_intensive_fair(cpu_task, "split_search", ctx.cost_class.as_label())
+        .await
+        .map_err(|_| {
+            crate::SearchError::Internal(format!("leaf search panicked. split={split_id}"))
+        })??;
+    drop(scheduler_guard);
 
     // Let's cache this result in the partial result cache.
     if let Some((leaf_search_req, leaf_search_resp)) = search_request_and_result {
@@ -1332,7 +1338,8 @@ pub async fn multi_index_leaf_search(
         incremental_merge_collector.add_result(result??)?;
     }
 
-    crate::search_thread_pool()
+    searcher_context
+        .search_thread_pool
         .run_cpu_intensive(
             || incremental_merge_collector.finalize().map_err(Into::into),
             "finalize",
@@ -1411,12 +1418,16 @@ pub async fn single_doc_mapping_leaf_search(
     let num_splits = splits.len();
     info!(num_docs, num_splits, split_offsets = ?PrettySample::new(&splits, 5));
 
-    let query_id = QueryId::next();
-    let scheduler_split_guards = crate::search_thread_pool().register_query(query_id, num_splits);
+    let scheduler_split_guards = searcher_context
+        .search_thread_pool
+        .register_query(num_splits);
     let split_outcome_counters = Arc::new(SplitSearchOutcomeCounters::new_unregistered());
-    let leaf_search_state_guards: Vec<SplitSearchStateGuard> = scheduler_split_guards
+    let leaf_search_ctx: Vec<SplitSearchContext> = scheduler_split_guards
         .into_iter()
-        .map(|split_guard| SplitSearchStateGuard::new(split_outcome_counters.clone(), split_guard))
+        .map(|scheduler_guard| SplitSearchContext {
+            state_guard: SplitSearchStateGuard::new(split_outcome_counters.clone()),
+            scheduler_guard,
+        })
         .collect();
 
     let split_filter = CanSplitDoBetter::from_request(&request, doc_mapper.timestamp_field_name());
@@ -1451,26 +1462,27 @@ pub async fn single_doc_mapping_leaf_search(
         cost_class,
     });
 
-    let total_permits = permit_futures.len();
     let mut join_set = JoinSet::new();
     let mut split_with_task_id = Vec::with_capacity(split_with_req.len());
-    for (index, (((split, search_request), permit_fut), mut leaf_search_state_guard)) in
-        split_with_req
-            .into_iter()
-            .zip(permit_futures)
-            .zip(leaf_search_state_guards)
-            .enumerate()
+    for (((split, search_request), permit_fut), mut split_search_ctx) in split_with_req
+        .into_iter()
+        .zip(permit_futures)
+        .zip(leaf_search_ctx)
     {
         let leaf_split_search_permit = permit_fut
             .instrument(info_span!("waiting_for_leaf_search_split_semaphore"))
             .await;
-        leaf_search_state_guard.set_state(SplitSearchState::Start);
-        crate::search_thread_pool().set_waiting_for_permit(query_id, total_permits - (index + 1));
+        split_search_ctx
+            .state_guard
+            .set_state(SplitSearchState::Start);
+        split_search_ctx.scheduler_guard.mark_permit_obtained();
 
         let Some(simplified_search_request) =
             simplify_search_request(search_request, &split, &split_filter)
         else {
-            leaf_search_state_guard.set_state(SplitSearchState::PrunedBeforeWarmup);
+            split_search_ctx
+                .state_guard
+                .set_state(SplitSearchState::PrunedBeforeWarmup);
             continue;
         };
         let split_id = split.split_id.clone();
@@ -1482,7 +1494,7 @@ pub async fn single_doc_mapping_leaf_search(
                 split,
                 leaf_split_search_permit,
                 aggregations_limits.clone(),
-                leaf_search_state_guard,
+                split_search_ctx,
             )
             .in_current_span(),
         );
@@ -1528,16 +1540,16 @@ pub async fn single_doc_mapping_leaf_search(
         });
     }
 
-    let leaf_search_response_reresult: Result<Result<LeafSearchResponse, _>, _> =
-        crate::search_thread_pool()
-            .run_cpu_intensive(
-                || incremental_merge_collector.finalize(),
-                "finalize",
-                cost_class.as_label(),
-            )
-            .instrument(info_span!("incremental_merge_intermediate"))
-            .await
-            .context("failed to merge split search responses");
+    let leaf_search_response_reresult: Result<Result<LeafSearchResponse, _>, _> = searcher_context
+        .search_thread_pool
+        .run_cpu_intensive(
+            || incremental_merge_collector.finalize(),
+            "finalize",
+            cost_class.as_label(),
+        )
+        .instrument(info_span!("incremental_merge_intermediate"))
+        .await
+        .context("failed to merge split search responses");
 
     let mut leaf_response = leaf_search_response_reresult??;
     leaf_response.splits_by_outcome = Some(split_outcome_counters.split_by_outcome());
@@ -1587,24 +1599,24 @@ impl Drop for SplitSearchStateGuard {
 struct SplitSearchStateGuard {
     state: SplitSearchState,
     local_split_search_outcome_counters: Arc<SplitSearchOutcomeCounters>,
-    scheduler_guard: SchedulerSplitGuard,
 }
 
 impl SplitSearchStateGuard {
-    pub fn new(
-        local_split_search_outcome_counters: Arc<SplitSearchOutcomeCounters>,
-        scheduler_guard: SchedulerSplitGuard,
-    ) -> Self {
+    pub fn new(local_split_search_outcome_counters: Arc<SplitSearchOutcomeCounters>) -> Self {
         SplitSearchStateGuard {
             state: SplitSearchState::WarmupQueue,
             local_split_search_outcome_counters,
-            scheduler_guard,
         }
     }
 
     pub fn set_state(&mut self, state: SplitSearchState) {
         self.state = state;
     }
+}
+
+struct SplitSearchContext {
+    state_guard: SplitSearchStateGuard,
+    scheduler_guard: SchedulerSplitGuard,
 }
 
 struct LeafSearchContext {
@@ -1624,7 +1636,7 @@ async fn leaf_search_single_split_wrapper(
     split: SplitIdAndFooterOffsets,
     mut search_permit: SearchPermit,
     aggregations_limits: AggregationLimitsGuard,
-    leaf_search_state_guard: SplitSearchStateGuard,
+    split_search_ctx: SplitSearchContext,
 ) {
     let timer = crate::SEARCH_METRICS
         .leaf_search_split_duration_secs
@@ -1637,7 +1649,7 @@ async fn leaf_search_single_split_wrapper(
             split.clone(),
             aggregations_limits,
             &mut search_permit,
-            leaf_search_state_guard,
+            split_search_ctx,
         )
         .await;
 
@@ -2270,8 +2282,8 @@ mod tests {
         index_writer.commit().unwrap();
         let searcher = index.reader().unwrap().searcher();
 
-        let query_id = QueryId::next();
-        let _split_guards = crate::search_thread_pool().register_query(query_id, 1);
+        let searcher_context = SearcherContext::for_test();
+        let split_guards = searcher_context.search_thread_pool.register_query(1);
 
         // Several valid regexes targeting the same field combine into a single
         // automaton and warm up successfully.
@@ -2284,7 +2296,7 @@ mod tests {
         ))
         .collect();
         assert!(
-            warm_up_automatons(&searcher, &valid, QueryCostClass::Regular, query_id)
+            warm_up_automatons(&searcher, &valid, QueryCostClass::Regular, &split_guards[0])
                 .await
                 .is_ok()
         );
@@ -2301,9 +2313,14 @@ mod tests {
         ))
         .collect();
         assert!(
-            warm_up_automatons(&searcher, &valid_json, QueryCostClass::Regular, query_id)
-                .await
-                .is_ok()
+            warm_up_automatons(
+                &searcher,
+                &valid_json,
+                QueryCostClass::Regular,
+                &split_guards[0]
+            )
+            .await
+            .is_ok()
         );
 
         // An unbuildable regex (here, invalid syntax) must cause warmup to fail
@@ -2313,10 +2330,15 @@ mod tests {
             HashSet::from([Automaton::Regex(None, vec!["(".to_string()])]),
         ))
         .collect();
-        let error = warm_up_automatons(&searcher, &invalid, QueryCostClass::Regular, query_id)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = warm_up_automatons(
+            &searcher,
+            &invalid,
+            QueryCostClass::Regular,
+            &split_guards[0],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("failed to build regex during warmup for field `text`"),
             "unexpected error: {error}"
@@ -2328,10 +2350,15 @@ mod tests {
             HashSet::from([Automaton::Regex(Some(json_path), vec!["(".to_string()])]),
         ))
         .collect();
-        let error = warm_up_automatons(&searcher, &invalid_json, QueryCostClass::Regular, query_id)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = warm_up_automatons(
+            &searcher,
+            &invalid_json,
+            QueryCostClass::Regular,
+            &split_guards[0],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains(
                 "failed to build regex during warmup for field `body.process.executable`"

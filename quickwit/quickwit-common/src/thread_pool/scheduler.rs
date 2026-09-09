@@ -16,8 +16,13 @@
 //!
 //! Rayon has no notion of task priority: it dispatches in whatever order tasks
 //! land in its own local deques / injector queue. This module keeps its own
-//! queue and uses rayon only to own OS threads that continuously drain it (the
-//! "pump loop" pattern).
+//! priority queue in a small async actor task, and only ever submits work to
+//! rayon one task at a time, directly via `rayon_pool.spawn`, whenever a slot
+//! is free. Since the actor itself never runs on a rayon worker, every job it
+//! submits lands in rayon's shared injector queue and competes fairly with
+//! anything submitted directly to the same pool from outside the scheduler
+//! (e.g. Tantivy's own internal parallelism), with no special priority either
+//! way.
 //!
 //! Three tiers of priority exist:
 //! - High priority: always runs first and processed in strict FIFO order. Meant for short and rarer
@@ -25,96 +30,100 @@
 //! - Per-query: tries to be fair among queries, with a bias towards queries that are closer to
 //!   completion.
 //! - External: tasks submitted to the rayon threadpool without going through the scheduler are
-//!   executed before all other tasks, but with some latency because they need the pump loops to
-//!   yield to be picked up.
+//!   dispatched by rayon on an equal footing with the scheduler's own tasks.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::rate_limited_error;
+use crate::thread_pool::Panicked;
 use crate::thread_pool::metrics::SCHEDULER_METRICS;
 
-/// Identifies a query (leaf search) whose split-processing tasks should be
-/// scheduled and fair-shared together. Must be unique among currently active
-/// queries: reusing an id while a previous query with that id is still being
-/// cleaned up would corrupt its accounting.
+/// Identifies a leaf search query for tasks that need to be fair-shared accross
+/// queries. Must be unique among currently active queries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct QueryId(u64);
+struct QueryId(u64);
 
 impl QueryId {
     /// Allocates a fresh, never-reused `QueryId`.
-    pub fn next() -> QueryId {
+    fn next() -> QueryId {
         static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
         QueryId(NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 
-/// One per split registered via [`Scheduler::register_query`]. Dropping it
-/// resolves that split -- via normal completion or via being dropped along
-/// with a cancelled future -- so the query's entry can never leak regardless
-/// of how its caller ends.
-#[must_use = "dropping this immediately resolves the split"]
+/// Tracks the number of remaining splits to be processed for a given query.
+#[must_use]
 pub struct SchedulerSplitGuard {
     scheduler: Arc<Scheduler>,
     query_id: QueryId,
+    waiting_for_permit: bool,
 }
 
 impl SchedulerSplitGuard {
-    pub fn query_id(&self) -> QueryId {
-        self.query_id
+    /// Signals the scheduler that this split has obtained a permit.
+    pub fn mark_permit_obtained(&mut self) {
+        if !self.waiting_for_permit {
+            return;
+        }
+        self.waiting_for_permit = false;
+        let _ = self
+            .scheduler
+            .tx
+            .send(ActorMessage::PermitObtained(self.query_id));
+    }
+
+    /// Runs a CPU-intensive task, fairly scheduled against against other
+    /// queries.
+    pub fn run_cpu_intensive_fair<F, R>(
+        &self,
+        cpu_intensive_fn: F,
+        caller: &'static str,
+        cost_class: &'static str,
+    ) -> impl Future<Output = Result<R, Panicked>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        super::spawn_traced(
+            "searcher", // TODO find way to get the pool name
+            caller,
+            cost_class,
+            cpu_intensive_fn,
+            move |job| self.scheduler.enqueue_fair(self.query_id, job),
+        )
     }
 }
 
 impl Drop for SchedulerSplitGuard {
     fn drop(&mut self) {
-        self.scheduler.split_resolved(self.query_id);
-    }
-}
-
-/// Ensures the running count of the query is decremented after the job
-/// completes even if the job itself panics.
-struct RunningCountGuard {
-    scheduler: Arc<Scheduler>,
-    query_id: QueryId,
-}
-
-impl Drop for RunningCountGuard {
-    fn drop(&mut self) {
-        let mut state = self.scheduler.lock_state();
-        if let Some(query) = state.queries.get_mut(&self.query_id) {
-            query.running_count = query.running_count.saturating_sub(1);
-        }
+        let _ = self.scheduler.tx.send(ActorMessage::SplitResolved {
+            query_id: self.query_id,
+            waiting_for_permit: self.waiting_for_permit,
+        });
     }
 }
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// How long a pump loop keeps grabbing tasks before handing its worker back to
-/// rayon's own scheduler (see [`pump_loop`]).
-///
-/// Setting this too low adds un-necessary context work, setting this too high
-/// adds latency to tasks submitted directly to the rayon threadpool. Long
-/// running tasks might take longer than this interval to yield (no preemption).
-const PUMP_LOOP_YIELD_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Per-query scheduling state.
+/// Per-query scheduling state, owned exclusively by the [`SchedulerActor`].
 struct QueryState {
     /// Tasks submitted for this query that have not yet been dispatched.
     ready: VecDeque<Job>,
-    /// Tasks currently executing on a worker.
+    /// Tasks currently executing on a rayon worker.
     running_count: usize,
     /// Number of this query's splits still waiting on a `SearchPermit`, not
     /// yet admitted into warmup/CPU processing. Kept up to date by the
     /// caller via [`Scheduler::set_waiting_for_permit`].
     waiting_for_permit: usize,
     /// Number of this query's splits not yet resolved through *any* terminal
-    /// path (processed, pruned, cache hit, ...). Decremented by
-    /// [`Scheduler::split_resolved`], which also cleans up the query once it
-    /// reaches zero.
+    /// path (processed, pruned, cache hit, ...). Used both in the priority
+    /// calculation and to determine when a query is fully resolved.
     remaining: usize,
     /// Used as the final tie-break: older queries win, for fairness/liveness
     /// among otherwise-indistinguishable queries.
@@ -127,42 +136,271 @@ impl QueryState {
     }
 }
 
-struct SchedulerState {
-    /// Always-first, uncapped tasks (e.g. finalize/root_merge).
-    high_priority_queue: VecDeque<Job>,
-    queries: HashMap<QueryId, QueryState>,
-    /// Number of pump loops currently spawned, bounded by `num_threads`. In the
-    /// rare case where externally scheduled tasks are keeping the rayon pool
-    /// busy, some pumps might be scheduled but not running.
-    scheduled_pump_workers: usize,
+/// Messages accepted by the [`SchedulerActor`]. `Scheduler`'s public methods
+/// are thin, non-blocking wrappers that just send one of these.
+enum ActorMessage {
+    EnqueueFifo(Job),
+    EnqueueFair(QueryId, Job),
+    RegisterQuery {
+        query_id: QueryId,
+        total_splits: usize,
+    },
+    /// A permit has been obtained, which might change the priority of the
+    /// query's tasks.
+    PermitObtained(QueryId),
+    /// A split's processing has completed.
+    SplitResolved {
+        query_id: QueryId,
+        waiting_for_permit: bool,
+    },
+    /// A per-query task finished (or panicked).
+    QueryTaskFinished(QueryId),
+    /// Any task (high-priority or per-query) finished (or panicked), freeing
+    /// up a rayon slot.
+    CapacityFreed,
+    #[cfg(test)]
+    Introspect(tokio::sync::oneshot::Sender<DebugState>),
 }
 
-impl SchedulerState {
+/// A priority scheduler backed by a [`rayon::ThreadPool`]. See the module
+/// documentation for the overall design.
+pub struct Scheduler {
+    #[cfg(test)]
+    rayon_pool: Arc<rayon::ThreadPool>,
+    tx: mpsc::UnboundedSender<ActorMessage>,
+}
+
+impl Scheduler {
+    /// Spawns a scheduler actor onto the current Tokio runtime. Must therefore
+    /// be called from within one.
+    pub fn new(rayon_pool: Arc<rayon::ThreadPool>) -> Arc<Scheduler> {
+        let num_threads = rayon_pool.current_num_threads();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = SchedulerActor {
+            rayon_pool: rayon_pool.clone(),
+            num_threads,
+            tx: tx.clone(),
+            high_priority_queue: VecDeque::new(),
+            queries: HashMap::new(),
+            running_count: 0,
+        };
+        tokio::spawn(actor.run(rx));
+        Arc::new(Scheduler {
+            #[cfg(test)]
+            rayon_pool,
+            tx,
+        })
+    }
+
+    /// Registers a new query on the scheduler's state. Must be called exactly
+    /// once per query.
+    ///
+    /// Tasks belonging to the query and that need to be scheduled fairly can be
+    /// enqueued using the resulting [`SchedulerSplitGuard`]s. This guaranties
+    /// that:
+    /// - The state of the query is always initialized before it is mutated (RegisterQuery message
+    ///   rec).
+    pub fn register_query(self: &Arc<Self>, total_splits: usize) -> Vec<SchedulerSplitGuard> {
+        let query_id = QueryId::next();
+        if total_splits == 0 {
+            return Vec::new();
+        }
+        let _ = self.tx.send(ActorMessage::RegisterQuery {
+            query_id,
+            total_splits,
+        });
+        (0..total_splits)
+            .map(|_| SchedulerSplitGuard {
+                scheduler: self.clone(),
+                query_id,
+                waiting_for_permit: true,
+            })
+            .collect()
+    }
+
+    /// Schedules a high priority task: always dispatched before any per-query
+    /// task, and processed FIFO. Long tasks (>100ms) are not recommended.
+    pub fn enqueue_fifo<F>(self: &Arc<Self>, job: F)
+    where F: FnOnce() + Send + 'static {
+        let _ = self.tx.send(ActorMessage::EnqueueFifo(Box::new(job)));
+    }
+
+    /// Schedules a task belonging to `query_id`. The query is expected to
+    /// already have been [`Self::register_query`]-ed.
+    fn enqueue_fair<F>(self: &Arc<Self>, query_id: QueryId, job: F)
+    where F: FnOnce() + Send + 'static {
+        let tx = self.tx.clone();
+        let wrapped: Job = Box::new(move || {
+            let _running_guard = RunningCountGuard { tx, query_id };
+            job();
+        });
+        let _ = self.tx.send(ActorMessage::EnqueueFair(query_id, wrapped));
+    }
+
+    #[cfg(test)]
+    async fn debug_state(&self) -> DebugState {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(ActorMessage::Introspect(tx));
+        rx.await.expect("scheduler actor must still be running")
+    }
+}
+
+/// Decrements `query_id`'s `running_count` once its task completes (or
+/// panics), even if the job itself panics -- embedded into the job closure
+/// by [`Scheduler::enqueue_fair`], at enqueue time.
+struct RunningCountGuard {
+    tx: mpsc::UnboundedSender<ActorMessage>,
+    query_id: QueryId,
+}
+
+impl Drop for RunningCountGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(ActorMessage::QueryTaskFinished(self.query_id));
+    }
+}
+
+/// Frees up the rayon slot `SchedulerActor::fill_capacity` accounted for,
+/// once the task completes (or panics) -- wrapped around every job (of any
+/// kind) right before it's actually dispatched to rayon.
+struct CapacityFreedGuard {
+    tx: mpsc::UnboundedSender<ActorMessage>,
+}
+
+impl Drop for CapacityFreedGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(ActorMessage::CapacityFreed);
+    }
+}
+
+#[cfg(test)]
+struct DebugState {
+    running_count: usize,
+    query_running_counts: HashMap<QueryId, usize>,
+    registered_queries: std::collections::HashSet<QueryId>,
+}
+
+/// Owns all scheduling state and priority logic; the only thing that ever
+/// calls `rayon_pool.spawn`. Runs as a single, long-lived Tokio task (see
+/// [`Self::run`]), processing one [`ActorMessage`] at a time -- so its state
+/// needs no lock.
+struct SchedulerActor {
+    rayon_pool: Arc<rayon::ThreadPool>,
+    num_threads: usize,
+    /// Cloned into every dispatched job's [`CapacityFreedGuard`] (and every
+    /// enqueued fair job's [`RunningCountGuard`]) so they can report back.
+    tx: mpsc::UnboundedSender<ActorMessage>,
+    /// Always-first, uncapped tasks (e.g. finalize/root_merge).
+    high_priority_queue: VecDeque<Job>,
+    /// Per-query "fairly" scheduled tasks.
+    queries: HashMap<QueryId, QueryState>,
+    /// Number of tasks currently dispatched to rayon (<=num_threads).
+    running_count: usize,
+}
+
+impl SchedulerActor {
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<ActorMessage>) {
+        while let Some(message) = rx.recv().await {
+            self.handle(message);
+            self.fill_capacity();
+        }
+    }
+
+    fn handle(&mut self, message: ActorMessage) {
+        match message {
+            ActorMessage::EnqueueFifo(job) => self.high_priority_queue.push_back(job),
+            ActorMessage::EnqueueFair(query_id, job) => match self.queries.get_mut(&query_id) {
+                Some(query) => query.ready.push_back(job),
+                None => {
+                    debug_assert!(
+                        false,
+                        "query must be registered before tasks are enqueued for it"
+                    );
+                    rate_limited_error!(
+                        limit_per_min = 1,
+                        ?query_id,
+                        "query not registered on the scheduler, fall back to FIFO"
+                    );
+                    self.high_priority_queue.push_back(job);
+                }
+            },
+            ActorMessage::RegisterQuery {
+                query_id,
+                total_splits,
+            } => {
+                self.queries.insert(
+                    query_id,
+                    QueryState {
+                        ready: VecDeque::new(),
+                        running_count: 0,
+                        waiting_for_permit: total_splits,
+                        remaining: total_splits,
+                        created_at: Instant::now(),
+                    },
+                );
+                SCHEDULER_METRICS.queries.set(self.queries.len() as i64);
+            }
+            ActorMessage::PermitObtained(query_id) => {
+                if let Some(query) = self.queries.get_mut(&query_id) {
+                    query.waiting_for_permit = query.waiting_for_permit.saturating_sub(1);
+                }
+            }
+            ActorMessage::SplitResolved {
+                query_id,
+                waiting_for_permit,
+            } => {
+                if let Some(query) = self.queries.get_mut(&query_id) {
+                    if waiting_for_permit {
+                        query.waiting_for_permit = query.waiting_for_permit.saturating_sub(1);
+                    }
+                    query.remaining = query.remaining.saturating_sub(1);
+                    if query.remaining == 0 {
+                        self.queries.remove(&query_id);
+                        SCHEDULER_METRICS.queries.set(self.queries.len() as i64);
+                    }
+                }
+            }
+            ActorMessage::QueryTaskFinished(query_id) => {
+                if let Some(query) = self.queries.get_mut(&query_id) {
+                    query.running_count = query.running_count.saturating_sub(1);
+                }
+            }
+            ActorMessage::CapacityFreed => {
+                self.running_count = self.running_count.saturating_sub(1);
+            }
+            #[cfg(test)]
+            ActorMessage::Introspect(reply) => {
+                let _ = reply.send(DebugState {
+                    running_count: self.running_count,
+                    query_running_counts: self
+                        .queries
+                        .iter()
+                        .map(|(query_id, query)| (*query_id, query.running_count))
+                        .collect(),
+                    registered_queries: self.queries.keys().copied().collect(),
+                });
+            }
+        }
+    }
+
     /// The maximum number of concurrently running tasks any single query may
     /// have right now, given how many queries are currently competing for the
     /// pool.
-    fn current_cap(&self, num_threads: usize) -> usize {
+    fn current_cap(&self) -> usize {
         let competing_queries = self
             .queries
             .values()
             .filter(|query| !query.ready.is_empty())
             .count();
-        num_threads.div_ceil(competing_queries.max(1))
+        self.num_threads.div_ceil(competing_queries.max(1))
     }
 
     /// Pops the single highest-priority ready and eligible task, if any,
-    /// updating `running_count` for its owning query. Called with the lock
-    /// already held, by a pump loop looking for its next unit of work.
-    ///
-    /// Deliberately implemented here rather than on [`Scheduler`]: taking
-    /// only `&mut self` (no access to `Scheduler::state`, the `Mutex` this is
-    /// always called with already locked) makes it structurally impossible
-    /// for this to ever try to re-lock it and deadlock.
-    fn pick_next(&mut self, num_threads: usize) -> Option<Job> {
+    /// updating `running_count` for its owning query.
+    fn pick_next(&mut self) -> Option<Job> {
         if let Some(job) = self.high_priority_queue.pop_front() {
             return Some(job);
         }
-        let cap = self.current_cap(num_threads);
+        let cap = self.current_cap();
         let query = self
             .queries
             .iter_mut()
@@ -176,230 +414,25 @@ impl SchedulerState {
         query.running_count += 1;
         Some(job)
     }
-}
 
-/// A priority scheduler backed by a [`rayon::ThreadPool`]. See the module
-/// documentation for the overall design.
-pub struct Scheduler {
-    rayon_pool: Arc<rayon::ThreadPool>,
-    num_threads: usize,
-    state: Mutex<SchedulerState>,
-}
-
-impl Scheduler {
-    pub fn new(rayon_pool: Arc<rayon::ThreadPool>) -> Arc<Scheduler> {
-        let num_threads = rayon_pool.current_num_threads();
-        Arc::new(Scheduler {
-            rayon_pool,
-            num_threads,
-            state: Mutex::new(SchedulerState {
-                high_priority_queue: VecDeque::new(),
-                queries: HashMap::new(),
-                scheduled_pump_workers: 0,
-            }),
-        })
-    }
-
-    /// Locks `state` and track the wait duration.
-    fn lock_state(&self) -> MutexGuard<'_, SchedulerState> {
-        let wait_start = Instant::now();
-        let guard = self.state.lock().unwrap();
-        SCHEDULER_METRICS
-            .lock_wait_time_nanos_total
-            .inc_by(wait_start.elapsed().as_nanos() as u64);
-        guard
-    }
-
-    /// Registers a new query with its total split count. Must be called exactly
-    /// once per query, before any [`Self::enqueue_fair`] or
-    /// [`Self::set_waiting_for_permit`] call for that `query_id`.
-    ///
-    /// Returns one guard per split to track the number of remaining splits for
-    /// the query.
-    pub fn register_query(
-        self: &Arc<Self>,
-        query_id: QueryId,
-        total_splits: usize,
-    ) -> Vec<SchedulerSplitGuard> {
-        if total_splits == 0 {
-            return Vec::new();
-        }
-        let mut state = self.lock_state();
-        state.queries.insert(
-            query_id,
-            QueryState {
-                ready: VecDeque::new(),
-                running_count: 0,
-                waiting_for_permit: 0,
-                remaining: total_splits,
-                created_at: Instant::now(),
-            },
-        );
-        SCHEDULER_METRICS.queries.set(state.queries.len() as i64);
-        drop(state);
-        (0..total_splits)
-            .map(|_| SchedulerSplitGuard {
-                scheduler: self.clone(),
-                query_id,
-            })
-            .collect()
-    }
-
-    /// Updates how many of `query_id`'s splits are still waiting on a
-    /// `SearchPermit`. A query with none left (the common case once
-    /// admission is done) is preferred over one still mostly permit-gated.
-    pub fn set_waiting_for_permit(&self, query_id: QueryId, waiting_for_permit: usize) {
-        let mut state = self.lock_state();
-        if let Some(query) = state.queries.get_mut(&query_id) {
-            query.waiting_for_permit = waiting_for_permit;
-        }
-    }
-
-    /// Should be called exactly once per split of `query_id` when we know for
-    /// sure that the split won't be submitted again to the fair scheduler.
-    fn split_resolved(&self, query_id: QueryId) {
-        let mut state = self.lock_state();
-        let Some(query) = state.queries.get_mut(&query_id) else {
-            return;
-        };
-        query.remaining = query.remaining.saturating_sub(1);
-        if query.remaining == 0 {
-            state.queries.remove(&query_id);
-            SCHEDULER_METRICS.queries.set(state.queries.len() as i64);
-        }
-    }
-
-    /// Schedules a high priority task: always dispatched before any per-query
-    /// task, and processed FIFO. Long tasks (>100ms) are not recommended.
-    pub fn enqueue_fifo<F>(self: &Arc<Self>, job: F)
-    where F: FnOnce() + Send + 'static {
-        let mut state = self.lock_state();
-        state.high_priority_queue.push_back(Box::new(job));
-        if state.scheduled_pump_workers < self.num_threads {
-            state.scheduled_pump_workers += 1;
-            let scheduler = self.clone();
-            self.rayon_pool.spawn(move || pump_loop(&scheduler));
-        }
-    }
-
-    /// Schedules a task belonging to `query_id`. The query is expected to
-    /// already have been [`Self::register_query`]-ed.
-    pub fn enqueue_fair<F>(self: &Arc<Self>, query_id: QueryId, job: F)
-    where F: FnOnce() + Send + 'static {
-        let scheduler = self.clone();
-        let wrapped: Job = Box::new(move || {
-            let _running_guard = RunningCountGuard {
-                scheduler,
-                query_id,
+    /// Tops up the number of tasks dispatched to rayon to `num_threads`,
+    /// dispatching the highest-priority ready task(s) directly -- called
+    /// after every handled message, since any of them could have made more
+    /// capacity or work available.
+    fn fill_capacity(&mut self) {
+        while self.running_count < self.num_threads {
+            let Some(job) = self.pick_next() else {
+                break;
             };
-            job();
-        });
-        let mut state = self.lock_state();
-        match state.queries.get_mut(&query_id) {
-            Some(query) => query.ready.push_back(wrapped),
-            None => {
-                debug_assert!(
-                    false,
-                    "query must be registered before tasks are enqueued for it"
-                );
-                rate_limited_error!(
-                    limit_per_min = 1,
-                    ?query_id,
-                    "query not registered on the scheduler, fall back to FIFO"
-                );
-                state.high_priority_queue.push_back(wrapped);
-            }
-        }
-        if state.scheduled_pump_workers < self.num_threads {
-            state.scheduled_pump_workers += 1;
-            let scheduler = self.clone();
-            self.rayon_pool.spawn(move || pump_loop(&scheduler));
-        }
-    }
-}
-
-/// Runs on a rayon worker thread: repeatedly picks and runs the current best
-/// task until none is eligible, then gives up its slot.
-///
-/// The exit check and the `active_pump_workers` decrement happen in the same
-/// critical section as `pick_next`'s "nothing to do" verdict, so a concurrent
-/// `enqueue_fifo`/`enqueue_fair` call always sees an up-to-date count and
-/// spawns a replacement if this one is exiting right as new work arrives.
-///
-/// Unfortunately, the rayon pool is also used without the scheduler (as a
-/// Tantivy Executor), so the pump loop needs to periodically yield to let rayon
-/// schedule those tasks.
-fn pump_loop(scheduler: &Arc<Scheduler>) {
-    let Ok(_reset_thread_on_drop) = configure_thread_for_pump(scheduler) else {
-        return;
-    };
-    let mut yield_deadline = Instant::now() + PUMP_LOOP_YIELD_INTERVAL;
-    loop {
-        let job = {
-            let mut state = scheduler.lock_state();
-            match state.pick_next(scheduler.num_threads) {
-                Some(job) => job,
-                None => {
-                    state.scheduled_pump_workers -= 1;
-                    return;
+            self.running_count += 1;
+            let tx = self.tx.clone();
+            self.rayon_pool.spawn(move || {
+                let _capacity_guard = CapacityFreedGuard { tx };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                    error!("task running in the thread pool scheduler panicked");
                 }
-            }
-        };
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
-            error!("task running in the thread pool scheduler panicked");
+            });
         }
-        if Instant::now() >= yield_deadline {
-            yield_for_external_work();
-            yield_deadline = Instant::now() + PUMP_LOOP_YIELD_INTERVAL;
-        }
-    }
-}
-
-thread_local! {
-    /// A flag indicating whether the current thread is running a pump loop.
-    static IN_PUMP_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Flag indicating that a pump loop was just requeued.
-    static PUMP_LOOP_REQUEUED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Configures the [IN_PUMP_LOOP] flag on the thread to avoid running a pump
-/// loop from another pump loop's yield.
-///
-/// Returns an error if called from within a pump loop.
-fn configure_thread_for_pump(scheduler: &Arc<Scheduler>) -> Result<ResetPumpThreadOnDrop, ()> {
-    let is_inside_another_pump = IN_PUMP_LOOP.with(|in_pump_loop| in_pump_loop.replace(true));
-    if is_inside_another_pump {
-        PUMP_LOOP_REQUEUED.with(|pump_loop_requeued| pump_loop_requeued.set(true));
-        let scheduler_clone = scheduler.clone();
-        scheduler
-            .rayon_pool
-            .spawn(move || pump_loop(&scheduler_clone));
-        return Err(());
-    }
-    Ok(ResetPumpThreadOnDrop)
-}
-
-/// Drain all currently pending externally-submitted work.
-fn yield_for_external_work() {
-    let mut last_yield_was_a_requeued_pump = false;
-    while rayon::yield_now() == Some(rayon::Yield::Executed) {
-        let this_yield_is_a_requeued_pump =
-            PUMP_LOOP_REQUEUED.with(|pump_loop_requeued| pump_loop_requeued.replace(false));
-        if last_yield_was_a_requeued_pump && this_yield_is_a_requeued_pump {
-            break;
-        }
-        last_yield_was_a_requeued_pump = this_yield_is_a_requeued_pump;
-    }
-}
-
-/// A guard that resets the pump loop flags on the current thread when dropped.
-#[must_use]
-struct ResetPumpThreadOnDrop;
-
-impl Drop for ResetPumpThreadOnDrop {
-    fn drop(&mut self) {
-        IN_PUMP_LOOP.with(|in_pump_loop| in_pump_loop.set(false));
-        PUMP_LOOP_REQUEUED.with(|pump_loop_requeued| pump_loop_requeued.set(false));
     }
 }
 
@@ -408,6 +441,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
+
+    use futures::future::join_all;
 
     use super::*;
 
@@ -423,113 +458,162 @@ mod tests {
 
     // Polls until `condition` is true or the timeout elapses, to avoid flaky
     // sleeps while still bounding worst-case test time.
-    fn wait_until(mut condition: impl FnMut() -> bool) {
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !condition() {
             assert!(Instant::now() < deadline, "condition never became true");
-            std::thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
-    #[test]
-    fn test_level0_runs_before_query_tasks() {
+    // Polls the actor's own state (via `Scheduler::debug_state`) until
+    // `condition` is true or the timeout elapses.
+    async fn wait_until_debug_state(
+        scheduler: &Scheduler,
+        mut condition: impl FnMut(&DebugState) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let debug_state = scheduler.debug_state().await;
+            if condition(&debug_state) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "condition never became true");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_priority_runs_before_query_tasks() {
         let scheduler = test_scheduler(1);
         let order: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
 
-        let _guards = scheduler.register_query(QueryId(1), 1);
+        let guards = scheduler.register_query(1);
 
         // Step 1: Block the single worker so both tasks from step 2 stay in the
         // queue.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        scheduler.enqueue_fair(QueryId(1), move || {
-            release_rx.recv().unwrap();
-        });
+        let blocker = guards[0].run_cpu_intensive_fair(
+            move || {
+                release_rx.recv().unwrap();
+            },
+            "test",
+            "test",
+        );
 
         // Step 2: Add two tasks that remain queued by the scheduler
         let order_clone = order.clone();
-        scheduler.enqueue_fair(QueryId(1), move || {
-            order_clone.lock().unwrap().push("query")
-        });
+        let query_task = guards[0].run_cpu_intensive_fair(
+            move || order_clone.lock().unwrap().push("query"),
+            "test",
+            "test",
+        );
         let order_clone = order.clone();
         scheduler.enqueue_fifo(move || order_clone.lock().unwrap().push("level0"));
 
         // Step 3: Release the blocked worker to validate that the priority
         // queue is picked up first
         release_tx.send(()).unwrap();
-        wait_until(|| order.lock().unwrap().len() == 2);
+        wait_until(|| order.lock().unwrap().len() == 2).await;
         assert_eq!(*order.lock().unwrap(), vec!["level0", "query"]);
+
+        // Step 4: Ensure all tasks have completed successfully.
+        let (blocker_result, query_result) = tokio::join!(blocker, query_task);
+        blocker_result.unwrap();
+        query_result.unwrap();
     }
 
-    #[test]
-    fn test_on_task_complete_runs_even_if_job_panics() {
+    #[tokio::test]
+    async fn test_on_task_complete_runs_even_if_job_panics() {
         let scheduler = test_scheduler(1);
-        let _guards = scheduler.register_query(QueryId(1), 1);
+        let guards = scheduler.register_query(1);
 
-        scheduler.enqueue_fair(QueryId(1), || panic!("boom"));
-        wait_until(|| match scheduler.lock_state().queries.get(&QueryId(1)) {
-            Some(query) => query.running_count == 0,
-            None => false,
-        });
+        let task = guards[0].run_cpu_intensive_fair(|| panic!("boom"), "test", "test");
+        wait_until_debug_state(&scheduler, |debug_state| {
+            debug_state
+                .query_running_counts
+                .values()
+                .all(|&count| count == 0)
+        })
+        .await;
+        task.await.unwrap_err();
     }
 
-    #[test]
-    fn test_smaller_remaining_runs_first() {
+    #[tokio::test]
+    async fn test_smaller_remaining_runs_first() {
         let scheduler = test_scheduler(1);
-        let order: Arc<StdMutex<Vec<QueryId>>> = Arc::new(StdMutex::new(Vec::new()));
+        let order: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
 
-        let _guards1 = scheduler.register_query(QueryId(1), 100);
-        let _guards2 = scheduler.register_query(QueryId(2), 2);
+        let guards1 = scheduler.register_query(100);
+        let guards2 = scheduler.register_query(2);
 
         // Step 1: Block the single worker so both tasks from step 2 stay in the
         // queue.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        scheduler.enqueue_fair(QueryId(1), move || {
-            release_rx.recv().unwrap();
-        });
+        let blocker = guards1[0].run_cpu_intensive_fair(
+            move || {
+                release_rx.recv().unwrap();
+            },
+            "test",
+            "test",
+        );
 
         // Step 2: Add two tasks that remain queued by the scheduler
         let order_clone = order.clone();
-        scheduler.enqueue_fair(QueryId(1), move || {
-            order_clone.lock().unwrap().push(QueryId(1))
-        });
+        let task1 = guards1[0].run_cpu_intensive_fair(
+            move || order_clone.lock().unwrap().push("query1"),
+            "test",
+            "test",
+        );
         let order_clone = order.clone();
-        scheduler.enqueue_fair(QueryId(2), move || {
-            order_clone.lock().unwrap().push(QueryId(2))
-        });
+        let task2 = guards2[0].run_cpu_intensive_fair(
+            move || order_clone.lock().unwrap().push("query2"),
+            "test",
+            "test",
+        );
 
         // Step 3: Release the blocked worker to validate that query 2 with
         // fewer remaining splits is picked up first.
         release_tx.send(()).unwrap();
-        wait_until(|| order.lock().unwrap().len() == 2);
-        assert_eq!(*order.lock().unwrap(), vec![QueryId(2), QueryId(1)]);
+        wait_until(|| order.lock().unwrap().len() == 2).await;
+        assert_eq!(*order.lock().unwrap(), vec!["query2", "query1"]);
+        let (blocker_result, task1_result, task2_result) = tokio::join!(blocker, task1, task2);
+        blocker_result.unwrap();
+        task1_result.unwrap();
+        task2_result.unwrap();
     }
 
-    #[test]
-    fn test_cap_ignores_queries_with_no_ready_or_running_work() {
+    #[tokio::test]
+    async fn test_cap_ignores_queries_with_no_ready_work() {
         let scheduler = test_scheduler(3);
         // Queries 1 and 2 simulate splits still waiting on a `SearchPermit`:
         // registered, but with nothing enqueued on the CPU scheduler yet.
-        let _guards1 = scheduler.register_query(QueryId(1), 100);
-        let _guards2 = scheduler.register_query(QueryId(2), 100);
-        let _guards3 = scheduler.register_query(QueryId(3), 100);
+        let _guards1 = scheduler.register_query(100);
+        let _guards2 = scheduler.register_query(100);
+        let guards3 = scheduler.register_query(100);
 
         let concurrent_3 = Arc::new(AtomicUsize::new(0));
         let max_concurrent_3 = Arc::new(AtomicUsize::new(0));
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Arc::new(StdMutex::new(release_rx));
+        let mut tasks = Vec::new();
         for _ in 0..10 {
             let concurrent_3 = concurrent_3.clone();
             let max_concurrent_3 = max_concurrent_3.clone();
             let release_rx = release_rx.clone();
-            scheduler.enqueue_fair(QueryId(3), move || {
-                let current = concurrent_3.fetch_add(1, Ordering::SeqCst) + 1;
-                max_concurrent_3.fetch_max(current, Ordering::SeqCst);
-                release_rx.lock().unwrap().recv().unwrap();
-                concurrent_3.fetch_sub(1, Ordering::SeqCst);
-            });
+            tasks.push(guards3[0].run_cpu_intensive_fair(
+                move || {
+                    let current = concurrent_3.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_concurrent_3.fetch_max(current, Ordering::SeqCst);
+                    release_rx.lock().unwrap().recv().unwrap();
+                    concurrent_3.fetch_sub(1, Ordering::SeqCst);
+                },
+                "test",
+                "test",
+            ));
         }
 
-        wait_until(|| concurrent_3.load(Ordering::SeqCst) == 3);
+        wait_until(|| concurrent_3.load(Ordering::SeqCst) == 3).await;
         // 3 queries are registered, but only query 3 has any ready/running
         // work, so it should get the whole pool instead of being capped at
         // usable/3 == 1 while the other two threads sit idle.
@@ -538,244 +622,188 @@ mod tests {
         for _ in 0..10 {
             release_tx.send(()).unwrap();
         }
+        join_all(tasks).await;
     }
 
-    #[test]
-    fn test_per_query_cap_shares_the_pool() {
+    #[tokio::test]
+    async fn test_per_query_cap_shares_the_pool() {
         let scheduler = test_scheduler(4);
-        let _guards1 = scheduler.register_query(QueryId(1), 100);
-        let _guards2 = scheduler.register_query(QueryId(2), 100);
+        let guards1 = scheduler.register_query(100);
+        let guards2 = scheduler.register_query(100);
 
         let concurrent_1 = Arc::new(AtomicUsize::new(0));
         let max_concurrent_1 = Arc::new(AtomicUsize::new(0));
-        let (release_tx_1, release_rx_1) = std::sync::mpsc::channel::<()>();
-        let release_rx_1 = Arc::new(StdMutex::new(release_rx_1));
         let (release_tx_2, release_rx_2) = std::sync::mpsc::channel::<()>();
         let release_rx_2 = Arc::new(StdMutex::new(release_rx_2));
+        let mut tasks1 = Vec::new();
+        let mut tasks2 = Vec::new();
 
         // Interleave both queries' backlogs (each with more tasks than the
         // pool could ever run at once for it alone) so both count as
         // competing from the start, splitting cap = 4/2 = 2 between them.
-        // Giving one query its whole backlog first would let it alone grab
-        // cap = 4/1 = 4 -- the entire pool -- before the other ever gets a
-        // chance to compete.
         for _ in 0..10 {
             let concurrent_1 = concurrent_1.clone();
             let max_concurrent_1 = max_concurrent_1.clone();
-            let release_rx_1 = release_rx_1.clone();
-            scheduler.enqueue_fair(QueryId(1), move || {
-                let current = concurrent_1.fetch_add(1, Ordering::SeqCst) + 1;
-                max_concurrent_1.fetch_max(current, Ordering::SeqCst);
-                release_rx_1.lock().unwrap().recv().unwrap();
-                concurrent_1.fetch_sub(1, Ordering::SeqCst);
-            });
+            tasks1.push(guards1[0].run_cpu_intensive_fair(
+                move || {
+                    let current = concurrent_1.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_concurrent_1.fetch_max(current, Ordering::SeqCst);
+                    std::thread::sleep(Duration::MAX);
+                    concurrent_1.fetch_sub(1, Ordering::SeqCst);
+                },
+                "test",
+                "test",
+            ));
             let release_rx_2 = release_rx_2.clone();
-            scheduler.enqueue_fair(QueryId(2), move || {
-                release_rx_2.lock().unwrap().recv().unwrap();
-            });
+            tasks2.push(guards2[0].run_cpu_intensive_fair(
+                move || {
+                    release_rx_2.lock().unwrap().recv().unwrap();
+                },
+                "test",
+                "test",
+            ));
         }
+        wait_until(|| concurrent_1.load(Ordering::SeqCst) >= 2).await;
 
-        wait_until(|| concurrent_1.load(Ordering::SeqCst) >= 2);
-        // both queries have a backlog, so cap = 4/2 = 2.
-        assert!(max_concurrent_1.load(Ordering::SeqCst) <= 2);
-
-        for _ in 0..10 {
-            release_tx_1.send(()).unwrap();
-        }
-        for _ in 0..10 {
+        // Make sure that even if query 2 is running faster, its capacity is not
+        // taken over by query 1.
+        for _ in 0..8 {
             release_tx_2.send(()).unwrap();
         }
+        assert_eq!(max_concurrent_1.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
-    fn test_pump_loop_yields_periodically_for_directly_injected_rayon_work() {
-        // A continuous flow of fair-share work keeps pump loops finding more
-        // ready tasks (there's always another one queued), so without a
-        // periodic yield they would never return control to rayon's own
-        // scheduler -- starving anything submitted straight to the same
-        // rayon pool outside the scheduler (e.g. Tantivy's own internal
-        // parallelism via `ThreadPool::get_executor`), which only gets
-        // picked up by a worker that actually returns to rayon's scheduling
-        // loop.
+    #[tokio::test]
+    async fn test_directly_injected_rayon_work_runs_promptly_even_under_backlog() {
+        // The actor never holds onto a rayon worker thread: it only ever
+        // submits one task at a time, directly, whenever a slot is free. So
+        // anything submitted straight to the same rayon pool outside the
+        // scheduler (e.g. Tantivy's own internal parallelism) always competes
+        // on an equal footing in rayon's own queue -- no periodic yielding
+        // needed, and no possible starvation by construction.
         let scheduler = test_scheduler(2);
-        let _guards = scheduler.register_query(QueryId(1), 100_000);
+        let guards = scheduler.register_query(100_000);
 
         // Keep both workers continuously busy with a long stream of short
-        // tasks, well over one yield interval in total.
-        for _ in 0..2_000 {
-            scheduler.enqueue_fair(QueryId(1), || {
-                std::thread::sleep(Duration::from_millis(10));
-            });
-        }
-        wait_until(|| scheduler.lock_state().scheduled_pump_workers >= 1);
+        // tasks. Held alive (not joined) for the rest of the test: draining
+        // the full backlog isn't needed to prove directly-injected work isn't
+        // starved, and would needlessly slow the test down.
+        let _tasks: Vec<_> = guards
+            .iter()
+            .take(1000)
+            .map(|guard| {
+                guard.run_cpu_intensive_fair(
+                    || {
+                        std::thread::sleep(Duration::from_millis(10));
+                    },
+                    "test",
+                    "test",
+                )
+            })
+            .collect();
+        wait_until_debug_state(&scheduler, |debug_state| debug_state.running_count >= 1).await;
 
         let (tx, rx) = std::sync::mpsc::channel();
         scheduler.rayon_pool.spawn(move || tx.send(()).unwrap());
-        rx.recv_timeout(Duration::from_secs(1))
-            .expect("directly-injected rayon work starved: pump loops never yielded");
+        rx.recv_timeout(Duration::from_millis(500))
+            .expect("directly-injected rayon work starved");
     }
 
-    #[test]
-    fn test_pump_loop_reentrant_pickup_does_not_recurse() {
-        // A same-thread nested `pump_loop` call is indistinguishable from a
-        // flat one when only observing cross-thread concurrency (both run
-        // strictly sequentially on that one thread), so this directly
-        // exercises `configure_thread_for_pump`'s reentrant branch instead:
-        // it must never let `pump_loop` fall through into running its loop
-        // again on a thread that's already inside one, or a continuous
-        // stream of re-queued bootstraps picked up by that same thread's
-        // own future yields would recurse one stack frame deeper every
-        // `PUMP_LOOP_YIELD_INTERVAL`, forever, instead of bailing out.
-        let scheduler = test_scheduler(1);
-
-        // Job 1 permanently occupies the pool's one real thread. Job 2
-        // stays queued, unconsumed -- a reentrant call that wrongly
-        // recurses into running its own loop would pick it up and block
-        // on it forever, instead of bailing out immediately.
-        let (blocker1_tx, blocker1_rx) = std::sync::mpsc::channel::<()>();
-        scheduler.enqueue_fifo(move || blocker1_rx.recv().unwrap());
-        let (blocker2_tx, blocker2_rx) = std::sync::mpsc::channel::<()>();
-        scheduler.enqueue_fifo(move || blocker2_rx.recv().unwrap());
-        assert_eq!(scheduler.lock_state().scheduled_pump_workers, 1);
-
-        // Simulate a thread already being inside a pump loop, and
-        // `enqueue_fifo` having just bumped `scheduled_pump_workers` for
-        // the bootstrap it spawned onto that same thread's local deque --
-        // then simulate `yield_now()` picking that bootstrap up by
-        // calling `pump_loop` reentrantly. Run this on a dedicated,
-        // non-rayon thread so a hang (recursion) can be detected with a
-        // timeout instead of blocking the test itself.
-        let scheduler_clone = scheduler.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            IN_PUMP_LOOP.with(|in_pump_loop| in_pump_loop.set(true));
-            scheduler_clone.lock_state().scheduled_pump_workers += 1;
-            pump_loop(&scheduler_clone);
-            done_tx.send(()).unwrap();
-        });
-
-        done_rx.recv_timeout(Duration::from_secs(1)).expect(
-            "reentrant pump_loop call recursed: it blocked running the queued job itself instead \
-             of bailing out",
-        );
-
-        blocker1_tx.send(()).unwrap();
-        blocker2_tx.send(()).unwrap();
-    }
-
-    #[test]
-    fn test_staged_second_pump_runs_concurrently_once_its_thread_is_freed() {
-        // Make sure pump loops cannot call each other recursively:
-
-        // Phase 1: Create a pool with 1 thread blocked (parked)
+    #[tokio::test]
+    async fn test_query_state_cleaned_up_once_remaining_reaches_zero() {
         let scheduler = test_scheduler(2);
-        let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
-        scheduler.rayon_pool.spawn(move || park_rx.recv().unwrap());
-
-        // Phase 2: Register a query with many 5ms tasks, they can only run on
-        // one pump as the other is stuck in the rayon threadpool's queue.
-        const TASK_DURATION: Duration = Duration::from_millis(5);
-        let _guards = scheduler.register_query(QueryId(1), 100_000);
-        let concurrent = Arc::new(AtomicUsize::new(0));
-        let max_concurrent = Arc::new(AtomicUsize::new(0));
-        let completed = Arc::new(AtomicUsize::new(0));
-        const TASKS_PER_YIELD_INTERVAL: usize =
-            (PUMP_LOOP_YIELD_INTERVAL.as_millis() / TASK_DURATION.as_millis()) as usize;
-        const NUMBER_OF_TASKS: usize = TASKS_PER_YIELD_INTERVAL * 10;
-        for _ in 0..NUMBER_OF_TASKS {
-            let concurrent = concurrent.clone();
-            let max_concurrent = max_concurrent.clone();
-            let completed = completed.clone();
-            scheduler.enqueue_fair(QueryId(1), move || {
-                let current = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
-                max_concurrent.fetch_max(current, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(5));
-                concurrent.fetch_sub(1, Ordering::SeqCst);
-                completed.fetch_add(1, Ordering::SeqCst);
-            });
-        }
-        assert_eq!(scheduler.lock_state().scheduled_pump_workers, 2);
-
-        // Phase 3: Give pump 1 time to actually reach a yield checkpoint. When
-        // it does, it will try to schedule the second pump. It should not do so
-        // and instead resume processing the rest of the tasks.
-        std::thread::sleep(PUMP_LOOP_YIELD_INTERVAL * 2);
-        assert_eq!(max_concurrent.load(Ordering::SeqCst), 1);
-        assert!(completed.load(Ordering::SeqCst) > TASKS_PER_YIELD_INTERVAL);
-
-        // Phase 4: Free the second thread, the staged pump must grab it and start
-        // running concurrently with pump 1.
-        park_tx.send(()).unwrap();
-
-        wait_until(|| max_concurrent.load(Ordering::SeqCst) == 2);
-    }
-
-    #[test]
-    fn test_query_state_cleaned_up_once_remaining_reaches_zero() {
-        let scheduler = test_scheduler(2);
-        let mut guards = scheduler.register_query(QueryId(1), 2);
-        assert!(scheduler.lock_state().queries.contains_key(&QueryId(1)));
+        let mut guards = scheduler.register_query(2);
+        wait_until_debug_state(&scheduler, |debug_state| {
+            debug_state.registered_queries.len() == 1
+        })
+        .await;
 
         drop(guards.pop().unwrap());
-        assert!(scheduler.lock_state().queries.contains_key(&QueryId(1)));
+        // Give the `SplitResolved` message time to be processed, then check
+        // the query is still registered (1 split remains).
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(scheduler.debug_state().await.registered_queries.len(), 1);
 
         drop(guards.pop().unwrap());
-        assert!(!scheduler.lock_state().queries.contains_key(&QueryId(1)));
+        wait_until_debug_state(&scheduler, |debug_state| {
+            debug_state.registered_queries.is_empty()
+        })
+        .await;
     }
 
-    #[test]
-    fn test_pump_loops_drain_and_exit() {
+    #[tokio::test]
+    async fn test_running_count_drains_back_to_zero_once_all_tasks_complete() {
         let scheduler = test_scheduler(2);
-        let _guards = scheduler.register_query(QueryId(1), 3);
+        let guards = scheduler.register_query(3);
         let ran = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
         for _ in 0..3 {
             let ran = ran.clone();
-            scheduler.enqueue_fair(QueryId(1), move || {
-                ran.fetch_add(1, Ordering::SeqCst);
-            });
+            tasks.push(guards[0].run_cpu_intensive_fair(
+                move || {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                },
+                "test",
+                "test",
+            ));
         }
-        wait_until(|| ran.load(Ordering::SeqCst) == 3);
-        wait_until(|| scheduler.lock_state().scheduled_pump_workers == 0);
+        wait_until(|| ran.load(Ordering::SeqCst) == 3).await;
+        wait_until_debug_state(&scheduler, |debug_state| debug_state.running_count == 0).await;
+        join_all(tasks).await;
     }
 
-    #[test]
-    fn test_more_waiting_for_permit_runs_last() {
+    #[tokio::test]
+    async fn test_more_waiting_for_permit_runs_last() {
         let scheduler = test_scheduler(1);
-        let order: Arc<StdMutex<Vec<QueryId>>> = Arc::new(StdMutex::new(Vec::new()));
+        let order: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
 
-        let _guards1 = scheduler.register_query(QueryId(1), 20);
-        let _guards2 = scheduler.register_query(QueryId(2), 10);
-        scheduler.set_waiting_for_permit(QueryId(1), 5);
+        let guards1 = scheduler.register_query(10);
+        let mut guards2 = scheduler.register_query(20);
+        for guard in guards2.iter_mut().take(15) {
+            guard.mark_permit_obtained();
+        }
 
         // Step 1: Block the single worker so both tasks from step 2 stay in
         // the queue.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        scheduler.enqueue_fair(QueryId(1), move || {
-            release_rx.recv().unwrap();
-        });
+        let blocker = guards1[0].run_cpu_intensive_fair(
+            move || {
+                release_rx.recv().unwrap();
+            },
+            "test",
+            "test",
+        );
 
         // Step 2: Add one task per query that remain in the queue.
         let order_clone = order.clone();
-        scheduler.enqueue_fair(QueryId(1), move || {
-            order_clone.lock().unwrap().push(QueryId(1))
-        });
+        let task1 = guards1[0].run_cpu_intensive_fair(
+            move || order_clone.lock().unwrap().push("query1"),
+            "test",
+            "test",
+        );
         let order_clone = order.clone();
-        scheduler.enqueue_fair(QueryId(2), move || {
-            order_clone.lock().unwrap().push(QueryId(2))
-        });
+        let task2 = guards2[0].run_cpu_intensive_fair(
+            move || order_clone.lock().unwrap().push("query2"),
+            "test",
+            "test",
+        );
 
         // Step 3: Release the blocked worker to validate that query 2, which
         // has no splits waiting on a permit, is picked up before query 1.
         release_tx.send(()).unwrap();
-        wait_until(|| order.lock().unwrap().len() == 2);
-        assert_eq!(*order.lock().unwrap(), vec![QueryId(2), QueryId(1)]);
+        wait_until(|| order.lock().unwrap().len() == 2).await;
+        assert_eq!(*order.lock().unwrap(), vec!["query2", "query1"]);
+        let (blocker_result, task1_result, task2_result) = tokio::join!(blocker, task1, task2);
+        blocker_result.unwrap();
+        task1_result.unwrap();
+        task2_result.unwrap();
     }
 
-    #[test]
-    fn test_register_query_with_zero_splits_returns_no_guards() {
+    #[tokio::test]
+    async fn test_register_query_with_zero_splits_returns_no_guards() {
         let scheduler = test_scheduler(1);
-        let guards = scheduler.register_query(QueryId(1), 0);
+        let guards = scheduler.register_query(0);
         assert!(guards.is_empty());
-        assert!(!scheduler.lock_state().queries.contains_key(&QueryId(1)));
+        assert!(scheduler.debug_state().await.registered_queries.is_empty());
     }
 }

@@ -16,14 +16,13 @@ use std::sync::Arc;
 
 use futures::Future;
 
-use super::scheduler::{QueryId, Scheduler, SchedulerSplitGuard};
+use super::scheduler::{Scheduler, SchedulerSplitGuard};
 use super::{Panicked, ThreadPool};
 
 /// A [`ThreadPool`] with a per-query fair-share priority scheduler (see
 /// [`super::scheduler`]) sitting in front of it, for CPU-intensive tasks that
-/// belong to a specific query and must be prioritized/fair-shared against
-/// each other. The plain [`ThreadPool`] has no notion of query and dispatches
-/// FIFO, which is all one-off or query-less CPU work needs.
+/// belong to a specific query and must be prioritized/fair-shared against each
+/// other.
 #[derive(Clone)]
 pub struct SearchThreadPool {
     thread_pool: ThreadPool,
@@ -42,18 +41,8 @@ impl SearchThreadPool {
 
     /// Registers a new query for per-query fair-share scheduling. See
     /// [`Scheduler::register_query`].
-    pub fn register_query(
-        &self,
-        query_id: QueryId,
-        total_splits: usize,
-    ) -> Vec<SchedulerSplitGuard> {
-        self.scheduler.register_query(query_id, total_splits)
-    }
-
-    /// See [`Scheduler::set_waiting_for_permit`].
-    pub fn set_waiting_for_permit(&self, query_id: QueryId, waiting_for_permit: usize) {
-        self.scheduler
-            .set_waiting_for_permit(query_id, waiting_for_permit);
+    pub fn register_query(&self, total_splits: usize) -> Vec<SchedulerSplitGuard> {
+        self.scheduler.register_query(total_splits)
     }
 
     /// Returns a Tantivy [`tantivy::Executor`] backed by this thread pool.
@@ -68,30 +57,6 @@ impl SearchThreadPool {
         cost_class: &'static str,
     ) -> tantivy::Executor {
         self.thread_pool.get_executor(caller, cost_class)
-    }
-
-    /// Runs a CPU-intensive task belonging to `query_id`, subject to the
-    /// per-query fair-share scheduling and priority ordering described in
-    /// [`super::scheduler`]. `query_id` must already have been registered via
-    /// [`Self::register_query`].
-    pub fn run_cpu_intensive_fair<F, R>(
-        &self,
-        cpu_intensive_fn: F,
-        query_id: QueryId,
-        caller: &'static str,
-        cost_class: &'static str,
-    ) -> impl Future<Output = Result<R, Panicked>>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        super::spawn_traced(
-            self.thread_pool.name,
-            caller,
-            cost_class,
-            cpu_intensive_fn,
-            move |job| self.scheduler.enqueue_fair(query_id, job),
-        )
     }
 
     /// Runs a CPU-intensive task ahead of any per-query fair-share task (see
@@ -123,22 +88,19 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::thread_pool::scheduler::QueryId;
 
-    #[test]
-    fn test_externally_submitted_panic_during_yield_does_not_stop_pump_loop() {
+    #[tokio::test]
+    async fn test_externally_submitted_panic_does_not_stop_the_scheduler() {
         crate::setup_logging_for_tests();
         let search_pool = SearchThreadPool::new("test", Some(1));
-        let query_id = QueryId::next();
-        let _guards = search_pool.register_query(query_id, 100_000);
+        let guards = search_pool.register_query(100_000);
 
-        // Keep the worker continuously busy so externally-submitted work
-        // can only ever be serviced through a pump loop's periodic yield.
+        // Keep the worker continuously busy to simulate contention with
+        // externally-submitted work.
         let mut futures = Vec::with_capacity(2_000);
-        for _ in 0..2_000 {
-            futures.push(search_pool.run_cpu_intensive_fair(
+        for guard in guards.iter().take(2_000) {
+            futures.push(guard.run_cpu_intensive_fair(
                 || std::thread::sleep(Duration::from_millis(10)),
-                query_id,
                 "test",
                 "test",
             ));
@@ -148,13 +110,20 @@ mod tests {
         // entirely.
         search_pool.thread_pool.rayon_pool.spawn(|| panic!("boom"));
 
-        // Confirm the unique pump loop kept yielding to external work afterward.
+        // Confirm externally-injected work still gets serviced afterward.
         let (tx, rx) = std::sync::mpsc::channel();
         search_pool
             .thread_pool
             .rayon_pool
             .spawn(move || tx.send(()).unwrap());
-        rx.recv_timeout(Duration::from_secs(2))
-            .expect("pump loop stopped yielding to external work after the panic");
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("external work starved after the panic");
+
+        // Confirm a task executed on the scheduler (with high prio) also gets
+        // serviced.
+        search_pool
+            .run_cpu_intensive(|| {}, "test", "test")
+            .await
+            .expect("task should not panic");
     }
 }
