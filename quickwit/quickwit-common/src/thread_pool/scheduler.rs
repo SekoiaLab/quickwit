@@ -475,6 +475,7 @@ mod tests {
     use std::time::Duration;
 
     use futures::future::join_all;
+    use tokio::sync::Mutex as AsyncMutex;
 
     use super::*;
 
@@ -665,8 +666,8 @@ mod tests {
 
         let concurrent_1 = Arc::new(AtomicUsize::new(0));
         let max_concurrent_1 = Arc::new(AtomicUsize::new(0));
-        let blocker_1 = Arc::new(StdMutex::new(()));
-        let _blocker_1_guard = blocker_1.lock().unwrap();
+        let blocker_1 = Arc::new(AsyncMutex::new(()));
+        let _blocker_1_guard = blocker_1.lock().await;
         let (release_tx_2, release_rx_2) = std::sync::mpsc::channel::<()>();
         let release_rx_2 = Arc::new(StdMutex::new(release_rx_2));
         let mut tasks1 = Vec::new();
@@ -684,7 +685,7 @@ mod tests {
                     let current = concurrent_1.fetch_add(1, Ordering::SeqCst) + 1;
                     max_concurrent_1.fetch_max(current, Ordering::SeqCst);
                     // tasks for query 1 remain blocked until the end of the test
-                    let _unused = blocker_1.lock().unwrap();
+                    let _unused = blocker_1.blocking_lock();
                 },
                 "test",
                 "test",

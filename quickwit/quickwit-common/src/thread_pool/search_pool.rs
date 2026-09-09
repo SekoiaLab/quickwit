@@ -48,7 +48,7 @@ impl SearchThreadPool {
     /// Returns a Tantivy [`tantivy::Executor`] backed by this thread pool.
     ///
     /// Tasks that Tantivy schedules through it are tracked by metrics, but --
-    /// unlike [`Self::run_cpu_intensive_fair`] -- bypass the per-query
+    /// unlike [`Self::run_cpu_intensive`] -- bypass the per-query
     /// priority scheduler entirely: Tantivy dispatches directly onto the raw
     /// rayon pool.
     pub fn get_executor(
