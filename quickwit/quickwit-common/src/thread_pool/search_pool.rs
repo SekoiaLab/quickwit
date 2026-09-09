@@ -32,7 +32,7 @@ pub struct SearchThreadPool {
 impl SearchThreadPool {
     pub fn new(name: &'static str, num_threads_opt: Option<usize>) -> SearchThreadPool {
         let thread_pool = ThreadPool::new(name, num_threads_opt);
-        let scheduler = Scheduler::new(thread_pool.rayon_pool.clone());
+        let scheduler = Scheduler::new(thread_pool.rayon_pool.clone(), name);
         SearchThreadPool {
             thread_pool,
             scheduler,

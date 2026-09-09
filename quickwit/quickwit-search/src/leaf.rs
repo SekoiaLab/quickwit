@@ -241,7 +241,7 @@ pub(crate) async fn warmup(
         searcher,
         &warmup_info.automatons_grouped_by_field,
         cost_class,
-        &scheduler_guard,
+        scheduler_guard,
     )
     .instrument(debug_span!("warm_up_automatons"));
 

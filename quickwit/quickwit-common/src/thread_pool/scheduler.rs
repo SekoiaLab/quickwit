@@ -20,9 +20,10 @@
 //! rayon one task at a time, directly via `rayon_pool.spawn`, whenever a slot
 //! is free. Since the actor itself never runs on a rayon worker, every job it
 //! submits lands in rayon's shared injector queue and competes fairly with
-//! anything submitted directly to the same pool from outside the scheduler
-//! (e.g. Tantivy's own internal parallelism), with no special priority either
-//! way.
+//! tasks submitted directly to the same pool from outside the scheduler (e.g.
+//! Tantivy's own internal parallelism). Given that the actor doesn't submit
+//! more tasks than the number of threads, externally submitted tasks will
+//! effectively be processed right after any ongoing work.
 //!
 //! Three tiers of priority exist:
 //! - High priority: always runs first and processed in strict FIFO order. Meant for short and rarer
@@ -38,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::rate_limited_error;
 use crate::thread_pool::Panicked;
@@ -63,6 +64,7 @@ pub struct SchedulerSplitGuard {
     scheduler: Arc<Scheduler>,
     query_id: QueryId,
     waiting_for_permit: bool,
+    pool_name: &'static str,
 }
 
 impl SchedulerSplitGuard {
@@ -78,8 +80,7 @@ impl SchedulerSplitGuard {
             .send(ActorMessage::PermitObtained(self.query_id));
     }
 
-    /// Runs a CPU-intensive task, fairly scheduled against against other
-    /// queries.
+    /// Runs a CPU-intensive task, fairly scheduled against other queries.
     pub fn run_cpu_intensive_fair<F, R>(
         &self,
         cpu_intensive_fn: F,
@@ -91,7 +92,7 @@ impl SchedulerSplitGuard {
         R: Send + 'static,
     {
         super::spawn_traced(
-            "searcher", // TODO find way to get the pool name
+            self.pool_name,
             caller,
             cost_class,
             cpu_intensive_fn,
@@ -117,9 +118,9 @@ struct QueryState {
     ready: VecDeque<Job>,
     /// Tasks currently executing on a rayon worker.
     running_count: usize,
-    /// Number of this query's splits still waiting on a `SearchPermit`, not
-    /// yet admitted into warmup/CPU processing. Kept up to date by the
-    /// caller via [`Scheduler::set_waiting_for_permit`].
+    /// Number of this query's splits still waiting on a `SearchPermit`, not yet
+    /// admitted into warmup/CPU processing. Kept up to date via
+    /// [`SchedulerSplitGuard::mark_permit_obtained`].
     waiting_for_permit: usize,
     /// Number of this query's splits not yet resolved through *any* terminal
     /// path (processed, pruned, cache hit, ...). Used both in the priority
@@ -168,28 +169,49 @@ pub struct Scheduler {
     #[cfg(test)]
     rayon_pool: Arc<rayon::ThreadPool>,
     tx: mpsc::UnboundedSender<ActorMessage>,
+    pool_name: &'static str,
 }
 
 impl Scheduler {
     /// Spawns a scheduler actor onto the current Tokio runtime. Must therefore
     /// be called from within one.
-    pub fn new(rayon_pool: Arc<rayon::ThreadPool>) -> Arc<Scheduler> {
+    pub fn new(rayon_pool: Arc<rayon::ThreadPool>, pool_name: &'static str) -> Arc<Scheduler> {
+        Self::new_inner(rayon_pool, pool_name).0
+    }
+
+    /// Like [`Self::new`], but also returns the actor task's `JoinHandle`, so
+    /// tests can await its termination.
+    #[cfg(test)]
+    fn new_with_handle(
+        rayon_pool: Arc<rayon::ThreadPool>,
+        pool_name: &'static str,
+    ) -> (Arc<Scheduler>, tokio::task::JoinHandle<()>) {
+        Self::new_inner(rayon_pool, pool_name)
+    }
+
+    fn new_inner(
+        rayon_pool: Arc<rayon::ThreadPool>,
+        pool_name: &'static str,
+    ) -> (Arc<Scheduler>, tokio::task::JoinHandle<()>) {
         let num_threads = rayon_pool.current_num_threads();
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = SchedulerActor {
             rayon_pool: rayon_pool.clone(),
             num_threads,
-            tx: tx.clone(),
+            tx: tx.downgrade(),
             high_priority_queue: VecDeque::new(),
             queries: HashMap::new(),
             running_count: 0,
+            pool_name,
         };
-        tokio::spawn(actor.run(rx));
-        Arc::new(Scheduler {
+        let handle = tokio::spawn(actor.run(rx));
+        let scheduler = Arc::new(Scheduler {
             #[cfg(test)]
             rayon_pool,
             tx,
-        })
+            pool_name,
+        });
+        (scheduler, handle)
     }
 
     /// Registers a new query on the scheduler's state. Must be called exactly
@@ -214,6 +236,7 @@ impl Scheduler {
                 scheduler: self.clone(),
                 query_id,
                 waiting_for_permit: true,
+                pool_name: self.pool_name,
             })
             .collect()
     }
@@ -229,7 +252,7 @@ impl Scheduler {
     /// already have been [`Self::register_query`]-ed.
     fn enqueue_fair<F>(self: &Arc<Self>, query_id: QueryId, job: F)
     where F: FnOnce() + Send + 'static {
-        let tx = self.tx.clone();
+        let tx = self.tx.downgrade();
         let wrapped: Job = Box::new(move || {
             let _running_guard = RunningCountGuard { tx, query_id };
             job();
@@ -249,26 +272,32 @@ impl Scheduler {
 /// panics), even if the job itself panics -- embedded into the job closure
 /// by [`Scheduler::enqueue_fair`], at enqueue time.
 struct RunningCountGuard {
-    tx: mpsc::UnboundedSender<ActorMessage>,
+    tx: mpsc::WeakUnboundedSender<ActorMessage>,
     query_id: QueryId,
 }
 
 impl Drop for RunningCountGuard {
     fn drop(&mut self) {
-        let _ = self.tx.send(ActorMessage::QueryTaskFinished(self.query_id));
+        if let Some(tx) = self.tx.upgrade() {
+            let _ = tx.send(ActorMessage::QueryTaskFinished(self.query_id));
+        }
     }
 }
 
 /// Frees up the rayon slot `SchedulerActor::fill_capacity` accounted for,
 /// once the task completes (or panics) -- wrapped around every job (of any
 /// kind) right before it's actually dispatched to rayon.
+///
+/// Holds a weak sender, for the same reason as [`RunningCountGuard`].
 struct CapacityFreedGuard {
-    tx: mpsc::UnboundedSender<ActorMessage>,
+    tx: mpsc::WeakUnboundedSender<ActorMessage>,
 }
 
 impl Drop for CapacityFreedGuard {
     fn drop(&mut self) {
-        let _ = self.tx.send(ActorMessage::CapacityFreed);
+        if let Some(tx) = self.tx.upgrade() {
+            let _ = tx.send(ActorMessage::CapacityFreed);
+        }
     }
 }
 
@@ -287,14 +316,16 @@ struct SchedulerActor {
     rayon_pool: Arc<rayon::ThreadPool>,
     num_threads: usize,
     /// Cloned into every dispatched job's [`CapacityFreedGuard`] (and every
-    /// enqueued fair job's [`RunningCountGuard`]) so they can report back.
-    tx: mpsc::UnboundedSender<ActorMessage>,
+    /// enqueued fair job's [`RunningCountGuard`]) so they can report back. Weak
+    /// handle to let the actor stop once the scheduler is dropped.
+    tx: mpsc::WeakUnboundedSender<ActorMessage>,
     /// Always-first, uncapped tasks (e.g. finalize/root_merge).
     high_priority_queue: VecDeque<Job>,
     /// Per-query "fairly" scheduled tasks.
     queries: HashMap<QueryId, QueryState>,
     /// Number of tasks currently dispatched to rayon (<=num_threads).
     running_count: usize,
+    pool_name: &'static str,
 }
 
 impl SchedulerActor {
@@ -303,6 +334,7 @@ impl SchedulerActor {
             self.handle(message);
             self.fill_capacity();
         }
+        info!(pool_name = self.pool_name, "scheduler actor stopped");
     }
 
     fn handle(&mut self, message: ActorMessage) {
@@ -453,7 +485,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        Scheduler::new(rayon_pool)
+        Scheduler::new(rayon_pool, "test")
     }
 
     // Polls until `condition` is true or the timeout elapses, to avoid flaky
@@ -633,6 +665,8 @@ mod tests {
 
         let concurrent_1 = Arc::new(AtomicUsize::new(0));
         let max_concurrent_1 = Arc::new(AtomicUsize::new(0));
+        let blocker_1 = Arc::new(StdMutex::new(()));
+        let _blocker_1_guard = blocker_1.lock().unwrap();
         let (release_tx_2, release_rx_2) = std::sync::mpsc::channel::<()>();
         let release_rx_2 = Arc::new(StdMutex::new(release_rx_2));
         let mut tasks1 = Vec::new();
@@ -644,12 +678,13 @@ mod tests {
         for _ in 0..10 {
             let concurrent_1 = concurrent_1.clone();
             let max_concurrent_1 = max_concurrent_1.clone();
+            let blocker_1 = blocker_1.clone();
             tasks1.push(guards1[0].run_cpu_intensive_fair(
                 move || {
                     let current = concurrent_1.fetch_add(1, Ordering::SeqCst) + 1;
                     max_concurrent_1.fetch_max(current, Ordering::SeqCst);
-                    std::thread::sleep(Duration::MAX);
-                    concurrent_1.fetch_sub(1, Ordering::SeqCst);
+                    // tasks for query 1 remain blocked until the end of the test
+                    let _unused = blocker_1.lock().unwrap();
                 },
                 "test",
                 "test",
@@ -805,5 +840,26 @@ mod tests {
         let guards = scheduler.register_query(0);
         assert!(guards.is_empty());
         assert!(scheduler.debug_state().await.registered_queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_actor_stops_once_scheduler_and_guards_are_dropped() {
+        let rayon_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let (scheduler, handle) = Scheduler::new_with_handle(rayon_pool, "test");
+        let guards = scheduler.register_query(1);
+
+        drop(scheduler);
+        // A guard (holding its own `Arc<Scheduler>` clone) is still alive, so
+        // the actor must not have stopped yet.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!handle.is_finished());
+
+        drop(guards);
+        handle.await.expect("scheduler actor task should not panic");
     }
 }
