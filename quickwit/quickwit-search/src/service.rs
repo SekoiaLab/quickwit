@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use quickwit_common::thread_pool::SearchThreadPool;
 use quickwit_common::uri::Uri;
 use quickwit_config::SearcherConfig;
 use quickwit_doc_mapper::DocMapper;
@@ -298,6 +299,7 @@ impl SearchService for SearchServiceImpl {
             list_fields_req,
             &self.cluster_client,
             self.metastore.clone(),
+            &self.searcher_context,
         )
         .await
     }
@@ -425,6 +427,8 @@ pub struct SearcherContext {
     pub list_fields_cache: ListFieldsCache,
     /// The aggregation limits are passed to limit the memory usage.
     pub aggregation_limit: AggregationLimitsGuard,
+    /// Per-query fair-share priority scheduler for CPU-intensive search tasks.
+    pub search_thread_pool: SearchThreadPool,
 }
 
 impl std::fmt::Debug for SearcherContext {
@@ -470,6 +474,8 @@ impl SearcherContext {
             Some(searcher_config.aggregation_memory_limit.as_u64()),
             Some(searcher_config.aggregation_bucket_limit),
         );
+        let search_thread_pool =
+            SearchThreadPool::new("search", crate::compute_search_thread_pool_num_threads());
 
         Self {
             searcher_config,
@@ -481,6 +487,7 @@ impl SearcherContext {
             list_fields_cache,
             split_cache_opt,
             aggregation_limit,
+            search_thread_pool,
         }
     }
 

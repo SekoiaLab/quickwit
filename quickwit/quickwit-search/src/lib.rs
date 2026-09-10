@@ -49,7 +49,6 @@ mod tests;
 
 pub use collector::QuickwitAggregations;
 use metrics::SEARCH_METRICS;
-use quickwit_common::thread_pool::ThreadPool;
 use quickwit_common::tower::Pool;
 use quickwit_doc_mapper::DocMapper;
 use quickwit_proto::metastore::{
@@ -62,7 +61,7 @@ use tracing::{info, warn};
 pub type Result<T> = std::result::Result<T, SearchError>;
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub use find_trace_ids_collector::{FindTraceIdsCollector, Span};
 use quickwit_config::SearcherConfig;
@@ -107,7 +106,7 @@ pub type SearcherPool = Pool<SocketAddr, SearchServiceClient>;
 /// - the `QW_SEARCH_THREAD_POOL_NUM_CPUS` environment variable, if set
 /// - all available CPUs, if `QW_SEARCH_THREAD_POOL_USE_ALL_CPUS` is set to true
 /// - all available CPUs but one, otherwise
-fn compute_search_thread_pool_num_threads() -> Option<usize> {
+pub(crate) fn compute_search_thread_pool_num_threads() -> Option<usize> {
     if let Some(num_cpus) =
         quickwit_common::get_from_env_opt::<usize>("QW_SEARCH_THREAD_POOL_NUM_CPUS", false)
     {
@@ -130,13 +129,6 @@ fn compute_search_thread_pool_num_threads() -> Option<usize> {
     let threads = usize::max(quickwit_common::num_cpus().saturating_sub(1), 1);
     info!(threads, "search thread pool configured with one free CPU");
     Some(threads)
-}
-
-fn search_thread_pool() -> &'static ThreadPool {
-    static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
-
-    SEARCH_THREAD_POOL
-        .get_or_init(|| ThreadPool::new("search", compute_search_thread_pool_num_threads()))
 }
 
 #[cfg(test)]
@@ -511,16 +503,30 @@ pub(crate) fn merge_splits_by_outcome(
     acc_opt: &mut Option<SplitsByOutcome>,
 ) {
     if let Some(new) = new_opt {
+        // Destructure to ensure all fields are accounted for.
+        let SplitsByOutcome {
+            cancel_warmup_queue,
+            pruned_before_warmup,
+            pruned_after_warmup,
+            cancel_before_warmup,
+            cancel_warmup,
+            cancel_cpu_queue,
+            cancel_cpu,
+            processed,
+            processed_from_metadata,
+            cache_hit,
+        } = new;
         if let Some(acc) = acc_opt {
-            acc.pruned_before_warmup += new.pruned_before_warmup;
-            acc.pruned_after_warmup += new.pruned_after_warmup;
-            acc.cancel_before_warmup += new.cancel_before_warmup;
-            acc.cancel_warmup += new.cancel_warmup;
-            acc.cancel_cpu_queue += new.cancel_cpu_queue;
-            acc.cancel_cpu += new.cancel_cpu;
-            acc.processed += new.processed;
-            acc.processed_from_metadata += new.processed_from_metadata;
-            acc.cache_hit += new.cache_hit;
+            acc.cancel_warmup_queue += cancel_warmup_queue;
+            acc.pruned_before_warmup += pruned_before_warmup;
+            acc.pruned_after_warmup += pruned_after_warmup;
+            acc.cancel_before_warmup += cancel_before_warmup;
+            acc.cancel_warmup += cancel_warmup;
+            acc.cancel_cpu_queue += cancel_cpu_queue;
+            acc.cancel_cpu += cancel_cpu;
+            acc.processed += processed;
+            acc.processed_from_metadata += processed_from_metadata;
+            acc.cache_hit += cache_hit;
         } else {
             *acc_opt = Some(new);
         }
