@@ -34,8 +34,8 @@
 //!   dispatched by rayon on an equal footing with the scheduler's own tasks.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
@@ -44,6 +44,17 @@ use tracing::{error, info};
 use crate::rate_limited_error;
 use crate::thread_pool::Panicked;
 use crate::thread_pool::metrics::SCHEDULER_METRICS;
+
+/// Number of tasks dispatched to rayon on top of the pool's thread count.
+///
+/// A worker that just finished a task would otherwise have to wait for a full
+/// actor round-trip (completion message -> actor wake-up -> spawn) before
+/// getting a new one. Keeping a few extra jobs staged in rayon's injector
+/// hides that latency, at the cost of dispatching a few tasks slightly before
+/// the priority queue has its final say on them.
+static OVERSUBSCRIPTION: LazyLock<usize> = LazyLock::new(|| {
+    crate::get_from_env("QW_THREAD_POOL_SCHEDULER_OVERSUBSCRIPTION", 0usize, false)
+});
 
 /// Identifies a leaf search query for tasks that need to be fair-shared accross
 /// queries. Must be unique among currently active queries.
@@ -176,28 +187,30 @@ impl Scheduler {
     /// Spawns a scheduler actor onto the current Tokio runtime. Must therefore
     /// be called from within one.
     pub fn new(rayon_pool: Arc<rayon::ThreadPool>, pool_name: &'static str) -> Arc<Scheduler> {
-        Self::new_inner(rayon_pool, pool_name).0
+        Self::new_inner(rayon_pool, pool_name, *OVERSUBSCRIPTION).0
     }
 
-    /// Like [`Self::new`], but also returns the actor task's `JoinHandle`, so
-    /// tests can await its termination.
+    /// Like [`Self::new`], but more configurable, allowing an explicit
+    /// oversubscription to be set and the join handle to be awaited.
     #[cfg(test)]
-    fn new_with_handle(
+    fn new_for_test(
         rayon_pool: Arc<rayon::ThreadPool>,
         pool_name: &'static str,
+        oversubscription: usize,
     ) -> (Arc<Scheduler>, tokio::task::JoinHandle<()>) {
-        Self::new_inner(rayon_pool, pool_name)
+        Self::new_inner(rayon_pool, pool_name, oversubscription)
     }
 
     fn new_inner(
         rayon_pool: Arc<rayon::ThreadPool>,
         pool_name: &'static str,
+        oversubscription: usize,
     ) -> (Arc<Scheduler>, tokio::task::JoinHandle<()>) {
         let num_threads = rayon_pool.current_num_threads();
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = SchedulerActor {
             rayon_pool: rayon_pool.clone(),
-            num_threads,
+            dispatch_cap: num_threads + oversubscription,
             tx: tx.downgrade(),
             high_priority_queue: VecDeque::new(),
             queries: HashMap::new(),
@@ -312,7 +325,8 @@ struct DebugState {
 /// needs no lock.
 struct SchedulerActor {
     rayon_pool: Arc<rayon::ThreadPool>,
-    num_threads: usize,
+    /// Number of rayon threads plus the configured [`OVERSUBSCRIPTION`].
+    dispatch_cap: usize,
     /// Cloned into every dispatched job's [`CapacityFreedGuard`] (and every
     /// enqueued fair job's [`RunningCountGuard`]) so they can report back. Weak
     /// handle to let the actor stop once the scheduler is dropped.
@@ -321,7 +335,7 @@ struct SchedulerActor {
     high_priority_queue: VecDeque<Job>,
     /// Per-query "fairly" scheduled tasks.
     queries: HashMap<QueryId, QueryState>,
-    /// Number of tasks currently dispatched to rayon (<=num_threads).
+    /// Number of tasks currently dispatched to rayon (<=dispatch_cap).
     running_count: usize,
     pool_name: &'static str,
 }
@@ -421,7 +435,7 @@ impl SchedulerActor {
             .values()
             .filter(|query| !query.ready.is_empty())
             .count();
-        self.num_threads.div_ceil(competing_queries.max(1))
+        self.dispatch_cap.div_ceil(competing_queries.max(1))
     }
 
     /// Pops the single highest-priority ready and eligible task, if any,
@@ -445,12 +459,12 @@ impl SchedulerActor {
         Some(job)
     }
 
-    /// Tops up the number of tasks dispatched to rayon to `num_threads`,
+    /// Tops up the number of tasks dispatched to rayon to `dispatch_cap`,
     /// dispatching the highest-priority ready task(s) directly -- called
     /// after every handled message, since any of them could have made more
     /// capacity or work available.
     fn fill_capacity(&mut self) {
-        while self.running_count < self.num_threads {
+        while self.running_count < self.dispatch_cap {
             let Some(job) = self.pick_next() else {
                 break;
             };
@@ -478,13 +492,20 @@ mod tests {
     use super::*;
 
     fn test_scheduler(num_threads: usize) -> Arc<Scheduler> {
+        test_scheduler_with_oversubscription(num_threads, 0)
+    }
+
+    fn test_scheduler_with_oversubscription(
+        num_threads: usize,
+        oversubscription: usize,
+    ) -> Arc<Scheduler> {
         let rayon_pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(num_threads)
                 .build()
                 .unwrap(),
         );
-        Scheduler::new(rayon_pool, "test")
+        Scheduler::new_for_test(rayon_pool, "test", oversubscription).0
     }
 
     // Polls until `condition` is true or the timeout elapses, to avoid flaky
@@ -744,6 +765,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_oversubscription_stages_extra_jobs_in_rayons_queue() {
+        let scheduler = test_scheduler_with_oversubscription(1, 2);
+        let guards = scheduler.register_query(3);
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(StdMutex::new(release_rx));
+        let mut tasks = Vec::new();
+        for guard in &guards {
+            let release_rx = release_rx.clone();
+            tasks.push(guard.run_cpu_intensive_fair(
+                move || release_rx.lock().unwrap().recv().unwrap(),
+                "test",
+                "test",
+            ));
+        }
+
+        // The single worker can only run one of them, the two others sit in
+        // rayon's queue ready to be picked up the instant it frees up.
+        wait_until_debug_state(&scheduler, |debug_state| debug_state.running_count == 3).await;
+
+        for _ in 0..3 {
+            release_tx.send(()).unwrap();
+        }
+        join_all(tasks).await;
+    }
+
+    #[tokio::test]
     async fn test_query_state_cleaned_up_once_remaining_reaches_zero() {
         let scheduler = test_scheduler(2);
         let mut guards = scheduler.register_query(2);
@@ -849,7 +897,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let (scheduler, handle) = Scheduler::new_with_handle(rayon_pool, "test");
+        let (scheduler, handle) = Scheduler::new_for_test(rayon_pool, "test", 0);
         let guards = scheduler.register_query(1);
 
         drop(scheduler);
