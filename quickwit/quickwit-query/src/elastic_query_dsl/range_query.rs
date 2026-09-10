@@ -54,17 +54,24 @@ impl ConvertibleToQueryAst for RangeQuery {
             boost,
             format,
         } = self.value;
-        let (gt, gte, lt, lte) = if let Some(JsonLiteral::String(java_date_format)) = format {
-            let parser = StrptimeParser::from_java_datetime_format(&java_date_format)
-                .map_err(|err| anyhow::anyhow!("failed to parse range query date format. {err}"))?;
-            (
-                gt.map(|v| parse_and_convert(v, &parser)).transpose()?,
-                gte.map(|v| parse_and_convert(v, &parser)).transpose()?,
-                lt.map(|v| parse_and_convert(v, &parser)).transpose()?,
-                lte.map(|v| parse_and_convert(v, &parser)).transpose()?,
-            )
-        } else {
-            (gt, gte, lt, lte)
+        let (gt, gte, lt, lte) = match format {
+            Some(JsonLiteral::String(format))
+                if format == "epoch_millis" || format == "epoch_second" =>
+            {
+                (gt, gte, lt, lte)
+            }
+            Some(JsonLiteral::String(java_date_format)) => {
+                let parser = StrptimeParser::from_java_datetime_format(&java_date_format).map_err(
+                    |err| anyhow::anyhow!("failed to parse range query date format. {err}"),
+                )?;
+                (
+                    gt.map(|v| parse_and_convert(v, &parser)).transpose()?,
+                    gte.map(|v| parse_and_convert(v, &parser)).transpose()?,
+                    lt.map(|v| parse_and_convert(v, &parser)).transpose()?,
+                    lte.map(|v| parse_and_convert(v, &parser)).transpose()?,
+                )
+            }
+            _ => (gt, gte, lt, lte),
         };
 
         let range_query_ast = crate::query_ast::RangeQuery {
@@ -161,6 +168,61 @@ mod tests {
                 upper_bound: Bound::Included(upper_bound),
             })
             if field == "timestamp" && upper_bound == JsonLiteral::String("2024-09-28T10:22:55.797Z".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_date_range_query_with_epoch_millis_format() {
+        let range_query_params = ElasticRangeQueryParams {
+            gt: None,
+            gte: Some(JsonLiteral::Number(1779137992972i64.into())),
+            lt: Some(JsonLiteral::Number(1780495357572i64.into())),
+            lte: None,
+            boost: None,
+            format: JsonLiteral::String("epoch_millis".to_string()).into(),
+        };
+        let range_query: ElasticRangeQuery = ElasticRangeQuery {
+            field: "@timestamp".to_string(),
+            value: range_query_params,
+        };
+        let range_query_ast = range_query.convert_to_query_ast().unwrap();
+        assert!(matches!(
+            range_query_ast,
+            QueryAst::Range(RangeQuery {
+                field,
+                lower_bound: Bound::Included(lower_bound),
+                upper_bound: Bound::Excluded(upper_bound),
+            })
+            if field == "@timestamp"
+                && lower_bound == JsonLiteral::Number(1779137992972i64.into())
+                && upper_bound == JsonLiteral::Number(1780495357572i64.into())
+        ));
+    }
+
+    #[test]
+    fn test_date_range_query_with_epoch_second_format() {
+        let range_query_params = ElasticRangeQueryParams {
+            gt: None,
+            gte: Some(JsonLiteral::Number(1779137992i64.into())),
+            lt: None,
+            lte: None,
+            boost: None,
+            format: JsonLiteral::String("epoch_second".to_string()).into(),
+        };
+        let range_query: ElasticRangeQuery = ElasticRangeQuery {
+            field: "@timestamp".to_string(),
+            value: range_query_params,
+        };
+        let range_query_ast = range_query.convert_to_query_ast().unwrap();
+        assert!(matches!(
+            range_query_ast,
+            QueryAst::Range(RangeQuery {
+                field,
+                lower_bound: Bound::Included(lower_bound),
+                upper_bound: Bound::Unbounded,
+            })
+            if field == "@timestamp"
+                && lower_bound == JsonLiteral::Number(1779137992i64.into())
         ));
     }
 }

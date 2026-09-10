@@ -73,9 +73,9 @@ pub use crate::metastore_config::{
     MetastoreBackend, MetastoreConfig, MetastoreConfigs, PostgresMetastoreConfig,
 };
 pub use crate::node_config::{
-    DEFAULT_QW_CONFIG_PATH, GrpcConfig, IndexerConfig, IngestApiConfig, JaegerConfig,
-    KeepAliveConfig, NodeConfig, RestConfig, SearcherConfig, SplitCacheLimits,
-    StorageTimeoutPolicy, TlsConfig,
+    CacheConfig, CachePolicy, DEFAULT_QW_CONFIG_PATH, GrpcConfig, IndexerConfig, IngestApiConfig,
+    JaegerConfig, KeepAliveConfig, NodeConfig, RestConfig, SearcherConfig, SplitCacheLimits,
+    StorageTimeoutPolicy, TlsConfig, VirtualCacheConfig,
 };
 use crate::source_config::serialize::{SourceConfigV0_7, SourceConfigV0_8, VersionedSourceConfig};
 pub use crate::storage_config::{
@@ -96,6 +96,12 @@ pub fn disable_ingest_v1() -> bool {
     static DISABLE_INGEST_V1: Lazy<bool> =
         Lazy::new(|| get_bool_from_env("QW_DISABLE_INGEST_V1", false));
     *DISABLE_INGEST_V1
+}
+
+pub fn is_delete_task_service_disabled() -> bool {
+    static DISABLE_DELETE_TASK_SERVICE_ENV: Lazy<bool> =
+        Lazy::new(|| get_bool_from_env("QW_DISABLE_DELETE_TASK_SERVICE", false));
+    *DISABLE_DELETE_TASK_SERVICE_ENV
 }
 
 #[derive(utoipa::OpenApi)]

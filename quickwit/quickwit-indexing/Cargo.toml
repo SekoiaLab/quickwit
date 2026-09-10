@@ -19,6 +19,8 @@ aws-sdk-kinesis = { workspace = true, optional = true }
 aws-sdk-sqs = { workspace = true, optional = true }
 bytes = { workspace = true }
 bytesize = { workspace = true }
+chrono = { workspace = true }
+cron = { workspace = true }
 fail = { workspace = true }
 flume = { workspace = true }
 fnv = { workspace = true }

@@ -2718,11 +2718,11 @@ mod tests {
                     num_hits: 2,
                     hits: vec![],
                     elapsed_time_micros: 100,
-                    errors: Vec::new(),
                     aggregation_postcard: Some(aggregation_postcard),
                     scroll_id: None,
                     failed_splits: Vec::new(),
                     num_successful_splits: 1,
+                    splits_by_outcome: None,
                 })
             });
 

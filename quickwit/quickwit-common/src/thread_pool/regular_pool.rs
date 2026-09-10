@@ -15,23 +15,22 @@
 use std::fmt;
 use std::sync::Arc;
 
-use futures::{Future, TryFutureExt};
-use once_cell::sync::Lazy;
-use prometheus::IntGauge;
-use tokio::sync::oneshot;
+use futures::Future;
 use tracing::error;
 
-use crate::metrics::{GaugeGuard, IntGaugeVec, OwnedGaugeGuard, new_gauge_vec};
+use super::ThreadPoolTaskInstrumentation;
 
 /// An executor backed by a thread pool to run CPU-intensive tasks.
 ///
-/// tokio::spawn_blocking should only used for IO-bound tasks, as it has not limit on its
-/// thread count.
+/// tokio::spawn_blocking should only be used for IO-bound tasks, as it has not
+/// limit on its thread count.
+///
+/// Unlike [`super::SearchThreadPool`], dispatches FIFO straight onto the raw
+/// rayon pool, with no per-query priority/fairness layer.
 #[derive(Clone)]
 pub struct ThreadPool {
-    thread_pool: Arc<rayon::ThreadPool>,
-    ongoing_tasks: IntGauge,
-    pending_tasks: IntGauge,
+    pub(super) rayon_pool: Arc<rayon::ThreadPool>,
+    pub(super) name: &'static str,
 }
 
 impl ThreadPool {
@@ -39,25 +38,36 @@ impl ThreadPool {
         let mut rayon_pool_builder = rayon::ThreadPoolBuilder::new()
             .thread_name(move |thread_id| format!("quickwit-{name}-{thread_id}"))
             .panic_handler(move |_my_panic| {
-                error!("task running in the quickwit {name} thread pool panicked");
+                error!(pool_name = name, "task running in the thread pool panicked");
             });
         if let Some(num_threads) = num_threads_opt {
             rayon_pool_builder = rayon_pool_builder.num_threads(num_threads);
         }
-        let thread_pool = rayon_pool_builder
+        let rayon_pool = rayon_pool_builder
             .build()
             .expect("failed to spawn thread pool");
-        let ongoing_tasks = THREAD_POOL_METRICS.ongoing_tasks.with_label_values([name]);
-        let pending_tasks = THREAD_POOL_METRICS.pending_tasks.with_label_values([name]);
         ThreadPool {
-            thread_pool: Arc::new(thread_pool),
-            ongoing_tasks,
-            pending_tasks,
+            rayon_pool: Arc::new(rayon_pool),
+            name,
         }
     }
 
-    pub fn get_underlying_rayon_thread_pool(&self) -> Arc<rayon::ThreadPool> {
-        self.thread_pool.clone()
+    /// Returns a Tantivy [`tantivy::Executor`] backed by this thread pool.
+    ///
+    /// Tasks that Tantivy schedules through it are tracked by metrics.
+    pub fn get_executor(
+        &self,
+        caller: &'static str,
+        cost_class: &'static str,
+    ) -> tantivy::Executor {
+        tantivy::Executor::InstrumentedThreadPool(
+            self.rayon_pool.clone(),
+            Arc::new(ThreadPoolTaskInstrumentation {
+                pool_name: self.name,
+                caller,
+                cost_class,
+            }),
+        )
     }
 
     /// Function similar to `tokio::spawn_blocking`.
@@ -78,29 +88,16 @@ impl ThreadPool {
     pub fn run_cpu_intensive<F, R>(
         &self,
         cpu_intensive_fn: F,
+        caller: &'static str,
+        cost_class: &'static str,
     ) -> impl Future<Output = Result<R, Panicked>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let span = tracing::Span::current();
-        let ongoing_tasks = self.ongoing_tasks.clone();
-        let mut pending_tasks_guard: OwnedGaugeGuard =
-            OwnedGaugeGuard::from_gauge(self.pending_tasks.clone());
-        pending_tasks_guard.add(1i64);
-        let (tx, rx) = oneshot::channel();
-        self.thread_pool.spawn(move || {
-            drop(pending_tasks_guard);
-            if tx.is_closed() {
-                return;
-            }
-            let _guard = span.enter();
-            let mut ongoing_task_guard = GaugeGuard::from_gauge(&ongoing_tasks);
-            ongoing_task_guard.add(1i64);
-            let result = cpu_intensive_fn();
-            let _ = tx.send(result);
-        });
-        rx.map_err(|_| Panicked)
+        super::spawn_traced(self.name, caller, cost_class, cpu_intensive_fn, |job| {
+            self.rayon_pool.spawn(job)
+        })
     }
 }
 
@@ -123,7 +120,7 @@ where
             let num_threads: usize = (crate::num_cpus() / 3).max(2);
             ThreadPool::new("small_tasks", Some(num_threads))
         })
-        .run_cpu_intensive(cpu_intensive_fn)
+        .run_cpu_intensive(cpu_intensive_fn, "unknown", "NA")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,34 +133,6 @@ impl fmt::Display for Panicked {
 }
 
 impl std::error::Error for Panicked {}
-
-struct ThreadPoolMetrics {
-    ongoing_tasks: IntGaugeVec<1>,
-    pending_tasks: IntGaugeVec<1>,
-}
-
-impl Default for ThreadPoolMetrics {
-    fn default() -> Self {
-        ThreadPoolMetrics {
-            ongoing_tasks: new_gauge_vec(
-                "ongoing_tasks",
-                "number of tasks being currently processed by threads in the thread pool",
-                "thread_pool",
-                &[],
-                ["pool"],
-            ),
-            pending_tasks: new_gauge_vec(
-                "pending_tasks",
-                "number of tasks waiting in the queue before being processed by the thread pool",
-                "thread_pool",
-                &[],
-                ["pool"],
-            ),
-        }
-    }
-}
-
-static THREAD_POOL_METRICS: Lazy<ThreadPoolMetrics> = Lazy::new(ThreadPoolMetrics::default);
 
 #[cfg(test)]
 mod tests {

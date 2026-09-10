@@ -42,12 +42,13 @@ use quickwit_config::IndexTemplate;
 use quickwit_proto::metastore::{
     AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, CreateIndexRequest,
     CreateIndexResponse, CreateIndexTemplateRequest, DeleteIndexRequest,
-    DeleteIndexTemplatesRequest, DeleteQuery, DeleteShardsRequest, DeleteShardsResponse,
-    DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse, EntityKind,
-    FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse, GetClusterIdentityRequest,
-    GetClusterIdentityResponse, GetIndexTemplateRequest, GetIndexTemplateResponse,
-    IndexMetadataFailure, IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse,
-    IndexTemplateMatch, IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
+    DeleteIndexTemplatesRequest, DeleteKvRequest, DeleteQuery, DeleteShardsRequest,
+    DeleteShardsResponse, DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse,
+    EntityKind, FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse,
+    GetClusterIdentityRequest, GetClusterIdentityResponse, GetIndexTemplateRequest,
+    GetIndexTemplateResponse, GetKvRequest, GetKvResponse, IndexMetadataFailure,
+    IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse, IndexTemplateMatch,
+    IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
     LastDeleteOpstampResponse, ListDeleteTasksRequest, ListDeleteTasksResponse,
     ListIndexStatsRequest, ListIndexStatsResponse, ListIndexTemplatesRequest,
     ListIndexTemplatesResponse, ListIndexesMetadataRequest, ListIndexesMetadataResponse,
@@ -55,8 +56,9 @@ use quickwit_proto::metastore::{
     ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreError, MetastoreResult,
     MetastoreService, MetastoreServiceStream, OpenShardSubrequest, OpenShardsRequest,
     OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest, ResetSourceCheckpointRequest,
-    StageSplitsRequest, ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest,
-    UpdateSplitsDeleteOpstampRequest, UpdateSplitsDeleteOpstampResponse, serde_utils,
+    SetKvRequest, SoftDeleteDocumentsRequest, SoftDeleteDocumentsResponse, StageSplitsRequest,
+    ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest,
+    UpdateSplitsDeleteOpstampResponse, serde_utils,
 };
 use quickwit_proto::types::{IndexId, IndexUid};
 use quickwit_storage::Storage;
@@ -729,6 +731,23 @@ impl MetastoreService for FileBackedMetastore {
         Ok(EmptyResponse {})
     }
 
+    async fn soft_delete_documents(
+        &self,
+        request: SoftDeleteDocumentsRequest,
+    ) -> MetastoreResult<SoftDeleteDocumentsResponse> {
+        let index_uid = request.index_uid().clone();
+        let num_soft_deleted_doc_ids = self
+            .mutate(&index_uid, |index| {
+                let num_soft_deleted_doc_ids =
+                    index.soft_delete_documents(&request.split_doc_ids)?;
+                Ok(MutationOccurred::Yes(num_soft_deleted_doc_ids))
+            })
+            .await?;
+        Ok(SoftDeleteDocumentsResponse {
+            num_soft_deleted_doc_ids,
+        })
+    }
+
     async fn add_source(&self, request: AddSourceRequest) -> MetastoreResult<EmptyResponse> {
         let source_config = request.deserialize_source_config()?;
         let index_uid = request.index_uid();
@@ -1274,6 +1293,43 @@ impl MetastoreService for FileBackedMetastore {
         Ok(GetClusterIdentityResponse {
             uuid: state_wlock_guard.identity.hyphenated().to_string(),
         })
+    }
+
+    // KV store API
+
+    async fn get_kv(&self, request: GetKvRequest) -> MetastoreResult<GetKvResponse> {
+        let state = self.state.read().await;
+        let value = state.kv_store.get(&request.key).cloned();
+        Ok(GetKvResponse { value })
+    }
+
+    async fn set_kv(&self, request: SetKvRequest) -> MetastoreResult<EmptyResponse> {
+        let mut state = self.state.write().await;
+        let previous_value = state.kv_store.insert(request.key.clone(), request.value);
+        let manifest = state.as_manifest();
+        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
+            // Rollback
+            match previous_value {
+                Some(value) => state.kv_store.insert(request.key, value),
+                None => state.kv_store.remove(&request.key),
+            };
+            return Err(error);
+        }
+        Ok(EmptyResponse {})
+    }
+
+    async fn delete_kv(&self, request: DeleteKvRequest) -> MetastoreResult<EmptyResponse> {
+        let mut state = self.state.write().await;
+        let previous_value = state.kv_store.remove(&request.key);
+        let manifest = state.as_manifest();
+        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
+            // Rollback
+            if let Some(value) = previous_value {
+                state.kv_store.insert(request.key, value);
+            }
+            return Err(error);
+        }
+        Ok(EmptyResponse {})
     }
 }
 
