@@ -461,6 +461,27 @@ pub async fn serve_quickwit(
     shutdown_signal: BoxFutureInfaillible<()>,
     env_filter_reload_fn: EnvFilterReloadFn,
 ) -> anyhow::Result<HashMap<String, ActorExitStatus>> {
+    // Opening the split footer cache costs one stat syscall per cached entry, i.e. a few hundred
+    // milliseconds for a large cache. It only depends on the node config, so it is started right
+    // away and awaited just before the searcher context is built: the scan then runs behind the
+    // cluster and metastore connection setup instead of delaying the node startup.
+    let split_footer_disk_cache_handle_opt = node_config
+        .searcher_config
+        .split_footer_disk_cache_capacity
+        .map(|capacity| {
+            let root_path = node_config
+                .data_dir_path
+                .join("searcher-split-footer-cache");
+            spawn_named_task(
+                DiskSizedCache::<String>::open(
+                    root_path,
+                    capacity.as_u64(),
+                    &quickwit_storage::STORAGE_METRICS.split_footer_disk_cache,
+                ),
+                "open_split_footer_disk_cache",
+            )
+        });
+
     let cluster = start_cluster_service(&node_config)
         .await
         .context("failed to start cluster service")?;
@@ -658,27 +679,21 @@ pub async fn serve_quickwit(
             None
         };
 
-    let split_footer_disk_cache_opt: Option<DiskSizedCache<String>> = if let Some(capacity) =
-        node_config.searcher_config.split_footer_disk_cache_capacity
-    {
-        match DiskSizedCache::open(
-            node_config
-                .data_dir_path
-                .join("searcher-split-footer-cache"),
-            capacity.as_u64(),
-            &quickwit_storage::STORAGE_METRICS.split_footer_disk_cache,
-        )
-        .await
-        {
-            Ok(disk_cache) => Some(disk_cache),
-            Err(error) => {
-                error!(%error, "failed to open the persistent split footer cache, disabling it");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let split_footer_disk_cache_opt: Option<DiskSizedCache<String>> =
+        match split_footer_disk_cache_handle_opt {
+            Some(handle) => match handle.await {
+                Ok(Ok(disk_cache)) => Some(disk_cache),
+                Ok(Err(error)) => {
+                    error!(%error, "failed to open the persistent split footer cache, disabling it");
+                    None
+                }
+                Err(error) => {
+                    error!(%error, "the split footer cache opening task panicked, disabling it");
+                    None
+                }
+            },
+            None => None,
+        };
 
     let searcher_context = Arc::new(SearcherContext::new(
         node_config.searcher_config.clone(),
