@@ -373,22 +373,28 @@ impl SchedulerActor {
 
     fn handle(&mut self, message: ActorMessage) {
         match message {
-            ActorMessage::EnqueueFifo(job) => self.high_priority_queue.push_back(job),
-            ActorMessage::EnqueueFair(query_id, job) => match self.queries.get_mut(&query_id) {
-                Some(query) => query.ready.push_back(job),
-                None => {
-                    debug_assert!(
-                        false,
-                        "query must be registered before tasks are enqueued for it"
-                    );
-                    rate_limited_error!(
-                        limit_per_min = 1,
-                        ?query_id,
-                        "query not registered on the scheduler, fall back to FIFO"
-                    );
-                    self.high_priority_queue.push_back(job);
+            ActorMessage::EnqueueFifo(job) => {
+                self.observe_actor_lag(&job);
+                self.high_priority_queue.push_back(job)
+            }
+            ActorMessage::EnqueueFair(query_id, job) => {
+                self.observe_actor_lag(&job);
+                match self.queries.get_mut(&query_id) {
+                    Some(query) => query.ready.push_back(job),
+                    None => {
+                        debug_assert!(
+                            false,
+                            "query must be registered before tasks are enqueued for it"
+                        );
+                        rate_limited_error!(
+                            limit_per_min = 1,
+                            ?query_id,
+                            "query not registered on the scheduler, fall back to FIFO"
+                        );
+                        self.high_priority_queue.push_back(job);
+                    }
                 }
-            },
+            }
             ActorMessage::RegisterQuery {
                 query_id,
                 total_splits,
@@ -446,6 +452,15 @@ impl SchedulerActor {
                 });
             }
         }
+    }
+
+    /// How long this job waited between being submitted and the actor getting
+    /// round to it. The rest of its dispatch latency is time spent queued.
+    fn observe_actor_lag(&self, job: &QueuedJob) {
+        SCHEDULER_METRICS
+            .actor_lag_secs
+            .with_label_values([job.tier])
+            .observe(job.enqueued_at.elapsed().as_secs_f64());
     }
 
     /// The maximum number of concurrently running tasks any single query may

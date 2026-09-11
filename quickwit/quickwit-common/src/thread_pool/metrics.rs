@@ -24,6 +24,7 @@ pub(super) struct SchedulerMetrics {
     pub(super) queries: IntGauge,
     pub(super) dispatch_latency_secs: HistogramVec<1>,
     pub(super) rayon_pickup_latency_secs: Histogram,
+    pub(super) actor_lag_secs: HistogramVec<1>,
 }
 
 impl Default for SchedulerMetrics {
@@ -49,6 +50,16 @@ impl Default for SchedulerMetrics {
                 "amount of time between the scheduler actor spawning a task on rayon and a rayon \
                  worker starting to run it",
                 "thread_pool",
+                latency_buckets(),
+            ),
+            actor_lag_secs: new_histogram_vec(
+                "scheduler_actor_lag_secs",
+                "amount of time between a task being submitted to the CPU scheduler and the \
+                 scheduler actor receiving it. Subtract from dispatch_latency_secs on the same \
+                 tier to get the time the task then spent queued",
+                "thread_pool",
+                &[],
+                ["tier"],
                 latency_buckets(),
             ),
         }
