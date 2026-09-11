@@ -123,10 +123,21 @@ impl Drop for SchedulerSplitGuard {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+const TIER_FIFO: &str = "fifo";
+const TIER_FAIR: &str = "fair";
+
+/// A job waiting in one of the scheduler's queues, along with what's needed to
+/// attribute the time it spends there.
+struct QueuedJob {
+    job: Job,
+    enqueued_at: Instant,
+    tier: &'static str,
+}
+
 /// Per-query scheduling state, owned exclusively by the [`SchedulerActor`].
 struct QueryState {
     /// Tasks submitted for this query that have not yet been dispatched.
-    ready: VecDeque<Job>,
+    ready: VecDeque<QueuedJob>,
     /// Tasks currently executing on a rayon worker.
     running_count: usize,
     /// Number of this query's splits still waiting on a `SearchPermit`, not yet
@@ -151,8 +162,8 @@ impl QueryState {
 /// Messages accepted by the [`SchedulerActor`]. `Scheduler`'s public methods
 /// are thin, non-blocking wrappers that just send one of these.
 enum ActorMessage {
-    EnqueueFifo(Job),
-    EnqueueFair(QueryId, Job),
+    EnqueueFifo(QueuedJob),
+    EnqueueFair(QueryId, QueuedJob),
     RegisterQuery {
         query_id: QueryId,
         total_splits: usize,
@@ -257,7 +268,11 @@ impl Scheduler {
     /// Schedules a high priority task: always dispatched before any per-query
     /// task, and processed FIFO. Long tasks (>100ms) are not recommended.
     pub fn enqueue_fifo(self: &Arc<Self>, job: Job) {
-        let _ = self.tx.send(ActorMessage::EnqueueFifo(job));
+        let _ = self.tx.send(ActorMessage::EnqueueFifo(QueuedJob {
+            job,
+            enqueued_at: Instant::now(),
+            tier: TIER_FIFO,
+        }));
     }
 
     /// Schedules a task belonging to `query_id`. The query is expected to
@@ -268,7 +283,14 @@ impl Scheduler {
             let _running_guard = RunningCountGuard { tx, query_id };
             job();
         });
-        let _ = self.tx.send(ActorMessage::EnqueueFair(query_id, wrapped));
+        let queued_job = QueuedJob {
+            job: wrapped,
+            enqueued_at: Instant::now(),
+            tier: TIER_FAIR,
+        };
+        let _ = self
+            .tx
+            .send(ActorMessage::EnqueueFair(query_id, queued_job));
     }
 
     #[cfg(test)]
@@ -332,7 +354,7 @@ struct SchedulerActor {
     /// handle to let the actor stop once the scheduler is dropped.
     tx: mpsc::WeakUnboundedSender<ActorMessage>,
     /// Always-first, uncapped tasks (e.g. finalize/root_merge).
-    high_priority_queue: VecDeque<Job>,
+    high_priority_queue: VecDeque<QueuedJob>,
     /// Per-query "fairly" scheduled tasks.
     queries: HashMap<QueryId, QueryState>,
     /// Number of tasks currently dispatched to rayon (<=dispatch_cap).
@@ -440,7 +462,7 @@ impl SchedulerActor {
 
     /// Pops the single highest-priority ready and eligible task, if any,
     /// updating `running_count` for its owning query.
-    fn pick_next(&mut self) -> Option<Job> {
+    fn pick_next(&mut self) -> Option<QueuedJob> {
         if let Some(job) = self.high_priority_queue.pop_front() {
             return Some(job);
         }
@@ -465,12 +487,21 @@ impl SchedulerActor {
     /// capacity or work available.
     fn fill_capacity(&mut self) {
         while self.running_count < self.dispatch_cap {
-            let Some(job) = self.pick_next() else {
+            let Some(queued_job) = self.pick_next() else {
                 break;
             };
             self.running_count += 1;
+            SCHEDULER_METRICS
+                .dispatch_latency_secs
+                .with_label_values([queued_job.tier])
+                .observe(queued_job.enqueued_at.elapsed().as_secs_f64());
+            let QueuedJob { job, .. } = queued_job;
+            let spawned_at = Instant::now();
             let tx = self.tx.clone();
             self.rayon_pool.spawn(move || {
+                SCHEDULER_METRICS
+                    .rayon_pickup_latency_secs
+                    .observe(spawned_at.elapsed().as_secs_f64());
                 let _capacity_guard = CapacityFreedGuard { tx };
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
                     error!("task running in the thread pool scheduler panicked");
