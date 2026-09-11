@@ -59,8 +59,9 @@ impl SearchThreadPool {
         self.thread_pool.get_executor(caller, cost_class)
     }
 
-    /// Runs a CPU-intensive task ahead of any per-query fair-share task (see
-    /// [`super::scheduler`]'s high-priority queue). Meant for short, rare,
+    /// Runs a CPU-intensive task ahead of any per-query fair-share task: it is
+    /// handed to rayon straight away, without waiting for a scheduler slot (see
+    /// [`super::scheduler::Scheduler::enqueue_fifo`]). Meant for short, rare,
     /// one-shot work such as finalizing or merging a query's results, and for
     /// callers with no query to fair-share against at all.
     pub fn run_cpu_intensive<F, R>(

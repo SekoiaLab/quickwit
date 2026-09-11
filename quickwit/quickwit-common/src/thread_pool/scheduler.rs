@@ -15,26 +15,25 @@
 //! Priority scheduler sitting in front of a [`rayon::ThreadPool`].
 //!
 //! Rayon has no notion of task priority: it dispatches in whatever order tasks
-//! land in its own local deques / injector queue. This module keeps its own
+//! land in its own local deques / injector queue. This module keeps a per-query
 //! priority queue in a small async actor task, and only ever submits work to
 //! rayon one task at a time, directly via `rayon_pool.spawn`, whenever a slot
 //! is free. Since the actor itself never runs on a rayon worker, every job it
 //! submits lands in rayon's shared injector queue and competes fairly with
 //! tasks submitted directly to the same pool from outside the scheduler (e.g.
-//! Tantivy's own internal parallelism). Given that the actor doesn't submit
-//! more tasks than the number of threads, externally submitted tasks will
-//! effectively be processed right after any ongoing work.
+//! Tantivy's own internal parallelism).
 //!
 //! Three tiers of priority exist:
-//! - High priority: always runs first and processed in strict FIFO order. Meant for short and rarer
-//!   tasks such as merging/finalizing a query's results.
+//! - High priority: spawned on rayon immediately, without going through the actor or waiting for a
+//!   slot. Meant for the short and rare tasks that merge/finalize a query's results: they are far
+//!   too short to be worth queueing behind per-query work.
 //! - Per-query: tries to be fair among queries, with a bias towards queries that are closer to
-//!   completion.
+//!   completion. Capped at `num_threads + OVERSUBSCRIPTION` tasks in flight.
 //! - External: tasks submitted to the rayon threadpool without going through the scheduler are
 //!   dispatched by rayon on an equal footing with the scheduler's own tasks.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -123,15 +122,26 @@ impl Drop for SchedulerSplitGuard {
 
 type Job = Box<dyn FnOnce() + Send>;
 
-const TIER_FIFO: &str = "fifo";
-const TIER_FAIR: &str = "fair";
-
-/// A job waiting in one of the scheduler's queues, along with what's needed to
+/// A job waiting in the actor's per-query queues, along with what's needed to
 /// attribute the time it spends there.
 struct QueuedJob {
     job: Job,
     enqueued_at: Instant,
-    tier: &'static str,
+}
+
+/// Hands a job over to rayon. `capacity_guard` must already account for it in
+/// the shared running count.
+fn spawn_on_rayon(rayon_pool: &rayon::ThreadPool, job: Job, capacity_guard: CapacityFreedGuard) {
+    let spawned_at = Instant::now();
+    rayon_pool.spawn(move || {
+        SCHEDULER_METRICS
+            .rayon_pickup_latency_secs
+            .observe(spawned_at.elapsed().as_secs_f64());
+        let _capacity_guard = capacity_guard;
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+            error!("task running in the thread pool scheduler panicked");
+        }
+    });
 }
 
 /// Per-query scheduling state, owned exclusively by the [`SchedulerActor`].
@@ -162,7 +172,6 @@ impl QueryState {
 /// Messages accepted by the [`SchedulerActor`]. `Scheduler`'s public methods
 /// are thin, non-blocking wrappers that just send one of these.
 enum ActorMessage {
-    EnqueueFifo(QueuedJob),
     EnqueueFair(QueryId, QueuedJob),
     RegisterQuery {
         query_id: QueryId,
@@ -178,8 +187,8 @@ enum ActorMessage {
     },
     /// A per-query task finished (or panicked).
     QueryTaskFinished(QueryId),
-    /// Any task (high-priority or per-query) finished (or panicked), freeing
-    /// up a rayon slot.
+    /// Any task finished (or panicked), so the actor should try to dispatch
+    /// more. The count itself is already updated by [`CapacityFreedGuard`].
     CapacityFreed,
     #[cfg(test)]
     Introspect(tokio::sync::oneshot::Sender<DebugState>),
@@ -188,8 +197,10 @@ enum ActorMessage {
 /// A priority scheduler backed by a [`rayon::ThreadPool`]. See the module
 /// documentation for the overall design.
 pub struct Scheduler {
-    #[cfg(test)]
     rayon_pool: Arc<rayon::ThreadPool>,
+    /// Shared with the actor: high priority tasks are spawned straight from the
+    /// handle, so both sides need to account for them.
+    running_count: Arc<AtomicUsize>,
     tx: mpsc::UnboundedSender<ActorMessage>,
     pool_name: &'static str,
 }
@@ -219,19 +230,19 @@ impl Scheduler {
     ) -> (Arc<Scheduler>, tokio::task::JoinHandle<()>) {
         let num_threads = rayon_pool.current_num_threads();
         let (tx, rx) = mpsc::unbounded_channel();
+        let running_count = Arc::new(AtomicUsize::new(0));
         let actor = SchedulerActor {
             rayon_pool: rayon_pool.clone(),
             dispatch_cap: num_threads + oversubscription,
+            running_count: running_count.clone(),
             tx: tx.downgrade(),
-            high_priority_queue: VecDeque::new(),
             queries: HashMap::new(),
-            running_count: 0,
             pool_name,
         };
         let handle = tokio::spawn(actor.run(rx));
         let scheduler = Arc::new(Scheduler {
-            #[cfg(test)]
             rayon_pool,
+            running_count,
             tx,
             pool_name,
         });
@@ -265,14 +276,21 @@ impl Scheduler {
             .collect()
     }
 
-    /// Schedules a high priority task: always dispatched before any per-query
-    /// task, and processed FIFO. Long tasks (>100ms) are not recommended.
+    /// Schedules a high priority task: handed to rayon straight away, without
+    /// going through the actor and without waiting for a slot.
+    ///
+    /// These tasks are short (tens of microseconds) and rare enough that their
+    /// contribution to the pool's occupancy is negligible, whereas making them
+    /// queue behind per-query tasks -- which run for tens of milliseconds --
+    /// would cost them orders of magnitude more than they take to run. Long
+    /// tasks (>100ms) are therefore not acceptable here.
     pub fn enqueue_fifo(self: &Arc<Self>, job: Job) {
-        let _ = self.tx.send(ActorMessage::EnqueueFifo(QueuedJob {
-            job,
-            enqueued_at: Instant::now(),
-            tier: TIER_FIFO,
-        }));
+        self.running_count.fetch_add(1, Ordering::Relaxed);
+        let capacity_guard = CapacityFreedGuard {
+            tx: self.tx.downgrade(),
+            running_count: self.running_count.clone(),
+        };
+        spawn_on_rayon(&self.rayon_pool, job, capacity_guard);
     }
 
     /// Schedules a task belonging to `query_id`. The query is expected to
@@ -286,7 +304,6 @@ impl Scheduler {
         let queued_job = QueuedJob {
             job: wrapped,
             enqueued_at: Instant::now(),
-            tier: TIER_FAIR,
         };
         let _ = self
             .tx
@@ -317,17 +334,18 @@ impl Drop for RunningCountGuard {
     }
 }
 
-/// Frees up the rayon slot `SchedulerActor::fill_capacity` accounted for,
-/// once the task completes (or panics) -- wrapped around every job (of any
-/// kind) right before it's actually dispatched to rayon.
+/// Releases the rayon slot accounted for when the job was handed to rayon,
+/// once it completes (or panics), and nudges the actor to dispatch more.
 ///
 /// Holds a weak sender, for the same reason as [`RunningCountGuard`].
 struct CapacityFreedGuard {
     tx: mpsc::WeakUnboundedSender<ActorMessage>,
+    running_count: Arc<AtomicUsize>,
 }
 
 impl Drop for CapacityFreedGuard {
     fn drop(&mut self) {
+        self.running_count.fetch_sub(1, Ordering::Relaxed);
         if let Some(tx) = self.tx.upgrade() {
             let _ = tx.send(ActorMessage::CapacityFreed);
         }
@@ -349,16 +367,16 @@ struct SchedulerActor {
     rayon_pool: Arc<rayon::ThreadPool>,
     /// Number of rayon threads plus the configured [`OVERSUBSCRIPTION`].
     dispatch_cap: usize,
+    /// Number of tasks currently handed to rayon, including the high priority
+    /// ones spawned directly by [`Scheduler::enqueue_fifo`]. Only bounded by
+    /// `dispatch_cap` for the tasks the actor itself dispatches.
+    running_count: Arc<AtomicUsize>,
     /// Cloned into every dispatched job's [`CapacityFreedGuard`] (and every
     /// enqueued fair job's [`RunningCountGuard`]) so they can report back. Weak
     /// handle to let the actor stop once the scheduler is dropped.
     tx: mpsc::WeakUnboundedSender<ActorMessage>,
-    /// Always-first, uncapped tasks (e.g. finalize/root_merge).
-    high_priority_queue: VecDeque<QueuedJob>,
     /// Per-query "fairly" scheduled tasks.
     queries: HashMap<QueryId, QueryState>,
-    /// Number of tasks currently dispatched to rayon (<=dispatch_cap).
-    running_count: usize,
     pool_name: &'static str,
 }
 
@@ -373,12 +391,10 @@ impl SchedulerActor {
 
     fn handle(&mut self, message: ActorMessage) {
         match message {
-            ActorMessage::EnqueueFifo(job) => {
-                self.observe_actor_lag(&job);
-                self.high_priority_queue.push_back(job)
-            }
             ActorMessage::EnqueueFair(query_id, job) => {
-                self.observe_actor_lag(&job);
+                SCHEDULER_METRICS
+                    .actor_lag_secs
+                    .observe(job.enqueued_at.elapsed().as_secs_f64());
                 match self.queries.get_mut(&query_id) {
                     Some(query) => query.ready.push_back(job),
                     None => {
@@ -389,9 +405,9 @@ impl SchedulerActor {
                         rate_limited_error!(
                             limit_per_min = 1,
                             ?query_id,
-                            "query not registered on the scheduler, fall back to FIFO"
+                            "query not registered on the scheduler, running it right away"
                         );
-                        self.high_priority_queue.push_back(job);
+                        self.dispatch(job);
                     }
                 }
             }
@@ -436,13 +452,11 @@ impl SchedulerActor {
                     query.running_count = query.running_count.saturating_sub(1);
                 }
             }
-            ActorMessage::CapacityFreed => {
-                self.running_count = self.running_count.saturating_sub(1);
-            }
+            ActorMessage::CapacityFreed => {}
             #[cfg(test)]
             ActorMessage::Introspect(reply) => {
                 let _ = reply.send(DebugState {
-                    running_count: self.running_count,
+                    running_count: self.running_count.load(Ordering::Relaxed),
                     query_running_counts: self
                         .queries
                         .iter()
@@ -454,13 +468,18 @@ impl SchedulerActor {
         }
     }
 
-    /// How long this job waited between being submitted and the actor getting
-    /// round to it. The rest of its dispatch latency is time spent queued.
-    fn observe_actor_lag(&self, job: &QueuedJob) {
+    /// How long the actor took to pick up this job, before any time it then
+    /// spends queued. The rest of its dispatch latency is queue residency.
+    fn dispatch(&self, queued_job: QueuedJob) {
+        self.running_count.fetch_add(1, Ordering::Relaxed);
         SCHEDULER_METRICS
-            .actor_lag_secs
-            .with_label_values([job.tier])
-            .observe(job.enqueued_at.elapsed().as_secs_f64());
+            .dispatch_latency_secs
+            .observe(queued_job.enqueued_at.elapsed().as_secs_f64());
+        let capacity_guard = CapacityFreedGuard {
+            tx: self.tx.clone(),
+            running_count: self.running_count.clone(),
+        };
+        spawn_on_rayon(&self.rayon_pool, queued_job.job, capacity_guard);
     }
 
     /// The maximum number of concurrently running tasks any single query may
@@ -478,9 +497,6 @@ impl SchedulerActor {
     /// Pops the single highest-priority ready and eligible task, if any,
     /// updating `running_count` for its owning query.
     fn pick_next(&mut self) -> Option<QueuedJob> {
-        if let Some(job) = self.high_priority_queue.pop_front() {
-            return Some(job);
-        }
         let cap = self.current_cap();
         let query = self
             .queries
@@ -496,32 +512,16 @@ impl SchedulerActor {
         Some(job)
     }
 
-    /// Tops up the number of tasks dispatched to rayon to `dispatch_cap`,
-    /// dispatching the highest-priority ready task(s) directly -- called
+    /// Tops up the number of per-query tasks handed to rayon to
+    /// `dispatch_cap`, dispatching the highest-priority ready task(s) -- called
     /// after every handled message, since any of them could have made more
     /// capacity or work available.
     fn fill_capacity(&mut self) {
-        while self.running_count < self.dispatch_cap {
+        while self.running_count.load(Ordering::Relaxed) < self.dispatch_cap {
             let Some(queued_job) = self.pick_next() else {
                 break;
             };
-            self.running_count += 1;
-            SCHEDULER_METRICS
-                .dispatch_latency_secs
-                .with_label_values([queued_job.tier])
-                .observe(queued_job.enqueued_at.elapsed().as_secs_f64());
-            let QueuedJob { job, .. } = queued_job;
-            let spawned_at = Instant::now();
-            let tx = self.tx.clone();
-            self.rayon_pool.spawn(move || {
-                SCHEDULER_METRICS
-                    .rayon_pickup_latency_secs
-                    .observe(spawned_at.elapsed().as_secs_f64());
-                let _capacity_guard = CapacityFreedGuard { tx };
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
-                    error!("task running in the thread pool scheduler panicked");
-                }
-            });
+            self.dispatch(queued_job);
         }
     }
 }
@@ -582,14 +582,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_priority_runs_before_query_tasks() {
+    async fn test_fifo_is_dispatched_without_waiting_for_capacity() {
         let scheduler = test_scheduler(1);
-        let order: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
-
         let guards = scheduler.register_query(1);
 
-        // Step 1: Block the single worker so both tasks from step 2 stay in the
-        // queue.
+        // Step 1: saturate the scheduler. With a single thread and no
+        // oversubscription, `dispatch_cap` is 1.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let blocker = guards[0].run_cpu_intensive_fair(
             move || {
@@ -598,27 +596,20 @@ mod tests {
             "test",
             "test",
         );
+        wait_until_debug_state(&scheduler, |debug_state| debug_state.running_count == 1).await;
 
-        // Step 2: Add two tasks that remain queued by the scheduler
-        let order_clone = order.clone();
-        let query_task = guards[0].run_cpu_intensive_fair(
-            move || order_clone.lock().unwrap().push("query"),
-            "test",
-            "test",
-        );
-        let order_clone = order.clone();
-        scheduler.enqueue_fifo(Box::new(move || order_clone.lock().unwrap().push("fifo")));
+        // Step 2: a high priority task is handed to rayon straight away, even
+        // though the dispatch cap is already reached.
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
+        scheduler.enqueue_fifo(Box::new(move || ran_tx.send(()).unwrap()));
+        wait_until(|| scheduler.running_count.load(Ordering::SeqCst) == 2).await;
 
-        // Step 3: Release the blocked worker to validate that the priority
-        // queue is picked up first
+        // Step 3: it only has to wait for a free thread, not for a free slot.
         release_tx.send(()).unwrap();
-        wait_until(|| order.lock().unwrap().len() == 2).await;
-        assert_eq!(*order.lock().unwrap(), vec!["fifo", "query"]);
-
-        // Step 4: Ensure all tasks have completed successfully.
-        let (blocker_result, query_result) = tokio::join!(blocker, query_task);
-        blocker_result.unwrap();
-        query_result.unwrap();
+        ran_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("high priority task never ran");
+        blocker.await.unwrap();
     }
 
     #[tokio::test]
