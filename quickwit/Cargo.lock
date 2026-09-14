@@ -6618,6 +6618,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "itertools 0.14.0",
+ "libc",
  "once_cell",
  "pin-project",
  "pnet",

@@ -25,6 +25,52 @@ use crate::metrics::{
     exponential_buckets, new_gauge_vec, new_histogram_vec,
 };
 
+/// Nice increment applied to the threads of every [`ThreadPool`].
+///
+/// CPU-intensive work is expected to yield to the tokio runtime, which drives the
+/// IO and the request handling, so that a saturated thread pool does not delay the
+/// tasks that are on the critical path of a response.
+///
+/// Overridable with `QW_THREAD_POOL_NICE`. `0` disables the renicing altogether.
+const DEFAULT_THREAD_POOL_NICE: i32 = 10;
+
+const QW_THREAD_POOL_NICE_ENV_KEY: &str = "QW_THREAD_POOL_NICE";
+
+fn thread_pool_nice() -> i32 {
+    static NICE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *NICE.get_or_init(|| {
+        crate::get_from_env(
+            QW_THREAD_POOL_NICE_ENV_KEY,
+            DEFAULT_THREAD_POOL_NICE,
+            false,
+        )
+        .clamp(0, 19)
+    })
+}
+
+/// Lowers the scheduling priority of the calling thread.
+///
+/// On Linux the nice value is a per-thread attribute (unlike what POSIX mandates),
+/// so this only affects the worker thread it is called from. Lowering a priority
+/// never requires any capability, so this cannot fail for permission reasons.
+#[cfg(target_os = "linux")]
+fn renice_current_thread(nice: i32) {
+    if nice == 0 {
+        return;
+    }
+    // SAFETY: `setpriority` is thread-safe and `who = 0` designates the calling thread.
+    let return_code = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+    if return_code != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            nice, "failed to lower the priority of a thread pool worker"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn renice_current_thread(_nice: i32) {}
+
 /// An executor backed by a thread pool to run CPU-intensive tasks.
 ///
 /// tokio::spawn_blocking should only used for IO-bound tasks, as it has not limit on its
@@ -37,8 +83,10 @@ pub struct ThreadPool {
 
 impl ThreadPool {
     pub fn new(name: &'static str, num_threads_opt: Option<usize>) -> ThreadPool {
+        let nice = thread_pool_nice();
         let mut rayon_pool_builder = rayon::ThreadPoolBuilder::new()
             .thread_name(move |thread_id| format!("quickwit-{name}-{thread_id}"))
+            .start_handler(move |_thread_id| renice_current_thread(nice))
             .panic_handler(move |_my_panic| {
                 error!("task running in the quickwit {name} thread pool panicked");
             });
