@@ -138,7 +138,7 @@ impl QuickwitServiceGenerator {
     ) -> Self {
         let inner = Box::new(WithSuffixServiceGenerator::new(
             "Grpc",
-            tonic_build::configure().service_generator(),
+            tonic_prost_build::configure().service_generator(),
         ));
         Self {
             result_type_path,
@@ -832,7 +832,7 @@ fn generate_layer_stack_types_and_attributes(
             type #type_alias_name = quickwit_common::tower::BoxLayer<quickwit_common::tower::BoxService<#request_type, #response_type, #error_type>, #request_type, #response_type, #error_type>;
         };
         let attribute = quote! {
-            #attribute_name: Vec<#type_alias_name>,
+            pub #attribute_name: Vec<#type_alias_name>,
         };
         type_aliases.extend(type_alias);
         attributes.extend(attribute);

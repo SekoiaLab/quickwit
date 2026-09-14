@@ -14,6 +14,7 @@
 
 pub(crate) mod serialize;
 
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
@@ -26,6 +27,7 @@ use chrono::Utc;
 use cron::Schedule;
 use humantime::parse_duration;
 use quickwit_common::uri::Uri;
+use quickwit_common::{is_true, true_fn};
 use quickwit_doc_mapper::{DocMapper, DocMapperBuilder, DocMapping};
 use quickwit_proto::types::IndexId;
 use serde::{Deserialize, Serialize};
@@ -170,6 +172,16 @@ pub struct IngestSettings {
     #[schema(default = 1, value_type = usize)]
     #[serde(default = "IngestSettings::default_min_shards")]
     pub min_shards: NonZeroUsize,
+    /// Whether to validate documents against the current doc mapping during ingestion.
+    /// Defaults to true. When false, documents will be written directly to the WAL without
+    /// validation, but might still be rejected during indexing when applying the doc mapping
+    /// in the doc processor, in that case the documents are dropped and a warning is logged.
+    ///
+    /// Note that when a source has a VRL transform configured, documents are not validated against
+    /// the doc mapping during ingestion either.
+    #[schema(default = true, value_type = bool)]
+    #[serde(default = "true_fn", skip_serializing_if = "is_true")]
+    pub validate_docs: bool,
 }
 
 impl IngestSettings {
@@ -182,6 +194,7 @@ impl Default for IngestSettings {
     fn default() -> Self {
         Self {
             min_shards: Self::default_min_shards(),
+            validate_docs: true,
         }
     }
 }
@@ -191,6 +204,20 @@ impl Default for IngestSettings {
 pub struct SearchSettings {
     #[serde(default)]
     pub default_search_fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize, Default, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RetentionTimestampType {
+    #[default]
+    Primary,
+    Secondary,
+}
+
+impl RetentionTimestampType {
+    pub fn is_primary(&self) -> bool {
+        matches!(self, RetentionTimestampType::Primary)
+    }
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -207,6 +234,11 @@ pub struct RetentionPolicy {
     #[serde(default = "RetentionPolicy::default_schedule")]
     #[serde(rename = "schedule")]
     pub evaluation_schedule: String,
+
+    /// The target timestamp field to use for retention evaluation. When the
+    /// range is not in the split's metadata, the split is never deleted.
+    #[serde(default, skip_serializing_if = "RetentionTimestampType::is_primary")]
+    pub timestamp_type: RetentionTimestampType,
 }
 
 impl RetentionPolicy {
@@ -454,6 +486,8 @@ impl crate::TestableForRegression for IndexConfig {
                 message_mapping,
             ],
             timestamp_field: Some("timestamp".to_string()),
+            secondary_timestamp_field: None,
+            indexation_time_field: None,
             tag_fields: BTreeSet::from_iter(["tenant_id".to_string(), "log_level".to_string()]),
             partition_key: Some("tenant_id".to_string()),
             max_num_partitions: NonZeroU32::new(100).unwrap(),
@@ -481,6 +515,7 @@ impl crate::TestableForRegression for IndexConfig {
         };
         let ingest_settings = IngestSettings {
             min_shards: NonZeroUsize::new(12).unwrap(),
+            validate_docs: true,
         };
         let search_settings = SearchSettings {
             default_search_fields: vec!["message".to_string()],
@@ -488,6 +523,7 @@ impl crate::TestableForRegression for IndexConfig {
         let retention_policy_opt = Some(RetentionPolicy {
             retention_period: "90 days".to_string(),
             evaluation_schedule: "daily".to_string(),
+            timestamp_type: RetentionTimestampType::Primary,
         });
         IndexConfig {
             index_id: "my-index".to_string(),
@@ -552,11 +588,67 @@ pub(super) fn validate_index_config(
     Ok(())
 }
 
+/// Returns the updated doc mapping and a boolean indicating whether a mutation occurred.
+///
+/// The logic goes as follows:
+/// 1. If the new doc mapping is the same as the current doc mapping, ignoring their UIDs, returns
+///    the current doc mapping and `false`, indicating that no mutation occurred.
+/// 2. If the new doc mapping is different from the current doc mapping, verifies the following
+///    constraints before returning the new doc mapping and `true`, indicating that a mutation
+///    occurred:
+///    - The doc mapping UID should differ from the current one
+///    - The timestamp field should remain the same
+///    - The tokenizers should be a superset of the current tokenizers
+///    - A doc mapper can be built from the new doc mapping
+pub fn prepare_doc_mapping_update(
+    mut new_doc_mapping: DocMapping,
+    current_doc_mapping: &DocMapping,
+    search_settings: &SearchSettings,
+) -> anyhow::Result<(DocMapping, bool)> {
+    // Save the new doc mapping UID in a temporary variable and override it with the current doc
+    // mapping UID to compare the two doc mappings, ignoring their UIDs.
+    let new_doc_mapping_uid = new_doc_mapping.doc_mapping_uid;
+    new_doc_mapping.doc_mapping_uid = current_doc_mapping.doc_mapping_uid;
+
+    if new_doc_mapping == *current_doc_mapping {
+        return Ok((new_doc_mapping, false));
+    }
+    // Restore the new doc mapping UID.
+    new_doc_mapping.doc_mapping_uid = new_doc_mapping_uid;
+
+    ensure!(
+        new_doc_mapping.doc_mapping_uid != current_doc_mapping.doc_mapping_uid,
+        "new doc mapping UID should differ from the current one, current UID `{}`, new UID `{}`",
+        current_doc_mapping.doc_mapping_uid,
+        new_doc_mapping.doc_mapping_uid,
+    );
+    let new_timestamp_field = new_doc_mapping.timestamp_field.as_deref();
+    let current_timestamp_field = current_doc_mapping.timestamp_field.as_deref();
+    ensure!(
+        new_timestamp_field == current_timestamp_field,
+        "updating timestamp field is not allowed, current timestamp field `{}`, new timestamp \
+         field `{}`",
+        current_timestamp_field.unwrap_or("none"),
+        new_timestamp_field.unwrap_or("none"),
+    );
+    // TODO: Unsure this constraint is required, should we relax it?
+    let new_tokenizers: HashSet<_> = new_doc_mapping.tokenizers.iter().collect();
+    let current_tokenizers: HashSet<_> = current_doc_mapping.tokenizers.iter().collect();
+    ensure!(
+        new_tokenizers.is_superset(&current_tokenizers),
+        "updating tokenizers is allowed only if adding new tokenizers, current tokenizers \
+         `{current_tokenizers:?}`, new tokenizers `{new_tokenizers:?}`",
+    );
+    build_doc_mapper(&new_doc_mapping, search_settings).context("invalid doc mapping")?;
+    Ok((new_doc_mapping, true))
+}
+
 #[cfg(test)]
 mod tests {
 
     use cron::TimeUnitSpec;
-    use quickwit_doc_mapper::ModeType;
+    use quickwit_doc_mapper::{Mode, ModeType, TokenizerEntry};
+    use quickwit_proto::types::DocMappingUid;
 
     use super::*;
     use crate::ConfigFormat;
@@ -604,6 +696,7 @@ mod tests {
         let expected_retention_policy = RetentionPolicy {
             retention_period: "90 days".to_string(),
             evaluation_schedule: "daily".to_string(),
+            timestamp_type: RetentionTimestampType::Primary,
         };
         assert_eq!(
             index_config.retention_policy_opt.unwrap(),
@@ -783,6 +876,7 @@ mod tests {
         let retention_policy = RetentionPolicy {
             retention_period: "90 days".to_string(),
             evaluation_schedule: "hourly".to_string(),
+            timestamp_type: RetentionTimestampType::Primary,
         };
         let retention_policy_yaml = serde_yaml::to_string(&retention_policy).unwrap();
         assert_eq!(
@@ -803,6 +897,7 @@ mod tests {
             let expected_retention_policy = RetentionPolicy {
                 retention_period: "90 days".to_string(),
                 evaluation_schedule: "hourly".to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
             };
             assert_eq!(retention_policy, expected_retention_policy);
         }
@@ -817,6 +912,23 @@ mod tests {
             let expected_retention_policy = RetentionPolicy {
                 retention_period: "90 days".to_string(),
                 evaluation_schedule: "daily".to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
+            };
+            assert_eq!(retention_policy, expected_retention_policy);
+        }
+        {
+            let retention_policy_yaml = r#"
+            period: 90 days
+            schedule: daily
+            timestamp_type: secondary
+        "#;
+            let retention_policy =
+                serde_yaml::from_str::<RetentionPolicy>(retention_policy_yaml).unwrap();
+
+            let expected_retention_policy = RetentionPolicy {
+                retention_period: "90 days".to_string(),
+                evaluation_schedule: "daily".to_string(),
+                timestamp_type: RetentionTimestampType::Secondary,
             };
             assert_eq!(retention_policy, expected_retention_policy);
         }
@@ -828,6 +940,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "hourly".to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
             };
             assert_eq!(
                 retention_policy.retention_period().unwrap(),
@@ -837,6 +950,7 @@ mod tests {
                 let retention_policy = RetentionPolicy {
                     retention_period: "foo".to_string(),
                     evaluation_schedule: "hourly".to_string(),
+                    timestamp_type: RetentionTimestampType::Primary,
                 };
                 assert_eq!(
                     retention_policy.retention_period().unwrap_err().to_string(),
@@ -861,6 +975,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "@hourly".to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
             };
             assert_eq!(
                 retention_policy.evaluation_schedule().unwrap(),
@@ -871,6 +986,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "hourly".to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
             };
             assert_eq!(
                 retention_policy.evaluation_schedule().unwrap(),
@@ -881,6 +997,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "0 * * * * *".to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
             };
             let evaluation_schedule = retention_policy.evaluation_schedule().unwrap();
             assert_eq!(evaluation_schedule.seconds().count(), 1);
@@ -894,6 +1011,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "hourly".to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
             };
             retention_policy.validate().unwrap();
         }
@@ -901,6 +1019,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "foo".to_string(),
                 evaluation_schedule: "hourly".to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
             };
             retention_policy.validate().unwrap_err();
         }
@@ -908,6 +1027,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "foo".to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
             };
             retention_policy.validate().unwrap_err();
         }
@@ -920,6 +1040,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: schedule_str.to_string(),
+                timestamp_type: RetentionTimestampType::Primary,
             };
 
             let next_evaluation_duration = chrono::Duration::nanoseconds(
@@ -942,18 +1063,122 @@ mod tests {
 
     #[test]
     fn test_ingest_settings_serde() {
-        let ingest_settings = IngestSettings {
+        let settings = IngestSettings {
             min_shards: NonZeroUsize::MIN,
+            validate_docs: false,
         };
-        let ingest_settings_yaml = serde_yaml::to_string(&ingest_settings).unwrap();
-        let ingest_settings_roundtrip: IngestSettings =
-            serde_yaml::from_str(&ingest_settings_yaml).unwrap();
-        assert_eq!(ingest_settings, ingest_settings_roundtrip);
+        let settings_yaml = serde_yaml::to_string(&settings).unwrap();
+        assert!(settings_yaml.contains("validate_docs"));
 
-        let ingest_settings_yaml = r#"
+        let expected_settings: IngestSettings = serde_yaml::from_str(&settings_yaml).unwrap();
+        assert_eq!(settings, expected_settings);
+
+        let settings = IngestSettings {
+            min_shards: NonZeroUsize::MIN,
+            validate_docs: true,
+        };
+        let settings_yaml = serde_yaml::to_string(&settings).unwrap();
+        assert!(!settings_yaml.contains("validate_docs"));
+
+        let expected_settings: IngestSettings = serde_yaml::from_str(&settings_yaml).unwrap();
+        assert_eq!(settings, expected_settings);
+
+        let settings_yaml = r#"
             min_shards: 0
         "#;
-        let error = serde_yaml::from_str::<IngestSettings>(ingest_settings_yaml).unwrap_err();
+        let error = serde_yaml::from_str::<IngestSettings>(settings_yaml).unwrap_err();
         assert!(error.to_string().contains("expected a nonzero"));
+    }
+
+    #[test]
+    fn test_prepare_doc_mapping_update() {
+        let current_index_config = IndexConfig::for_test("test-index", "s3://test-index");
+        let mut current_doc_mapping = current_index_config.doc_mapping;
+        let search_settings = current_index_config.search_settings;
+
+        let tokenizer_json = r#"
+            {
+                "name": "breton-tokenizer",
+                "type": "regex",
+                "pattern": "crêpes*"
+            }
+            "#;
+        let tokenizer: TokenizerEntry = serde_json::from_str(tokenizer_json).unwrap();
+
+        current_doc_mapping.tokenizers.push(tokenizer.clone());
+
+        // The new doc mapping should have a different doc mapping UID.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.store_source = false; // This is set to `true` for the current doc mapping.
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("doc mapping UID should differ"));
+
+        // The new doc mapping should not change the timestamp field.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.timestamp_field = Some("ts".to_string()); // This is set to `timestamp` for the current doc mapping.
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("timestamp field"));
+
+        // The new doc mapping should not remove the timestamp field.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.timestamp_field = None;
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("timestamp field"));
+
+        // The new doc mapping should not remove tokenizers.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.tokenizers.clear();
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("tokenizers"));
+
+        // The new doc mapping should be "buildable" into a doc mapper.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.tokenizers.push(tokenizer);
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .source()
+                .unwrap()
+                .to_string();
+        assert!(error.contains("duplicated custom tokenizer"));
+
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        let (updated_doc_mapping, mutation_occurred) =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap();
+        assert!(!mutation_occurred);
+        assert_eq!(
+            updated_doc_mapping.doc_mapping_uid,
+            current_doc_mapping.doc_mapping_uid
+        );
+        assert_eq!(updated_doc_mapping, current_doc_mapping);
+
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        let new_doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.doc_mapping_uid = new_doc_mapping_uid;
+        new_doc_mapping.mode = Mode::Strict;
+        let (updated_doc_mapping, mutation_occurred) =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap();
+        assert!(mutation_occurred);
+        assert_eq!(updated_doc_mapping.doc_mapping_uid, new_doc_mapping_uid);
+        assert_eq!(updated_doc_mapping.mode, Mode::Strict);
     }
 }

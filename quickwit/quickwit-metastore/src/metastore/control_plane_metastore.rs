@@ -20,19 +20,21 @@ use quickwit_proto::control_plane::{ControlPlaneService, ControlPlaneServiceClie
 use quickwit_proto::metastore::{
     AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, CreateIndexRequest,
     CreateIndexResponse, CreateIndexTemplateRequest, DeleteIndexRequest,
-    DeleteIndexTemplatesRequest, DeleteQuery, DeleteShardsRequest, DeleteShardsResponse,
-    DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse,
+    DeleteIndexTemplatesRequest, DeleteKvRequest, DeleteQuery, DeleteShardsRequest,
+    DeleteShardsResponse, DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse,
     FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse, GetClusterIdentityRequest,
-    GetClusterIdentityResponse, GetIndexTemplateRequest, GetIndexTemplateResponse,
-    IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataRequest, IndexesMetadataResponse,
-    LastDeleteOpstampRequest, LastDeleteOpstampResponse, ListDeleteTasksRequest,
-    ListDeleteTasksResponse, ListIndexTemplatesRequest, ListIndexTemplatesResponse,
-    ListIndexesMetadataRequest, ListIndexesMetadataResponse, ListShardsRequest, ListShardsResponse,
-    ListSplitsRequest, ListSplitsResponse, ListStaleSplitsRequest, MarkSplitsForDeletionRequest,
-    MetastoreResult, MetastoreService, MetastoreServiceClient, MetastoreServiceStream,
-    OpenShardsRequest, OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest,
-    ResetSourceCheckpointRequest, StageSplitsRequest, ToggleSourceRequest, UpdateIndexRequest,
-    UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest, UpdateSplitsDeleteOpstampResponse,
+    GetClusterIdentityResponse, GetIndexTemplateRequest, GetIndexTemplateResponse, GetKvRequest,
+    GetKvResponse, IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataRequest,
+    IndexesMetadataResponse, LastDeleteOpstampRequest, LastDeleteOpstampResponse,
+    ListDeleteTasksRequest, ListDeleteTasksResponse, ListIndexStatsRequest, ListIndexStatsResponse,
+    ListIndexTemplatesRequest, ListIndexTemplatesResponse, ListIndexesMetadataRequest,
+    ListIndexesMetadataResponse, ListShardsRequest, ListShardsResponse, ListSplitsRequest,
+    ListSplitsResponse, ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreResult,
+    MetastoreService, MetastoreServiceClient, MetastoreServiceStream, OpenShardsRequest,
+    OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest, ResetSourceCheckpointRequest,
+    SetKvRequest, SoftDeleteDocumentsRequest, SoftDeleteDocumentsResponse, StageSplitsRequest,
+    ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest,
+    UpdateSplitsDeleteOpstampResponse,
 };
 
 /// A [`MetastoreService`] implementation that proxies some requests to the control plane so it can
@@ -162,6 +164,13 @@ impl MetastoreService for ControlPlaneMetastore {
         self.metastore.list_splits(request).await
     }
 
+    async fn list_index_stats(
+        &self,
+        request: ListIndexStatsRequest,
+    ) -> MetastoreResult<ListIndexStatsResponse> {
+        self.metastore.list_index_stats(request).await
+    }
+
     async fn list_stale_splits(
         &self,
         request: ListStaleSplitsRequest,
@@ -178,6 +187,13 @@ impl MetastoreService for ControlPlaneMetastore {
 
     async fn delete_splits(&self, request: DeleteSplitsRequest) -> MetastoreResult<EmptyResponse> {
         self.metastore.delete_splits(request).await
+    }
+
+    async fn soft_delete_documents(
+        &self,
+        request: SoftDeleteDocumentsRequest,
+    ) -> MetastoreResult<SoftDeleteDocumentsResponse> {
+        self.metastore.soft_delete_documents(request).await
     }
 
     async fn reset_source_checkpoint(
@@ -280,5 +296,17 @@ impl MetastoreService for ControlPlaneMetastore {
         request: GetClusterIdentityRequest,
     ) -> MetastoreResult<GetClusterIdentityResponse> {
         self.metastore.get_cluster_identity(request).await
+    }
+
+    async fn get_kv(&self, request: GetKvRequest) -> MetastoreResult<GetKvResponse> {
+        self.metastore.get_kv(request).await
+    }
+
+    async fn set_kv(&self, request: SetKvRequest) -> MetastoreResult<EmptyResponse> {
+        self.metastore.set_kv(request).await
+    }
+
+    async fn delete_kv(&self, request: DeleteKvRequest) -> MetastoreResult<EmptyResponse> {
+        self.metastore.delete_kv(request).await
     }
 }

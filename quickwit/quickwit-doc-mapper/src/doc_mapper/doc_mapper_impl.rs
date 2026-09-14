@@ -14,12 +14,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use fnv::FnvHashSet;
 use quickwit_proto::types::DocMappingUid;
 use quickwit_query::create_default_quickwit_tokenizer_manager;
-use quickwit_query::query_ast::QueryAst;
+use quickwit_query::query_ast::{BuildTantivyAstContext, QueryAst};
 use quickwit_query::tokenizers::TokenizerManager;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value as JsonValue};
@@ -34,7 +35,7 @@ use super::field_presence::populate_field_presence;
 use super::tantivy_val_to_json::tantivy_value_to_json;
 use crate::doc_mapper::mapping_tree::{
     JsonValueIterator, MappingNode, MappingNodeRoot, build_field_path_from_str, build_mapping_tree,
-    map_primitive_json_to_tantivy,
+    map_primitive_json_to_concatenate_value,
 };
 use crate::doc_mapper::{FieldMappingType, JsonObject, Partition};
 use crate::query_builder::build_query;
@@ -75,6 +76,10 @@ pub struct DocMapper {
     timestamp_field_name: Option<String>,
     /// Timestamp field path (name parsed)
     timestamp_field_path: Option<Vec<String>>,
+    /// Secondary timestamp field name.
+    secondary_timestamp_field_name: Option<String>,
+    /// Indexation time field name.
+    indexation_time_field_name: Option<String>,
     /// Root node of the field mapping tree.
     /// See [`MappingNode`].
     field_mappings: MappingNode,
@@ -125,6 +130,31 @@ fn validate_timestamp_field(
     Ok(())
 }
 
+fn validate_indexation_time_field(
+    indexation_field_path: &str,
+    mapping_root_node: &MappingNode,
+) -> anyhow::Result<()> {
+    if indexation_field_path.starts_with('.') || indexation_field_path.starts_with("\\.") {
+        bail!("indexation_time field `{indexation_field_path}` should not start with a `.`");
+    }
+    if indexation_field_path.ends_with('.') {
+        bail!("indexation_time field `{indexation_field_path}` should not end with a `.`");
+    }
+    let Some(indexation_time_field_type) =
+        mapping_root_node.find_field_mapping_type(indexation_field_path)
+    else {
+        bail!("could not find indexation_time field `{indexation_field_path}` in field mappings");
+    };
+    if let FieldMappingType::DateTime(_, cardinality) = &indexation_time_field_type {
+        if cardinality != &Cardinality::SingleValued {
+            bail!("indexation_time field `{indexation_field_path}` should be single-valued");
+        }
+    } else {
+        bail!("indexation_time field `{indexation_field_path}` should be a datetime field");
+    }
+    Ok(())
+}
+
 impl From<DocMapper> for DocMapperBuilder {
     fn from(default_doc_mapper: DocMapper) -> Self {
         let partition_key_str = default_doc_mapper.partition_key.to_string();
@@ -138,6 +168,8 @@ impl From<DocMapper> for DocMapperBuilder {
             mode: default_doc_mapper.mode,
             field_mappings: default_doc_mapper.field_mappings.into(),
             timestamp_field: default_doc_mapper.timestamp_field_name,
+            secondary_timestamp_field: default_doc_mapper.secondary_timestamp_field_name,
+            indexation_time_field: default_doc_mapper.indexation_time_field_name,
             tag_fields: default_doc_mapper.tag_field_names,
             partition_key: partition_key_opt,
             max_num_partitions: default_doc_mapper.max_num_partitions,
@@ -199,6 +231,9 @@ impl TryFrom<DocMapperBuilder> for DocMapper {
         } else {
             None
         };
+        if let Some(indexation_time_field_name) = &doc_mapping.indexation_time_field {
+            validate_indexation_time_field(indexation_time_field_name, &field_mappings)?;
+        }
         let schema = schema_builder.build();
 
         let tokenizer_manager = create_default_quickwit_tokenizer_manager();
@@ -288,6 +323,8 @@ impl TryFrom<DocMapperBuilder> for DocMapper {
             default_search_field_names,
             timestamp_field_name: doc_mapping.timestamp_field,
             timestamp_field_path,
+            secondary_timestamp_field_name: doc_mapping.secondary_timestamp_field,
+            indexation_time_field_name: doc_mapping.indexation_time_field,
             field_mappings,
             concatenate_dynamic_fields,
             tag_field_names,
@@ -529,7 +566,7 @@ impl DocMapper {
             if !self.concatenate_dynamic_fields.is_empty() {
                 let json_obj_values =
                     JsonValueIterator::new(serde_json::Value::Object(dynamic_json_obj.clone()))
-                        .flat_map(map_primitive_json_to_tantivy);
+                        .flat_map(map_primitive_json_to_concatenate_value);
 
                 for value in json_obj_values {
                     for concatenate_dynamic_field in self.concatenate_dynamic_fields.iter() {
@@ -636,15 +673,19 @@ impl DocMapper {
     pub fn query(
         &self,
         split_schema: Schema,
-        query_ast: &QueryAst,
+        query_ast: QueryAst,
         with_validation: bool,
+        cache_context: Option<(Arc<dyn quickwit_query::query_ast::PredicateCache>, String)>,
     ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
         build_query(
             query_ast,
-            split_schema,
-            self.tokenizer_manager(),
-            &self.default_search_field_names[..],
-            with_validation,
+            &BuildTantivyAstContext {
+                schema: &split_schema,
+                tokenizer_manager: self.tokenizer_manager(),
+                search_fields: &self.default_search_field_names[..],
+                with_validation,
+            },
+            cache_context,
         )
     }
 
@@ -665,6 +706,16 @@ impl DocMapper {
     /// Returns the timestamp field name.
     pub fn timestamp_field_name(&self) -> Option<&str> {
         self.timestamp_field_name.as_deref()
+    }
+
+    /// Returns the secondary timestamp field name.
+    pub fn secondary_timestamp_field_name(&self) -> Option<&str> {
+        self.secondary_timestamp_field_name.as_deref()
+    }
+
+    /// Returns the indexation time field name.
+    pub fn indexation_time_field_name(&self) -> Option<&str> {
+        self.indexation_time_field_name.as_deref()
     }
 
     /// Returns the tag `NameField`s on the current schema.
@@ -1849,7 +1900,8 @@ mod tests {
             }"#,
             "concat",
             r#"{"some_int": 25}"#,
-            vec![25_u64.into()],
+            // i64 comes before u64
+            vec![25_i64.into()],
         );
     }
 
@@ -2068,7 +2120,7 @@ mod tests {
             .parse_user_query(doc_mapper.default_search_fields())
             .map_err(|err| err.to_string())?;
         let (query, _) = doc_mapper
-            .query(doc_mapper.schema(), &query_ast, true)
+            .query(doc_mapper.schema(), query_ast, true, None)
             .map_err(|err| err.to_string())?;
         Ok(format!("{query:?}"))
     }

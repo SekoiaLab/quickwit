@@ -18,13 +18,12 @@ use std::collections::BTreeMap;
 
 use anyhow::Context;
 use colored::Colorize;
-use opentelemetry::global;
-use quickwit_cli::busy_detector;
 use quickwit_cli::checklist::RED_COLOR;
 use quickwit_cli::cli::{CliCommand, build_cli};
 #[cfg(feature = "jemalloc")]
 use quickwit_cli::jemalloc::start_jemalloc_metrics_loop;
 use quickwit_cli::logger::setup_logging_and_tracing;
+use quickwit_cli::{busy_detector, install_default_crypto_ring_provider};
 use quickwit_common::runtimes::scrape_tokio_runtime_metrics;
 use quickwit_serve::BuildInfo;
 use tracing::error;
@@ -78,7 +77,8 @@ async fn main_impl() -> anyhow::Result<()> {
     };
     register_build_info_metric();
 
-    let about_text = about_text();
+    let about_text = "Sub-second search & analytics engine on cloud storage.\n  Find more \
+                      information at https://quickwit.io/docs\n\n";
     let version_text = BuildInfo::get_version_text();
 
     let app = build_cli().about(about_text).version(version_text);
@@ -93,15 +93,13 @@ async fn main_impl() -> anyhow::Result<()> {
         }
     };
 
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("rustls crypto ring default provider installation should not fail");
+    install_default_crypto_ring_provider();
 
     #[cfg(feature = "jemalloc")]
     start_jemalloc_metrics_loop();
 
     let build_info = BuildInfo::get();
-    let env_filter_reload_fn =
+    let (env_filter_reload_fn, tracer_provider_opt) =
         setup_logging_and_tracing(command.default_log_level(), ansi_colors, build_info)?;
 
     let return_code: i32 = if let Err(command_error) = command.execute(env_filter_reload_fn).await {
@@ -116,19 +114,13 @@ async fn main_impl() -> anyhow::Result<()> {
         0
     };
 
-    global::shutdown_tracer_provider();
-    std::process::exit(return_code)
-}
-
-/// Return the about text with telemetry info.
-fn about_text() -> String {
-    let mut about_text = String::from(
-        "Sub-second search & analytics engine on cloud storage.\n  Find more information at https://quickwit.io/docs\n\n",
-    );
-    if !quickwit_telemetry::is_telemetry_disabled() {
-        about_text += "Telemetry: enabled";
+    if let Some(provider) = tracer_provider_opt {
+        provider
+            .shutdown()
+            .context("failed to shutdown OpenTelemetry tracer provider")?;
     }
-    about_text
+
+    std::process::exit(return_code)
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ use tantivy::{ReloadPolicy, Term};
 use tracing::{debug, error, info, instrument};
 
 use crate::leaf::open_index_with_caches;
+use crate::query_cost_classifier::QueryCostClass;
 use crate::search_job_placer::group_jobs_by_index_id;
 use crate::search_permit_provider::compute_initial_memory_allocation;
 use crate::{ClusterClient, SearchError, SearchJob, SearcherContext, resolve_index_patterns};
@@ -206,6 +207,7 @@ pub fn jobs_to_leaf_requests(
 
 /// Apply a leaf list terms on a single split.
 #[instrument(skip_all, fields(split_id = split.split_id))]
+#[allow(deprecated)]
 async fn leaf_list_terms_single_split(
     searcher_context: &SearcherContext,
     search_request: &ListTermsRequest,
@@ -308,6 +310,7 @@ fn term_from_data(field: Field, field_type: &FieldType, data: &[u8]) -> Term {
     term
 }
 
+#[allow(deprecated)]
 fn term_to_data(field: Field, field_type: &FieldType, field_value: &[u8]) -> Vec<u8> {
     let mut term = Term::from_field_bool(field, false);
     term.clear_with_type(field_type.value_type());
@@ -332,9 +335,11 @@ pub async fn leaf_list_terms(
                 .warmup_single_split_initial_allocation,
         )
     });
+    // List terms requests don't run a query, so there is no query AST to classify: they are
+    // always considered regular cost.
     let permits = searcher_context
         .search_permit_provider
-        .get_permits(permit_sizes)
+        .get_permits(permit_sizes, QueryCostClass::Regular)
         .await;
     let leaf_search_single_split_futures: Vec<_> = splits
         .iter()
@@ -345,7 +350,7 @@ pub async fn leaf_list_terms(
             async move {
                 let leaf_split_search_permit = search_permit_recv.await;
                 // TODO dedicated counter and timer?
-                crate::SEARCH_METRICS.leaf_searches_splits_total.inc();
+                crate::SEARCH_METRICS.leaf_list_terms_splits_total.inc();
                 let timer = crate::SEARCH_METRICS
                     .leaf_search_split_duration_secs
                     .start_timer();

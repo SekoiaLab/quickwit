@@ -126,6 +126,20 @@ pub struct DocMapping {
     #[serde(default)]
     pub timestamp_field: Option<String>,
 
+    /// Field with the secondary timestamp. A new secondary time can be added
+    /// but it cannot be changed. If the secondary timestamp is missing from a
+    /// document in the split, the range is not set in the split metadata.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_timestamp_field: Option<String>,
+
+    /// Declares the field which will contain the indexation time for the document.
+    /// This field is automatically populated by the indexer
+    /// with the time at which the document is indexed.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexation_time_field: Option<String>,
+
     /// Declares the low cardinality fields for which the values ​​are recorded directly in the
     /// splits metadata.
     #[schema(value_type = Vec<String>)]
@@ -166,20 +180,6 @@ impl DocMapping {
     pub fn default_max_num_partitions() -> NonZeroU32 {
         NonZeroU32::new(200).unwrap()
     }
-
-    /// Returns whether the `other` doc mapping is equal to `self` leaving their respective doc
-    /// mapping UIDs out of the comparison.
-    pub fn eq_ignore_doc_mapping_uid(&self, other: &Self) -> bool {
-        let doc_mapping_uid = DocMappingUid::default();
-
-        let mut left = self.clone();
-        left.doc_mapping_uid = doc_mapping_uid;
-
-        let mut right = other.clone();
-        right.doc_mapping_uid = doc_mapping_uid;
-
-        left == right
-    }
 }
 
 #[cfg(test)]
@@ -213,6 +213,8 @@ mod tests {
                 },
             ],
             timestamp_field: Some("timestamp".to_string()),
+            secondary_timestamp_field: None,
+            indexation_time_field: None,
             tag_fields: BTreeSet::from_iter(["level".to_string()]),
             partition_key: Some("tenant_id".to_string()),
             max_num_partitions: NonZeroU32::new(100).unwrap(),

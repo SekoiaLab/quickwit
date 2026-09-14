@@ -29,20 +29,24 @@ use quickwit_proto::search::{
     SearchResponse, SnippetRequest,
 };
 use quickwit_storage::{
-    MemorySizedCache, QuickwitCache, SplitCache, StorageCache, StorageResolver,
+    DiskSizedCache, MemorySizedCache, QuickwitCache, SplitCache, StorageCache, StorageResolver,
+    TieredSizedCache,
 };
 use tantivy::aggregation::AggregationLimitsGuard;
 
 use crate::leaf::multi_index_leaf_search;
-use crate::leaf_cache::LeafSearchCache;
+use crate::leaf_cache::{LeafSearchCache, PredicateCacheImpl};
 use crate::list_fields::{leaf_list_fields, root_list_fields};
 use crate::list_fields_cache::ListFieldsCache;
 use crate::list_terms::{leaf_list_terms, root_list_terms};
+use crate::metrics::SEARCH_METRICS;
 use crate::metrics_trackers::LeafSearchMetricsFuture;
 use crate::root::fetch_docs_phase;
 use crate::scroll_context::{MiniKV, ScrollContext, ScrollKeyAndStartOffset};
 use crate::search_permit_provider::SearchPermitProvider;
-use crate::{ClusterClient, SearchError, fetch_docs, root_search, search_plan};
+use crate::{
+    ClusterClient, SearchError, fetch_docs, query_cost_classifier, root_search, search_plan,
+};
 
 #[derive(Clone)]
 /// The search service implementation.
@@ -177,26 +181,32 @@ impl SearchService for SearchServiceImpl {
         leaf_search_request: LeafSearchRequest,
     ) -> crate::Result<LeafSearchResponse> {
         // Check leaf_search_request existence before tracing with `instrument` call.
-        if leaf_search_request.search_request.is_none() {
+        let Some(search_request) = leaf_search_request.search_request.as_ref() else {
             return Err(SearchError::Internal("no search request".to_string()));
-        }
+        };
+        // The cost class is computed here, once per leaf request: it labels the permit and task
+        // gauges, so it has to be known before any permit is requested.
+        let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
         let num_splits = leaf_search_request
             .leaf_requests
             .iter()
             .map(|req| req.split_offsets.len())
             .sum::<usize>();
 
-        LeafSearchMetricsFuture {
+        let timeout = self.searcher_context.searcher_config.request_timeout();
+        let tracked_future = LeafSearchMetricsFuture {
             tracked: multi_index_leaf_search(
                 self.searcher_context.clone(),
                 leaf_search_request,
                 &self.storage_resolver,
+                cost_class,
             ),
             start: Instant::now(),
             targeted_splits: num_splits,
             status: None,
-        }
-        .await
+            cost_class,
+        };
+        tokio::time::timeout(timeout, tracked_future).await?
     }
 
     async fn fetch_docs(
@@ -387,10 +397,10 @@ pub(crate) async fn scroll(
         num_hits: scroll_context.total_num_hits,
         elapsed_time_micros: start.elapsed().as_micros() as u64,
         scroll_id: Some(next_scroll_id.to_string()),
-        errors: Vec::new(),
         aggregation_postcard: None,
         failed_splits: scroll_context.failed_splits,
         num_successful_splits: scroll_context.num_successful_splits,
+        splits_by_outcome: scroll_context.splits_by_outcome,
     })
 }
 /// [`SearcherContext`] provides a common set of variables
@@ -401,12 +411,14 @@ pub struct SearcherContext {
     pub searcher_config: SearcherConfig,
     /// Fast fields cache.
     pub fast_fields_cache: Arc<dyn StorageCache>,
-    /// Counting semaphore to limit concurrent leaf search split requests.
+    /// Limit the concurrency for small snappy interactive searches.
     pub search_permit_provider: SearchPermitProvider,
-    /// Split footer cache.
-    pub split_footer_cache: MemorySizedCache<String>,
-    /// Recent sub-query cache.
+    /// Split footer cache. In-memory, optionally backed by a persistent on-disk tier.
+    pub split_footer_cache: TieredSizedCache<String>,
+    /// Per-split and per-query cache.
     pub leaf_search_cache: LeafSearchCache,
+    /// Per-split and per-predicate cache.
+    pub predicate_cache: Arc<PredicateCacheImpl>,
     /// Search split cache. `None` if no split cache is configured.
     pub split_cache_opt: Option<Arc<SplitCache>>,
     /// List fields cache. Caches the list fields response for a given split.
@@ -428,26 +440,32 @@ impl SearcherContext {
     #[cfg(test)]
     pub fn for_test() -> SearcherContext {
         let searcher_config = SearcherConfig::default();
-        SearcherContext::new(searcher_config, None)
+        SearcherContext::new(searcher_config, None, None)
     }
 
-    /// Creates a new searcher context, given a searcher config, and an optional `SplitCache`.
-    pub fn new(searcher_config: SearcherConfig, split_cache_opt: Option<Arc<SplitCache>>) -> Self {
-        let capacity_in_bytes = searcher_config.split_footer_cache_capacity.as_u64() as usize;
-        let global_split_footer_cache = MemorySizedCache::with_capacity_in_bytes(
-            capacity_in_bytes,
+    /// Creates a new searcher context, given a searcher config, an optional `SplitCache` and an
+    /// optional persistent (on-disk) split footer cache.
+    pub fn new(
+        searcher_config: SearcherConfig,
+        split_cache_opt: Option<Arc<SplitCache>>,
+        split_footer_disk_cache_opt: Option<DiskSizedCache<String>>,
+    ) -> Self {
+        let global_split_footer_cache = MemorySizedCache::from_config(
+            &searcher_config.split_footer_cache,
             &quickwit_storage::STORAGE_METRICS.split_footer_cache,
         );
+        let split_footer_cache =
+            TieredSizedCache::new(global_split_footer_cache, split_footer_disk_cache_opt);
         let leaf_search_split_semaphore = SearchPermitProvider::new(
             searcher_config.max_num_concurrent_split_searches,
             searcher_config.warmup_memory_budget,
+            SEARCH_METRICS.search_task_metrics(),
         );
-        let fast_field_cache_capacity = searcher_config.fast_field_cache_capacity.as_u64() as usize;
-        let storage_long_term_cache = Arc::new(QuickwitCache::new(fast_field_cache_capacity));
-        let leaf_search_cache =
-            LeafSearchCache::new(searcher_config.partial_request_cache_capacity.as_u64() as usize);
-        let list_fields_cache =
-            ListFieldsCache::new(searcher_config.partial_request_cache_capacity.as_u64() as usize);
+        let storage_long_term_cache =
+            Arc::new(QuickwitCache::new(&searcher_config.fast_field_cache));
+        let leaf_search_cache = LeafSearchCache::new(&searcher_config.partial_request_cache);
+        let predicate_cache = PredicateCacheImpl::new(&searcher_config.predicate_cache);
+        let list_fields_cache = ListFieldsCache::new(&searcher_config.partial_request_cache);
         let aggregation_limit = AggregationLimitsGuard::new(
             Some(searcher_config.aggregation_memory_limit.as_u64()),
             Some(searcher_config.aggregation_bucket_limit),
@@ -456,8 +474,9 @@ impl SearcherContext {
         Self {
             searcher_config,
             fast_fields_cache: storage_long_term_cache,
+            predicate_cache: predicate_cache.into(),
             search_permit_provider: leaf_search_split_semaphore,
-            split_footer_cache: global_split_footer_cache,
+            split_footer_cache,
             leaf_search_cache,
             list_fields_cache,
             split_cache_opt,

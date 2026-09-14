@@ -107,6 +107,10 @@ pub(super) fn append_query_filters_and_order_by(
         sql.cond_where(Expr::col(Splits::IndexUid).is_in(index_uids));
     }
 
+    if let Some(split_ids) = &query.split_ids {
+        sql.cond_where(Expr::col(Splits::SplitId).is_in(split_ids));
+    }
+
     if let Some(node_id) = &query.node_id {
         sql.cond_where(Expr::col(Splits::NodeId).eq(node_id));
     };
@@ -153,6 +157,48 @@ pub(super) fn append_query_filters_and_order_by(
             sql.cond_where(any![
                 Expr::col(Splits::TimeRangeStart).lt(v),
                 Expr::col(Splits::TimeRangeStart).is_null()
+            ]);
+        }
+        Bound::Unbounded => {}
+    };
+
+    if let Some(v) = query.max_secondary_time_range_end {
+        sql.cond_where(any![
+            Expr::col(Splits::SecondaryTimeRangeEnd).lte(v),
+            sea_query::all![
+                Expr::col(Splits::SecondaryTimeRangeEnd).is_null(),
+                Expr::col(Splits::TimeRangeEnd).lte(v)
+            ]
+        ]);
+    }
+
+    match query.secondary_time_range.start {
+        Bound::Included(v) => {
+            sql.cond_where(any![
+                Expr::col(Splits::SecondaryTimeRangeEnd).gte(v),
+                Expr::col(Splits::SecondaryTimeRangeEnd).is_null()
+            ]);
+        }
+        Bound::Excluded(v) => {
+            sql.cond_where(any![
+                Expr::col(Splits::SecondaryTimeRangeEnd).gt(v),
+                Expr::col(Splits::SecondaryTimeRangeEnd).is_null()
+            ]);
+        }
+        Bound::Unbounded => {}
+    };
+
+    match query.secondary_time_range.end {
+        Bound::Included(v) => {
+            sql.cond_where(any![
+                Expr::col(Splits::SecondaryTimeRangeStart).lte(v),
+                Expr::col(Splits::SecondaryTimeRangeStart).is_null()
+            ]);
+        }
+        Bound::Excluded(v) => {
+            sql.cond_where(any![
+                Expr::col(Splits::SecondaryTimeRangeStart).lt(v),
+                Expr::col(Splits::SecondaryTimeRangeStart).is_null()
             ]);
         }
         Bound::Unbounded => {}

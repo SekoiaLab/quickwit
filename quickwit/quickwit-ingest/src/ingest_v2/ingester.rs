@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -141,7 +141,7 @@ impl Ingester {
         replication_factor: usize,
         idle_shard_timeout: Duration,
     ) -> IngestV2Result<Self> {
-        let self_node_id: NodeId = cluster.self_node_id().into();
+        let self_node_id: NodeId = cluster.self_node_id();
         let state = IngesterState::load(wal_dir_path, rate_limiter_settings);
 
         let weak_state = state.weak();
@@ -224,8 +224,8 @@ impl Ingester {
             .insert(queue_id, (rate_limiter, rate_meter));
 
         let primary_shard = if let Some(follower_id) = &shard.follower_id {
-            let leader_id: NodeId = shard.leader_id.clone().into();
-            let follower_id: NodeId = follower_id.clone().into();
+            let leader_id: NodeId = NodeId::from_str(&shard.leader_id);
+            let follower_id: NodeId = NodeId::from_str(follower_id);
 
             let replication_client = self
                 .init_replication_stream(
@@ -313,7 +313,10 @@ impl Ingester {
             })
             .collect();
 
-        let advise_reset_shards_request = AdviseResetShardsRequest { shard_ids };
+        let advise_reset_shards_request = AdviseResetShardsRequest {
+            ingester_id: self.self_node_id.to_string(),
+            shard_ids,
+        };
         let advise_reset_shards_future = self
             .control_plane
             .advise_reset_shards(advise_reset_shards_request);
@@ -382,8 +385,8 @@ impl Ingester {
             Entry::Vacant(entry) => entry,
         };
         let open_request = OpenReplicationStreamRequest {
-            leader_id: leader_id.clone().into(),
-            follower_id: follower_id.clone().into(),
+            leader_id: leader_id.clone().to_string(),
+            follower_id: follower_id.clone().to_string(),
             replication_seqno: 0,
         };
         let open_message = SynReplicationMessage::new_open_request(open_request);
@@ -454,7 +457,7 @@ impl Ingester {
 
         let commit_type = persist_request.commit_type();
         let force_commit = commit_type == CommitTypeV2::Force;
-        let leader_id: NodeId = persist_request.leader_id.into();
+        let leader_id: NodeId = NodeId::from_str(&persist_request.leader_id);
 
         let mut state_guard =
             with_lock_metrics!(self.state.lock_fully().await, "persist", "write")?;
@@ -473,7 +476,7 @@ impl Ingester {
                 persist_failures.push(persist_failure);
             }
             let persist_response = PersistResponse {
-                leader_id: leader_id.into(),
+                leader_id: leader_id.to_string(),
                 successes: Vec::new(),
                 failures: persist_failures,
             };
@@ -845,8 +848,8 @@ impl Ingester {
         if open_replication_stream_request.follower_id != self.self_node_id {
             return Err(IngestV2Error::Internal("routing error".to_string()));
         }
-        let leader_id: NodeId = open_replication_stream_request.leader_id.into();
-        let follower_id: NodeId = open_replication_stream_request.follower_id.into();
+        let leader_id: NodeId = NodeId::from_str(&open_replication_stream_request.leader_id);
+        let follower_id: NodeId = NodeId::from_str(&open_replication_stream_request.follower_id);
 
         let mut state_guard = self.state.lock_partially().await?;
 
@@ -920,7 +923,7 @@ impl Ingester {
         let self_node_id = self.self_node_id.clone();
         let observation_stream = status_stream.map(move |status| {
             let observation_message = ObservationMessage {
-                node_id: self_node_id.clone().into(),
+                node_id: self_node_id.clone().to_string(),
                 status: status as i32,
             };
             Ok(observation_message)
@@ -995,10 +998,10 @@ impl Ingester {
             let truncate_up_to_position_inclusive = subrequest.truncate_up_to_position_inclusive();
 
             if truncate_up_to_position_inclusive.is_eof() {
-                state_guard.delete_shard(&queue_id).await;
+                state_guard.delete_shard(&queue_id, "indexer-rpc").await;
             } else {
                 state_guard
-                    .truncate_shard(&queue_id, truncate_up_to_position_inclusive)
+                    .truncate_shard(&queue_id, truncate_up_to_position_inclusive, "indexer-rpc")
                     .await;
             }
         }
@@ -1054,12 +1057,12 @@ impl Ingester {
             Err(_) => {
                 return json!({
                     "status": "initializing",
-                    "shards": [],
+                    "shards": {},
                     "mrecordlog": {},
                 });
             }
         };
-        let mut per_index_shards_json: HashMap<IndexUid, Vec<JsonValue>> = HashMap::new();
+        let mut per_index_shards_json: BTreeMap<IndexUid, Vec<JsonValue>> = BTreeMap::new();
 
         for (queue_id, shard) in &state_guard.shards {
             let Some((index_uid, source_id, shard_id)) = split_queue_id(queue_id) else {
@@ -1179,7 +1182,9 @@ impl IngesterService for Ingester {
             .collect();
         info!(queues=?remove_queue_ids, "removing queues");
         for queue_id in remove_queue_ids {
-            state_guard.delete_shard(&queue_id).await;
+            state_guard
+                .delete_shard(&queue_id, "control-plane-retain-shards-rpc")
+                .await;
         }
         self.check_decommissioning_status(&mut state_guard);
         Ok(RetainShardsResponse {})
@@ -1226,9 +1231,11 @@ impl EventSubscriber<ShardPositionsUpdate> for WeakIngesterState {
         for (shard_id, shard_position) in shard_positions_update.updated_shard_positions {
             let queue_id = queue_id(&index_uid, &source_id, &shard_id);
             if shard_position.is_eof() {
-                state_guard.delete_shard(&queue_id).await;
+                state_guard.delete_shard(&queue_id, "indexer-gossip").await;
             } else if !shard_position.is_beginning() {
-                state_guard.truncate_shard(&queue_id, shard_position).await;
+                state_guard
+                    .truncate_shard(&queue_id, shard_position, "indexer-gossip")
+                    .await;
             }
         }
     }
@@ -1338,7 +1345,7 @@ mod tests {
             let control_plane = ControlPlaneServiceClient::from_mock(mock_control_plane);
 
             Self {
-                node_id: "test-ingester".into(),
+                node_id: NodeId::from_str("test-ingester"),
                 control_plane,
                 ingester_pool: IngesterPool::default(),
                 disk_capacity: ByteSize::mb(256),
@@ -1352,7 +1359,7 @@ mod tests {
 
     impl IngesterForTest {
         pub fn with_node_id(mut self, node_id: &str) -> Self {
-            self.node_id = node_id.into();
+            self.node_id = NodeId::from_str(node_id);
             self
         }
 
@@ -3252,6 +3259,7 @@ mod tests {
             .expect_advise_reset_shards()
             .once()
             .returning(|mut request| {
+                assert_eq!(request.ingester_id, "test-ingester");
                 assert_eq!(request.shard_ids.len(), 1);
                 assert_eq!(request.shard_ids[0].index_uid(), &("test-index", 0));
                 assert_eq!(request.shard_ids[0].source_id, "test-source");

@@ -49,6 +49,10 @@ use crate::{Split, SplitMetadata, SplitState};
 /// Splits batch size returned by the stream splits API
 pub(crate) const STREAM_SPLITS_CHUNK_SIZE: usize = 100;
 
+/// Maximum number of soft-deleted document IDs allowed per split.
+/// Attempts to soft-delete documents that would push the total above this limit will fail.
+pub(crate) const MAX_SOFT_DELETED_DOCS_PER_SPLIT: usize = 10_000;
+
 /// An extended trait for [`MetastoreService`].
 #[async_trait]
 pub trait MetastoreServiceExt: MetastoreService {
@@ -640,6 +644,10 @@ pub struct ListSplitsQuery {
     /// A specific node ID to filter by.
     pub node_id: Option<NodeId>,
 
+    /// A non-empty list of split IDs to fetch, or
+    /// None to ignore this filter.
+    pub split_ids: Option<Vec<SplitId>>,
+
     /// The maximum number of splits to retrieve.
     pub limit: Option<usize>,
 
@@ -657,6 +665,12 @@ pub struct ListSplitsQuery {
 
     /// The maximum time range end to filter by.
     pub max_time_range_end: Option<i64>,
+
+    /// The time range to filter by on the secondary timestamp.
+    pub secondary_time_range: FilterRange<i64>,
+
+    /// The maximum time range end to filter by on the secondary timestamp.
+    pub max_secondary_time_range_end: Option<i64>,
 
     /// The delete opstamp range to filter by.
     pub delete_opstamp: FilterRange<u64>,
@@ -725,12 +739,15 @@ impl ListSplitsQuery {
             tags: None,
             time_range: Default::default(),
             max_time_range_end: None,
+            secondary_time_range: Default::default(),
+            max_secondary_time_range_end: None,
             delete_opstamp: Default::default(),
             update_timestamp: Default::default(),
             create_timestamp: Default::default(),
             mature: Bound::Unbounded,
             sort_by: SortBy::None,
             after_split: None,
+            split_ids: None,
         }
     }
 
@@ -749,12 +766,15 @@ impl ListSplitsQuery {
             tags: None,
             time_range: Default::default(),
             max_time_range_end: None,
+            secondary_time_range: Default::default(),
+            max_secondary_time_range_end: None,
             delete_opstamp: Default::default(),
             update_timestamp: Default::default(),
             create_timestamp: Default::default(),
             mature: Bound::Unbounded,
             sort_by: SortBy::None,
             after_split: None,
+            split_ids: None,
         })
     }
 
@@ -769,18 +789,27 @@ impl ListSplitsQuery {
             tags: None,
             time_range: Default::default(),
             max_time_range_end: None,
+            secondary_time_range: Default::default(),
+            max_secondary_time_range_end: None,
             delete_opstamp: Default::default(),
             update_timestamp: Default::default(),
             create_timestamp: Default::default(),
             mature: Bound::Unbounded,
             sort_by: SortBy::None,
             after_split: None,
+            split_ids: None,
         }
     }
 
     /// Selects splits produced by the specified node.
     pub fn with_node_id(mut self, node_id: NodeId) -> Self {
         self.node_id = Some(node_id);
+        self
+    }
+
+    /// Selects only splits with the specified IDs.
+    pub fn with_split_ids(mut self, split_ids: Vec<SplitId>) -> Self {
+        self.split_ids = Some(split_ids);
         self
     }
 
@@ -846,6 +875,28 @@ impl ListSplitsQuery {
     /// *less than or equal to* the provided value.
     pub fn with_max_time_range_end(mut self, v: i64) -> Self {
         self.max_time_range_end = Some(v);
+        self
+    }
+
+    /// Sets the field's lower bound to match values that are
+    /// *less than* the provided value.
+    pub fn with_secondary_time_range_end_lt(mut self, v: i64) -> Self {
+        self.secondary_time_range.end = Bound::Excluded(v);
+        self
+    }
+
+    /// Sets the field's upper bound to match values that are
+    /// *greater than or equal to* the provided value.
+    pub fn with_secondary_time_range_start_gte(mut self, v: i64) -> Self {
+        self.secondary_time_range.start = Bound::Included(v);
+        self
+    }
+
+    /// Retains only splits with a secondary time range end that is defined and
+    /// *less than or equal to* the provided value. If the secondary time range
+    /// end is not defined, falls back to the primary.
+    pub fn with_max_secondary_time_range_end(mut self, v: i64) -> Self {
+        self.max_secondary_time_range_end = Some(v);
         self
     }
 

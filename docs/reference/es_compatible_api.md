@@ -187,11 +187,12 @@ It is also possible to not supply an order and rely on the default order using t
 }
 ```
 
-If no format is provided for timestamps, timestamps are returned with milliseconds precision.
-
-If you need nanosecond precision, you can use the `epoch_nanos_int` format. Beware this means the resulting
-JSON may contain high numbers for which there is loss of precision when using languages where all numbers are
-floats, such as JavaScript.
+Fields explicitly specified as `datetime` in the doc mapping also support an
+output format. If no format is provided, timestamps are returned with
+milliseconds precision. If you need nanosecond precision, you can use the
+`epoch_nanos_int` format. Beware, this means the resulting JSON may contain high
+numbers for which there is loss of precision when using languages where all
+numbers are floats, such as JavaScript.
 
 ```json
 {
@@ -236,6 +237,40 @@ You can pass the `sort` value of the last hit in a subsequent request where othe
 ```
 
 This allows you to paginate your results.
+
+
+#### Note regarding multi-type pagination
+
+Pagination can get tricky on fields that have multiple types. In dynamic fields, multiple column types can be present for a given field within a single split. When using doc mapping updates, any type combination can be present across split.
+
+First, let's take a look at the various type systems we are working with.
+
+The JSON representation used for the sort values provides the following primitive types:
+- numerical
+- bool
+- string
+
+Tantivy uses the following types:
+- i64 / u64 / f64 (only one of these can be present in a split)
+- datetime
+- string
+- bool
+- ip (not supported in sort yet)
+- bytes (not supported in sort yet)
+
+Elasticsearch can represent date field sort values in various formats. In Quickwit, only integer formats are supported (millisecond or nanosecond). Either way, the fact that datetime can live along with another type inside a split yields unreliable pagination:
+- Because there isn't a simple and efficient common representation in the fast field u64 space, it's hard to represent datetime within the numerical (i64/u64/f64) order.
+- To paginate separately across numerical and datetime types a strongly typed representation of the json sort key would be necessary.
+
+The current implementation does the following:
+- If the mapping is explicitly set to datetime and never changed, pagination works as expected.
+- If the mapping evolved to datetime, pagination fails for splits that contain numerical values (i64, u64, f64 columns).
+- If the mapping is a json/dynamic field, pagination fails for splits that contain a datetime column. This can happen because on JSON field Tantivy automatically stores RFC3339 date strings in a datetime column.
+- If other types are mixed, the sort will iterate over all values type by type
+  - Asc: numeric -> string -> boolean -> datetime -> null
+  - Desc: datetime -> boolean -> string -> numeric -> null
+- Quickwit used to support specifying numbers as string in the search after value. That isn't possible anymore.
+
 
 ### `_msearch` &nbsp; Multi search API
 
@@ -695,10 +730,11 @@ When working on text, it is recommended to only use `term` queries on fields con
 
 #### Supported Parameters
 
-| Variable | Type     | Description                                                                  | Default |
-| -------- | -------- | ---------------------------------------------------------------------------- | ------- |
-| `value`  | String   | Term value. This is the string representation of a token after tokenization. | -       |
-| `boost`  | `Number` | Multiplier boost for score computation                                       | 1.0     |
+| Variable           | Type    | Description                                                                  | Default |
+| ------------------ | ------- | ---------------------------------------------------------------------------- | ------- |
+| `value`            | String  | Term value. This is the string representation of a token after tokenization. | -       |
+| `boost`            | Number  | Multiplier boost for score computation                                       | 1.0     |
+| `case_insensitive` | Boolean | Allows ASCII case insensitive matching of the value.                         | false   |
 
 
 
@@ -740,6 +776,91 @@ Query matching only documents containing a non-null value for a given field.
 | Variable | Type   | Description                                             | Default |
 | -------- | ------ | ------------------------------------------------------- | ------- |
 | `field`  | String | Only documents with a value for field will be returned. | -       |
+
+### `prefix`
+
+[Elasticsearch reference documentation](https://www.elastic.co/guide/en/elasticsearch/reference/8.8/query-dsl-prefix-query.html)
+
+Returns documents that contain a specific prefix in a provided field.
+
+#### Example
+
+```json
+{
+  "query": {
+    "prefix": {
+      "author.login" {
+        "value": "adm",
+      }
+    }
+  }
+}
+```
+
+#### Supported Parameters
+
+| Variable           | Type    | Description                                          | Default |
+| ------------------ | ------- | ---------------------------------------------------- | ------- |
+| `value`            | String  | Beginning characters of terms you wish to find.      | -       |
+| `case_insensitive` | Boolean | Allows ASCII case insensitive matching of the value. | false   |
+
+### `wildcard`
+
+[Elasticsearch reference documentation](https://www.elastic.co/guide/en/elasticsearch/reference/8.8/query-dsl-wildcard-query.html)
+
+Returns documents that contain terms matching a wildcard pattern:
+* `?` replaces one and only one term character
+* `*` replaces any number of term characters or an empty string
+
+#### Example
+
+```json
+{
+  "query": {
+    "wildcard": {
+      "author.login" {
+        "value": "adm?n*",
+      }
+    }
+  }
+}
+```
+
+#### Supported Parameters
+
+| Variable           | Type    | Description                                          | Default |
+| ------------------ | ------- | ---------------------------------------------------- | ------- |
+| `value`            | String  | Wildcard pattern for terms you wish to find.         | -       |
+| `boost`            | Number  | Multiplier boost for score computation.              | 1.0     |
+| `case_insensitive` | Boolean | Allows ASCII case insensitive matching of the value. | false   |
+
+
+### `regexp`
+
+[Elasticsearch reference documentation](https://www.elastic.co/guide/en/elasticsearch/reference/8.8/query-dsl-regexp-query.html)
+
+Returns documents that contain terms matching a regular expression.
+
+#### Example
+
+```json
+{
+  "query": {
+    "regexp": {
+      "author.login" {
+        "value": "adm.*n",
+      }
+    }
+  }
+}
+```
+
+#### Supported Parameters
+
+| Variable           | Type    | Description                                          | Default |
+| ------------------ | ------- | ---------------------------------------------------- | ------- |
+| `value`            | String  | Wildcard pattern for terms you wish to find.         | -       |
+| `case_insensitive` | Boolean | Allows ASCII case insensitive matching of the value. | false   |
 
 
 ### About the `lenient` argument

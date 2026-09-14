@@ -42,21 +42,23 @@ use quickwit_config::IndexTemplate;
 use quickwit_proto::metastore::{
     AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, CreateIndexRequest,
     CreateIndexResponse, CreateIndexTemplateRequest, DeleteIndexRequest,
-    DeleteIndexTemplatesRequest, DeleteQuery, DeleteShardsRequest, DeleteShardsResponse,
-    DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse, EntityKind,
-    FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse, GetClusterIdentityRequest,
-    GetClusterIdentityResponse, GetIndexTemplateRequest, GetIndexTemplateResponse,
-    IndexMetadataFailure, IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse,
-    IndexTemplateMatch, IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
+    DeleteIndexTemplatesRequest, DeleteKvRequest, DeleteQuery, DeleteShardsRequest,
+    DeleteShardsResponse, DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse,
+    EntityKind, FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse,
+    GetClusterIdentityRequest, GetClusterIdentityResponse, GetIndexTemplateRequest,
+    GetIndexTemplateResponse, GetKvRequest, GetKvResponse, IndexMetadataFailure,
+    IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse, IndexTemplateMatch,
+    IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
     LastDeleteOpstampResponse, ListDeleteTasksRequest, ListDeleteTasksResponse,
-    ListIndexTemplatesRequest, ListIndexTemplatesResponse, ListIndexesMetadataRequest,
-    ListIndexesMetadataResponse, ListShardsRequest, ListShardsResponse, ListSplitsRequest,
-    ListSplitsResponse, ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreError,
-    MetastoreResult, MetastoreService, MetastoreServiceStream, OpenShardSubrequest,
-    OpenShardsRequest, OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest,
-    ResetSourceCheckpointRequest, StageSplitsRequest, ToggleSourceRequest, UpdateIndexRequest,
-    UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest, UpdateSplitsDeleteOpstampResponse,
-    serde_utils,
+    ListIndexStatsRequest, ListIndexStatsResponse, ListIndexTemplatesRequest,
+    ListIndexTemplatesResponse, ListIndexesMetadataRequest, ListIndexesMetadataResponse,
+    ListShardsRequest, ListShardsResponse, ListSplitsRequest, ListSplitsResponse,
+    ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreError, MetastoreResult,
+    MetastoreService, MetastoreServiceStream, OpenShardSubrequest, OpenShardsRequest,
+    OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest, ResetSourceCheckpointRequest,
+    SetKvRequest, SoftDeleteDocumentsRequest, SoftDeleteDocumentsResponse, StageSplitsRequest,
+    ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest,
+    UpdateSplitsDeleteOpstampResponse, serde_utils,
 };
 use quickwit_proto::types::{IndexId, IndexUid};
 use quickwit_storage::Storage;
@@ -575,7 +577,7 @@ impl MetastoreService for FileBackedMetastore {
                     ingest_settings,
                     search_settings,
                     retention_policy_opt,
-                );
+                )?;
                 let index_metadata = index.metadata().clone();
 
                 if mutation_occurred {
@@ -729,6 +731,23 @@ impl MetastoreService for FileBackedMetastore {
         Ok(EmptyResponse {})
     }
 
+    async fn soft_delete_documents(
+        &self,
+        request: SoftDeleteDocumentsRequest,
+    ) -> MetastoreResult<SoftDeleteDocumentsResponse> {
+        let index_uid = request.index_uid().clone();
+        let num_soft_deleted_doc_ids = self
+            .mutate(&index_uid, |index| {
+                let num_soft_deleted_doc_ids =
+                    index.soft_delete_documents(&request.split_doc_ids)?;
+                Ok(MutationOccurred::Yes(num_soft_deleted_doc_ids))
+            })
+            .await?;
+        Ok(SoftDeleteDocumentsResponse {
+            num_soft_deleted_doc_ids,
+        })
+    }
+
     async fn add_source(&self, request: AddSourceRequest) -> MetastoreResult<EmptyResponse> {
         let source_config = request.deserialize_source_config()?;
         let index_uid = request.index_uid();
@@ -807,6 +826,51 @@ impl MetastoreService for FileBackedMetastore {
             .collect();
         let splits_responses_stream = Box::pin(futures::stream::iter(splits_responses));
         Ok(ServiceStream::new(splits_responses_stream))
+    }
+
+    async fn list_index_stats(
+        &self,
+        request: ListIndexStatsRequest,
+    ) -> MetastoreResult<ListIndexStatsResponse> {
+        let index_id_matcher =
+            IndexIdMatcher::try_from_index_id_patterns(&request.index_id_patterns)?;
+        let index_ids: Vec<IndexId> = {
+            let inner_rlock_guard = self.state.read().await;
+            inner_rlock_guard
+                .indexes
+                .iter()
+                .filter_map(|(index_id, index_state)| match index_state {
+                    LazyIndexStatus::Active(_) if index_id_matcher.is_match(index_id) => {
+                        Some(index_id)
+                    }
+                    _ => None,
+                })
+                .cloned()
+                .collect()
+        };
+
+        let mut index_read_futures = FuturesUnordered::new();
+        for index_id in index_ids {
+            let index_read_future = async move {
+                self.read_any(&index_id, None, |index| index.get_stats())
+                    .await
+            };
+            index_read_futures.push(index_read_future);
+        }
+
+        let mut index_stats = Vec::new();
+        while let Some(index_read_result) = index_read_futures.next().await {
+            match index_read_result {
+                Ok(stats) => index_stats.push(stats),
+                Err(MetastoreError::NotFound(_)) => {
+                    // If the index does not exist, we just skip it.
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(ListIndexStatsResponse { index_stats })
     }
 
     async fn list_stale_splits(
@@ -1229,6 +1293,43 @@ impl MetastoreService for FileBackedMetastore {
         Ok(GetClusterIdentityResponse {
             uuid: state_wlock_guard.identity.hyphenated().to_string(),
         })
+    }
+
+    // KV store API
+
+    async fn get_kv(&self, request: GetKvRequest) -> MetastoreResult<GetKvResponse> {
+        let state = self.state.read().await;
+        let value = state.kv_store.get(&request.key).cloned();
+        Ok(GetKvResponse { value })
+    }
+
+    async fn set_kv(&self, request: SetKvRequest) -> MetastoreResult<EmptyResponse> {
+        let mut state = self.state.write().await;
+        let previous_value = state.kv_store.insert(request.key.clone(), request.value);
+        let manifest = state.as_manifest();
+        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
+            // Rollback
+            match previous_value {
+                Some(value) => state.kv_store.insert(request.key, value),
+                None => state.kv_store.remove(&request.key),
+            };
+            return Err(error);
+        }
+        Ok(EmptyResponse {})
+    }
+
+    async fn delete_kv(&self, request: DeleteKvRequest) -> MetastoreResult<EmptyResponse> {
+        let mut state = self.state.write().await;
+        let previous_value = state.kv_store.remove(&request.key);
+        let manifest = state.as_manifest();
+        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
+            // Rollback
+            if let Some(value) = previous_value {
+                state.kv_store.insert(request.key, value);
+            }
+            return Err(error);
+        }
+        Ok(EmptyResponse {})
     }
 }
 
@@ -1698,9 +1799,9 @@ mod tests {
 
         // Stage splits in multiple threads
         let mut handles = Vec::new();
-        let mut random_generator = rand::thread_rng();
+        let mut random_generator = rand::rng();
         for i in 1..=20 {
-            let sleep_duration = Duration::from_millis(random_generator.gen_range(0..=200));
+            let sleep_duration = Duration::from_millis(random_generator.random_range(0..=200));
             let metastore = metastore.clone();
             let current_timestamp = OffsetDateTime::now_utc().unix_timestamp();
             let handle = tokio::spawn({

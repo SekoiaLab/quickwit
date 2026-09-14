@@ -38,20 +38,20 @@ interface RowProps {
 }
 
 const EntryName = styled("dt")`
-display: inline;
-background-color: ${QUICKWIT_INTERMEDIATE_GREY};
-color: #343741;
-padding: 2px 1px 2px 4px;
-margin-right: 4px;
-word-break: normal;
-border-radius: 3px;
+  display: inline;
+  background-color: ${QUICKWIT_INTERMEDIATE_GREY};
+  color: #343741;
+  padding: 2px 1px 2px 4px;
+  margin-right: 4px;
+  word-break: normal;
+  border-radius: 3px;
 `;
 
 const EntryValue = styled("dd")`
-display: inline;
-margin: 0;
-padding: 0;
-margin-inline-end: 5px;
+  display: inline;
+  margin: 0;
+  padding: 0;
+  margin-inline-end: 5px;
 `;
 
 function EntryFormatter(entry: Entry) {
@@ -83,7 +83,14 @@ function DisplayTimestampValue(row: RawDoc, timestampField: Field | null) {
   }
   return (
     <TableCell sx={{ verticalAlign: "top", padding: "4px" }}>
-      <Box sx={{ maxHeight: "115px", width: "90px", display: "inline-block" }}>
+      <Box
+        sx={{
+          maxHeight: "115px",
+          width: "90px",
+          display: "inline-block",
+          wordBreak: "break-word",
+        }}
+      >
         {formatDateTime(
           field_value,
           timestampField.field_mapping.output_format,
@@ -93,7 +100,6 @@ function DisplayTimestampValue(row: RawDoc, timestampField: Field | null) {
   );
 }
 
-/* eslint-disable  @typescript-eslint/no-explicit-any */
 function formatDateTime(field_value: any, timestampOutputFormat: string): any {
   // A unix timestamp can be in secs/millis/micros/nanos and need to be converted properly.
   if (

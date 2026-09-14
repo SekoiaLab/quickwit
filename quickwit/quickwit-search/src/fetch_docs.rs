@@ -180,9 +180,7 @@ async fn fetch_docs_in_split(
     .context("open-index-for-split")?;
     // we add an executor here, we could add it in open_index_with_caches, though we should verify
     // the side-effect before
-    let tantivy_executor = crate::search_thread_pool()
-        .get_underlying_rayon_thread_pool()
-        .into();
+    let tantivy_executor = crate::search_thread_pool().get_executor("fetch_docs", "unknown");
     index.set_executor(tantivy_executor);
     let index_reader = index
         .reader_builder()
@@ -304,7 +302,7 @@ async fn create_fields_snippet_generator(
     let schema = searcher.schema();
     let query_ast_resolved = serde_json::from_str(&snippet_request.query_ast_resolved)
         .context("failed to deserialize QueryAst")?;
-    let (query, _) = doc_mapper.query(schema.clone(), &query_ast_resolved, false)?;
+    let (query, _) = doc_mapper.query(schema.clone(), query_ast_resolved, false, None)?;
     let mut snippet_generators = HashMap::new();
     for field_name in &snippet_request.snippet_fields {
         let field = schema.get_field(field_name)?;

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use tantivy::directory::OwnedBytes;
 
-use crate::metrics::CacheMetrics;
+use crate::metrics::CacheMetricCounters;
 
 #[derive(Clone, PartialOrd, Ord, PartialEq, Eq)]
 struct CacheKey<'a, T: ToOwned + ?Sized> {
@@ -58,11 +58,11 @@ struct NeedMutByteRangeCache<T: 'static + ToOwned + ?Sized> {
     // this is hardly significant as items can get merged if they overlap
     num_items: u64,
     num_bytes: u64,
-    cache_counters: &'static CacheMetrics,
+    cache_counters: &'static CacheMetricCounters,
 }
 
 impl<T: 'static + ToOwned + ?Sized + Ord> NeedMutByteRangeCache<T> {
-    fn with_infinite_capacity(cache_counters: &'static CacheMetrics) -> Self {
+    fn with_infinite_capacity(cache_counters: &'static CacheMetricCounters) -> Self {
         NeedMutByteRangeCache {
             cache: BTreeMap::new(),
             num_items: 0,
@@ -352,7 +352,7 @@ struct Inner {
 
 impl ByteRangeCache {
     /// Creates a slice cache that never removes any entry.
-    pub fn with_infinite_capacity(cache_counters: &'static CacheMetrics) -> Self {
+    pub fn with_infinite_capacity(cache_counters: &'static CacheMetricCounters) -> Self {
         let need_mut_byte_range_cache =
             NeedMutByteRangeCache::with_infinite_capacity(cache_counters);
         let inner = Inner {
@@ -402,7 +402,7 @@ mod tests {
 
     use super::ByteRangeCache;
     use crate::OwnedBytes;
-    use crate::metrics::{CACHE_METRICS_FOR_TESTS, CacheMetrics};
+    use crate::metrics::{CACHE_METRICS_FOR_TESTS, ComponentCacheMetrics};
 
     #[derive(Debug)]
     enum Operation {
@@ -445,7 +445,7 @@ mod tests {
             state.insert("path1", vec![false; 12]);
             state.insert("path2", vec![false; 12]);
 
-            let cache = ByteRangeCache::with_infinite_capacity(&CACHE_METRICS_FOR_TESTS);
+            let cache = ByteRangeCache::with_infinite_capacity(&CACHE_METRICS_FOR_TESTS.active_cache_metrics);
 
             for op in ops {
                 match op {
@@ -510,10 +510,10 @@ mod tests {
     fn test_byte_range_cache_doesnt_merge_unnecessarily() {
         // we need to get a 'static ref to metrics, and want a dedicated metrics because we assert
         // on it
-        static METRICS: Lazy<CacheMetrics> =
-            Lazy::new(|| CacheMetrics::for_component("byterange_cache_test"));
+        static METRICS: Lazy<ComponentCacheMetrics> =
+            Lazy::new(|| ComponentCacheMetrics::for_component_in_tests("byterange_cache_test"));
 
-        let cache = ByteRangeCache::with_infinite_capacity(&METRICS);
+        let cache = ByteRangeCache::with_infinite_capacity(&METRICS.active_cache_metrics);
 
         let key: std::path::PathBuf = "key".into();
 

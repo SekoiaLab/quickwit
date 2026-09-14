@@ -94,6 +94,7 @@ The doc mapping defines how a document and the fields it contains are stored and
 | `tag_fields` | Collection of fields* explicitly defined in `field_mappings` whose values will be stored as part of the `tags` metadata. Allowed types are: `text` (with raw tokenizer), `i64` and `u64`. [Learn more about tags](../overview/concepts/querying.md#tag-pruning). | `[]` |
 | `store_source` | Whether or not the original JSON document is stored or not in the index.   | `false` |
 | `timestamp_field`      | Timestamp field* used for sharding documents in splits. The field has to be of type `datetime`. [Learn more about time sharding](./../overview/architecture.md).  | `None` |
+| `indexation_time_field`      | Field with that will hold the indexation time of the document. This field is populated during indexation. The field has to be of type `datetime`.  | `None` |
 | `partition_key`   |  If set, quickwit will route documents into different splits depending on the field name declared as the `partition_key`. | `null` |
 | `max_num_partitions`  | Limits the number of splits created through partitioning. (See [Partitioning](../overview/concepts/querying.md#partitioning))  |    `200` |
 | `index_field_presence` | `exists` queries are enabled automatically for fast fields. To enable it for all other fields set this parameter to `true`. Enabling it can have a significant CPU-cost on indexing.  |  false |
@@ -358,6 +359,14 @@ fast:
   normalizer: lowercase
 ```
 
+Stored primitive types are inferred from the JSON value types using the following rules:
+- a boolean value `true` or `false` is stored as `bool`
+- numeric values are cast to the first compatible format between `i64`, `u64` or
+  `f64` (in this order)
+- for string values (surrounded with quotes), Tantivy attempts to parse a date
+  in `rfc3339` format. If the parsing fails, the value is stored as `text` using
+  the configured tokenization rules
+
 **Parameters for JSON field**
 
 | Variable      | Description   | Default value |
@@ -435,8 +444,13 @@ record: basic
 Concatenate fields don't support fast fields, and are never stored. They uses their own tokenizer, independently of the
 tokenizer configured on the individual fields.
 At query time, concatenate fields don't support range queries.
-Only the following types are supported inside a concatenate field: text, bool, i64, u64, f64, json. Other types are rejected
-at index creation, or silently discarded during indexation if they are found inside a json field.
+Only the following types are supported inside a concatenate field: text, bool,
+i64, u64, f64, json. Other types are rejected at index creation, or silently
+discarded during indexation if they are found inside a json field. Unlike
+regular JSON fields, JSON fields in a concatenate field don't store RFC3339
+dates as Tantivy dates. This means you can still perform prefix queries,
+e.g `my_default_field:"2025-12-12"*` to work around the lack of support for range
+queries.
 Adding an object field to a concatenate field doesn't automatically add its subfields (yet).
 <!-- typing is made so it wouldn't be too hard to add, as well as things like params_* matching all fields which starts name with params_ , but the feature isn't implemented yet -->
 It isn't possible to add subfields from a json field to a concatenate field. For instance if `attributes` is a json field, it's not possible to add only `attributes.color` to a concatenate field.
@@ -551,6 +565,8 @@ src.port:53
 // and of course we can combine them with boolean operators.
 src.port:53 AND query_params.ctk:e42bb897d
 ```
+
+The stored primitive type inference is the [same as for JSON fields](#json-type).
 
 ### Field name validation rules
 

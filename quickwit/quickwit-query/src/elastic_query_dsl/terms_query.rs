@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeSet, HashMap};
+use std::sync::LazyLock;
+
+use anyhow::bail;
 use serde::Deserialize;
 
-use crate::elastic_query_dsl::bool_query::BoolQuery;
 use crate::elastic_query_dsl::one_field_map::OneFieldMap;
-use crate::elastic_query_dsl::term_query::term_query_from_field_value;
 use crate::elastic_query_dsl::{ConvertibleToQueryAst, ElasticQueryDslInner};
 use crate::not_nan_f32::NotNaNf32;
-use crate::query_ast::QueryAst;
+use crate::query_ast::{QueryAst, TermSetQuery};
 
 #[derive(PartialEq, Eq, Debug, Deserialize, Clone)]
 #[serde(try_from = "TermsQueryForSerialization")]
@@ -39,15 +41,34 @@ struct TermsQueryForSerialization {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum OneOrMany {
-    One(String),
-    Many(Vec<String>),
+enum TermValue {
+    I64(i64),
+    U64(u64),
+    Str(String),
 }
+
+impl From<TermValue> for String {
+    fn from(term_value: TermValue) -> String {
+        match term_value {
+            TermValue::I64(val) => val.to_string(),
+            TermValue::U64(val) => val.to_string(),
+            TermValue::Str(val) => val,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(TermValue),
+    Many(Vec<TermValue>),
+}
+
 impl From<OneOrMany> for Vec<String> {
     fn from(one_or_many: OneOrMany) -> Vec<String> {
         match one_or_many {
-            OneOrMany::One(one_value) => vec![one_value],
-            OneOrMany::Many(values) => values,
+            OneOrMany::One(one_value) => vec![one_value.into()],
+            OneOrMany::Many(values) => values.into_iter().map(|v| v.into()).collect(),
         }
     }
 }
@@ -66,17 +87,34 @@ impl TryFrom<TermsQueryForSerialization> for TermsQuery {
     }
 }
 
+const TERMS_QUERY_WARN_THRESHOLD: usize = 10_000;
+static TERMS_QUERY_REJECT_THRESHOLD: LazyLock<usize> =
+    LazyLock::new(|| quickwit_common::get_from_env("QW_MAX_TERMS_QUERY_SIZE", 100_000, false));
+
 impl ConvertibleToQueryAst for TermsQuery {
     fn convert_to_query_ast(self) -> anyhow::Result<QueryAst> {
-        let term_queries: Vec<ElasticQueryDslInner> = self
-            .values
-            .into_iter()
-            .map(|value| term_query_from_field_value(self.field.clone(), value))
-            .map(ElasticQueryDslInner::from)
-            .collect();
-        let mut union = BoolQuery::union(term_queries);
-        union.boost = self.boost;
-        union.convert_to_query_ast()
+        if self.values.len() > TERMS_QUERY_WARN_THRESHOLD {
+            tracing::warn!(
+                num_terms = self.values.len(),
+                field = %self.field,
+                "terms query contains more than {TERMS_QUERY_WARN_THRESHOLD} terms"
+            );
+        }
+        if self.values.len() > *TERMS_QUERY_REJECT_THRESHOLD {
+            bail!(
+                "too many terms ({}>{})",
+                self.values.len(),
+                *TERMS_QUERY_REJECT_THRESHOLD
+            )
+        }
+        let mut terms_per_field = HashMap::new();
+        let values_set: BTreeSet<String> = self.values.into_iter().collect();
+        terms_per_field.insert(self.field, values_set);
+
+        let term_set_query = TermSetQuery { terms_per_field };
+        let query_ast: QueryAst = term_set_query.into();
+
+        Ok(query_ast.boost(self.boost))
     }
 }
 
@@ -107,6 +145,14 @@ mod tests {
         let terms_query: TermsQuery = serde_json::from_str(terms_query_json).unwrap();
         assert_eq!(&terms_query.field, "user.id");
         assert_eq!(&terms_query.values[..], &["hello".to_string()]);
+    }
+
+    #[test]
+    fn test_terms_query_not_string() {
+        let terms_query_json = r#"{ "user.id": [1, 2] }"#;
+        let terms_query: TermsQuery = serde_json::from_str(terms_query_json).unwrap();
+        assert_eq!(&terms_query.field, "user.id");
+        assert_eq!(&terms_query.values[..], &["1".to_string(), "2".to_string()]);
     }
 
     #[test]

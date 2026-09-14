@@ -27,6 +27,7 @@ pub mod jemalloc_profiled;
 mod kill_switch;
 pub mod metrics;
 pub mod net;
+pub mod numeric_types;
 mod path_hasher;
 pub mod pretty;
 mod progress;
@@ -65,6 +66,18 @@ pub use socket_addr_legacy_hash::SocketAddrLegacyHash;
 pub use stream_utils::{BoxStream, ServiceStream};
 use tracing::{error, info};
 
+/// Returns true at compile time. This function is mostly used with serde to initialize boolean
+/// fields to true.
+pub const fn true_fn() -> bool {
+    true
+}
+
+/// Returns whether the given boolean value is true. This function is mostly used with serde to skip
+/// serializing boolean fields with `skip_serializing_if = "is_true"` when the value is true.
+pub fn is_true(value: &bool) -> bool {
+    *value
+}
+
 pub fn chunk_range(range: Range<usize>, chunk_size: usize) -> impl Iterator<Item = Range<usize>> {
     range.clone().step_by(chunk_size).map(move |block_start| {
         let block_end = (block_start + chunk_size).min(range.end);
@@ -77,7 +90,10 @@ pub fn into_u64_range(range: Range<usize>) -> Range<u64> {
 }
 
 pub fn setup_logging_for_tests() {
-    let _ = env_logger::builder().format_timestamp(None).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
 }
 
 pub fn split_file(split_id: impl Display) -> String {
@@ -174,6 +190,32 @@ pub fn is_false(value: &bool) -> bool {
 
 pub fn no_color() -> bool {
     matches!(env::var("NO_COLOR"), Ok(value) if !value.is_empty())
+}
+
+#[macro_export]
+macro_rules! assert_eventually {
+    ($cond:expr, $timeout:expr, $interval:expr) => {
+        let start = std::time::Instant::now();
+        loop {
+            if $cond {
+                break;
+            }
+            if start.elapsed() > $timeout {
+                panic!(
+                    "assertion failed: condition `{}` never became true within {} ms",
+                    stringify!($cond),
+                    $timeout.as_millis()
+                );
+            }
+            tokio::time::sleep($interval).await;
+        }
+    };
+    ($cond:expr, $timeout:expr) => {
+        assert_eventually!($cond, $timeout, std::time::Duration::from_millis(50));
+    };
+    ($cond:expr) => {
+        assert_eventually!($cond, std::time::Duration::from_secs(1));
+    };
 }
 
 #[macro_export]

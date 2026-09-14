@@ -30,8 +30,8 @@ endpoint: simple/ingest
 params:
   commit: force
 ndjson:
-  - {"ts": 1684993001, "not_fast": 1684993001}
-  - {"ts": 1684993002, "not_fast": 1684993002}
+  - {"ts": 1684993001, "not_fast": 1684993001, "auto_date": "2023-05-25T10:00:00Z"}
+  - {"ts": 1684993002, "not_fast": 1684993002, "auto_date": "2023-05-25T11:00:00Z"}
 ---
 # Ingest documents split #2
 method: POST
@@ -98,3 +98,31 @@ ndjson:
   - {"text_raw": "indexed with raw tokenizer dashes"}
   - {"text_fast": "fast-text-value-dashes"}
   - {"text_fast": "fast text value whitespaces"}
+---
+method: DELETE
+endpoint: indexes/millisec
+status_code: null
+---
+method: POST
+endpoint: indexes/
+json:
+  version: "0.7"
+  index_id: millisec
+  doc_mapping:
+    timestamp_field: ts
+    mode: strict
+    field_mappings:
+      - name: ts
+        type: datetime
+        fast: true
+        input_formats: ["rfc3339"]
+        fast_precision: milliseconds
+---
+method: POST
+endpoint: millisec/ingest
+params:
+  commit: force
+ndjson:
+  - {"ts": "2022-12-16T10:00:56.297Z"}
+  - {"ts": "2022-12-16T10:00:57.000Z"}
+  - {"ts": "2022-12-16T10:00:57.297Z"}

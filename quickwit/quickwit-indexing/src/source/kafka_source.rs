@@ -25,7 +25,7 @@ use quickwit_actors::{ActorExitStatus, Mailbox};
 use quickwit_config::KafkaSourceParams;
 use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
 use quickwit_proto::metastore::SourceType;
-use quickwit_proto::types::{IndexUid, Position};
+use quickwit_proto::types::{IndexUid, NodeIdRef, Position};
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::{
     BaseConsumer, CommitMode, Consumer, ConsumerContext, DefaultConsumerContext, Rebalance,
@@ -240,6 +240,7 @@ impl KafkaSource {
         let (events_tx, events_rx) = mpsc::channel(100);
         let (truncate_tx, truncate_rx) = watch::channel(SourceCheckpoint::default());
         let (client_config, consumer, group_id) = create_consumer(
+            source_runtime.node_id(),
             source_runtime.index_uid(),
             source_runtime.source_id(),
             source_params,
@@ -654,6 +655,7 @@ pub(super) async fn check_connectivity(params: KafkaSourceParams) -> anyhow::Res
 
 /// Creates a new `KafkaSourceConsumer`.
 fn create_consumer(
+    node_id: &NodeIdRef,
     index_uid: &IndexUid,
     source_id: &str,
     params: KafkaSourceParams,
@@ -676,6 +678,7 @@ fn create_consumer(
             params.enable_backfill_mode.to_string(),
         )
         .set("group.id", &group_id)
+        .set("client.id", node_id.as_str())
         .set_log_level(log_level)
         .create_with_context(RdKafkaContext {
             topic: params.topic,
@@ -714,6 +717,10 @@ fn parse_client_params(client_params: JsonValue) -> anyhow::Result<ClientConfig>
     };
     let mut client_config = ClientConfig::new();
     for (key, value_json) in params {
+        if key == "indexing_settings" {
+            // used for QW per source settings override workaround
+            continue;
+        }
         let value = match value_json {
             JsonValue::Bool(value_bool) => value_bool.to_string(),
             JsonValue::Number(value_number) => value_number.to_string(),
@@ -834,6 +841,7 @@ mod kafka_broker_tests {
     {
         let producer: &FutureProducer = &ClientConfig::new()
             .set("bootstrap.servers", "localhost:9092")
+            .set("broker.address.family", "v4")
             .set("statistics.interval.ms", "500")
             .set("api.version.request", "true")
             .set("debug", "all")
@@ -872,6 +880,8 @@ mod kafka_broker_tests {
 
     fn get_source_config(topic: &str, auto_offset_reset: &str) -> (String, SourceConfig) {
         let source_id = append_random_suffix("test-kafka-source--source");
+        // Setting explicitly ip v4 with `broker.address.family` is required
+        // because of https://github.com/fede1024/rust-rdkafka/issues/809
         let source_config = SourceConfig {
             source_id: source_id.clone(),
             num_pipelines: NonZeroUsize::MIN,
@@ -882,6 +892,7 @@ mod kafka_broker_tests {
                 client_params: json!({
                     "auto.offset.reset": auto_offset_reset,
                     "bootstrap.servers": "localhost:9092",
+                    "broker.address.family": "v4",
                 }),
                 enable_backfill_mode: true,
             }),
@@ -1169,7 +1180,7 @@ mod kafka_broker_tests {
     #[tokio::test]
     async fn test_kafka_source_suggest_truncate() {
         let admin_client = create_admin_client();
-        let topic = append_random_suffix("test-kafka-source--suggest-truncate--topic");
+        let topic = append_random_suffix("test--source--suggest-truncate--topic");
         create_topic(&admin_client, &topic, 2).await.unwrap();
 
         let metastore = metastore_for_test();

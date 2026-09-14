@@ -46,7 +46,8 @@ pub use cluster_config::ClusterConfig;
 use index_config::serialize::{IndexConfigV0_8, VersionedIndexConfig};
 pub use index_config::{
     IndexConfig, IndexingResources, IndexingSettings, IngestSettings, RetentionPolicy,
-    SearchSettings, build_doc_mapper, load_index_config_from_user_config, load_index_config_update,
+    RetentionTimestampType, SearchSettings, build_doc_mapper, load_index_config_from_user_config,
+    load_index_config_update, prepare_doc_mapping_update,
 };
 pub use quickwit_doc_mapper::DocMapping;
 use serde::Serialize;
@@ -72,14 +73,15 @@ pub use crate::metastore_config::{
     MetastoreBackend, MetastoreConfig, MetastoreConfigs, PostgresMetastoreConfig,
 };
 pub use crate::node_config::{
-    DEFAULT_QW_CONFIG_PATH, GrpcConfig, IndexerConfig, IngestApiConfig, JaegerConfig,
-    KeepAliveConfig, NodeConfig, RestConfig, SearcherConfig, SplitCacheLimits,
-    StorageTimeoutPolicy, TlsConfig,
+    CacheConfig, CachePolicy, DEFAULT_QW_CONFIG_PATH, GrpcConfig, IndexerConfig, IngestApiConfig,
+    JaegerConfig, KeepAliveConfig, NodeConfig, RestConfig, SearcherConfig, SplitCacheLimits,
+    StorageTimeoutPolicy, TlsConfig, VirtualCacheConfig,
 };
 use crate::source_config::serialize::{SourceConfigV0_7, SourceConfigV0_8, VersionedSourceConfig};
 pub use crate::storage_config::{
     AzureStorageConfig, FileStorageConfig, GoogleCloudStorageConfig, RamStorageConfig,
-    S3StorageConfig, StorageBackend, StorageBackendFlavor, StorageConfig, StorageConfigs,
+    S3EncryptionConfig, S3StorageConfig, StorageBackend, StorageBackendFlavor, StorageConfig,
+    StorageConfigs,
 };
 
 /// Returns true if the ingest API v2 is enabled.
@@ -94,6 +96,12 @@ pub fn disable_ingest_v1() -> bool {
     static DISABLE_INGEST_V1: Lazy<bool> =
         Lazy::new(|| get_bool_from_env("QW_DISABLE_INGEST_V1", false));
     *DISABLE_INGEST_V1
+}
+
+pub fn is_delete_task_service_disabled() -> bool {
+    static DISABLE_DELETE_TASK_SERVICE_ENV: Lazy<bool> =
+        Lazy::new(|| get_bool_from_env("QW_DISABLE_DELETE_TASK_SERVICE", false));
+    *DISABLE_DELETE_TASK_SERVICE_ENV
 }
 
 #[derive(utoipa::OpenApi)]
@@ -117,6 +125,7 @@ pub fn disable_ingest_v1() -> bool {
     PulsarSourceParams,
     RegionOrEndpoint,
     RetentionPolicy,
+    RetentionTimestampType,
     SearchSettings,
     SourceConfigV0_7,
     SourceConfigV0_8,

@@ -73,7 +73,7 @@ impl ApiResponse {
     }
 }
 
-/// A cousin of [`quickwit_search::SearchResponseRest`] that implements [`Deserialize`]
+/// A cousin of `quickwit_search::SearchResponseRest` that implements [`Deserialize`]
 ///
 /// This version of the response is necessary because
 /// `serde_json_borrow::OwnedValue` is not deserializeable.
@@ -83,7 +83,6 @@ pub struct SearchResponseRestClient {
     pub hits: Vec<JsonValue>,
     pub snippets: Option<Vec<JsonValue>>,
     pub elapsed_time_micros: u64,
-    pub errors: Vec<String>,
     pub aggregations: Option<JsonValue>,
 }
 

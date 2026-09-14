@@ -65,7 +65,6 @@ export class Client {
     );
   }
 
-  // eslint-disable-next-line
   async config(): Promise<Record<string, any>> {
     return await this.fetch(
       `${this.apiRoot()}config`,
@@ -82,7 +81,8 @@ export class Client {
     ]);
     return {
       metadata: metadata,
-      splits: splits,
+      splits: splits[0],
+      split_limit_reached: splits[1],
     };
   }
 
@@ -90,14 +90,16 @@ export class Client {
     return this.fetch(`${this.apiRoot()}indexes/${indexId}`, {});
   }
 
-  async getAllSplits(indexId: string): Promise<Array<SplitMetadata>> {
+  async getAllSplits(
+    indexId: string,
+  ): Promise<[Array<SplitMetadata>, boolean]> {
     // TODO: restrieve all the splits.
     const results: { splits: Array<SplitMetadata> } = await this.fetch(
       `${this.apiRoot()}indexes/${indexId}/splits?limit=10000`,
       {},
     );
 
-    return results["splits"];
+    return [results["splits"], results["splits"].length === 10000];
   }
 
   async listIndexes(): Promise<Array<IndexMetadata>> {
@@ -141,7 +143,6 @@ export class Client {
     request: SearchRequest,
     timestamp_field: string | null,
   ): string {
-    /* eslint-disable  @typescript-eslint/no-explicit-any */
     const body: any = {
       // TODO: the trim should be done in the backend.
       query: request.query.trim() || "*",
@@ -166,12 +167,11 @@ export class Client {
     return JSON.stringify(body);
   }
 
-  /* eslint-disable  @typescript-eslint/no-explicit-any */
   buildAggregation(
     request: SearchRequest,
     timestamp_field: string | null,
   ): any {
-    let aggregation = undefined;
+    let aggregation: any;
     if (request.aggregationConfig.metric) {
       const metric = request.aggregationConfig.metric;
       aggregation = {
@@ -185,7 +185,7 @@ export class Client {
     if (request.aggregationConfig.histogram && timestamp_field) {
       const histogram = request.aggregationConfig.histogram;
       const interval = histogram.interval;
-      let extended_bounds;
+      let extended_bounds: any;
       if (request.startTimestamp && request.endTimestamp) {
         extended_bounds = {
           min: request.startTimestamp,

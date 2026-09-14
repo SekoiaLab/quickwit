@@ -509,7 +509,7 @@ mod tests {
         }
         let index = index_writer.finalize()?;
 
-        let node_id = NodeId::from("test-node");
+        let node_id = NodeId::from_str("test-node");
         let index_uid = IndexUid::new_with_random_ulid("test-index");
         let source_id = "test-source".to_string();
 
@@ -526,9 +526,10 @@ mod tests {
                 num_docs,
                 uncompressed_docs_size_in_bytes: num_docs * 15,
                 time_range: timerange_opt,
-                replaced_split_ids: Vec::new(),
+                secondary_time_range: None,
                 delete_opstamp: 0,
                 num_merge_ops: 0,
+                replaced_splits: Vec::new(),
             },
             index,
             split_scratch_directory,

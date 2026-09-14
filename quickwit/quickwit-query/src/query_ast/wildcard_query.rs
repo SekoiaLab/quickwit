@@ -17,13 +17,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use tantivy::Term;
 use tantivy::schema::{Field, FieldType, Schema as TantivySchema};
 
 use super::{BuildTantivyAst, QueryAst};
-use crate::query_ast::{AutomatonQuery, JsonPathPrefix, TantivyQueryAst};
+use crate::query_ast::{AutomatonQuery, BuildTantivyAstContext, JsonPathPrefix, TantivyQueryAst};
 use crate::tokenizers::TokenizerManager;
-use crate::{InvalidQuery, find_field_or_hit_dynamic};
+use crate::{InvalidQuery, JsonPath, find_field_or_hit_dynamic};
 
 /// A Wildcard query allows to match 'bond' with a query like 'b*d'.
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
@@ -32,6 +31,7 @@ pub struct WildcardQuery {
     pub value: String,
     /// Support missing fields
     pub lenient: bool,
+    pub case_insensitive: bool,
 }
 
 impl From<WildcardQuery> for QueryAst {
@@ -111,7 +111,7 @@ impl WildcardQuery {
         &self,
         schema: &TantivySchema,
         tokenizer_manager: &TokenizerManager,
-    ) -> Result<(Field, Option<Vec<u8>>, String), InvalidQuery> {
+    ) -> Result<(Field, Option<JsonPath>, String), InvalidQuery> {
         let Some((field, field_entry, json_path)) = find_field_or_hit_dynamic(&self.field, schema)
         else {
             return Err(InvalidQuery::FieldDoesNotExist {
@@ -133,6 +133,12 @@ impl WildcardQuery {
                 let tokenizer_name = text_field_indexing.tokenizer();
                 let regex =
                     sub_query_parts_to_regex(sub_query_parts, tokenizer_name, tokenizer_manager)?;
+                let regex =
+                    if self.case_insensitive && self.value.chars().any(|c| c.is_alphabetic()) {
+                        format!("(?i){}", regex)
+                    } else {
+                        regex
+                    };
 
                 Ok((field, None, regex))
             }
@@ -147,18 +153,15 @@ impl WildcardQuery {
                 let tokenizer_name = text_field_indexing.tokenizer();
                 let regex =
                     sub_query_parts_to_regex(sub_query_parts, tokenizer_name, tokenizer_manager)?;
+                let regex =
+                    if self.case_insensitive && self.value.chars().any(|c| c.is_alphabetic()) {
+                        format!("(?i){}", regex)
+                    } else {
+                        regex
+                    };
 
-                let mut term_for_path = Term::from_field_json_path(
-                    field,
-                    json_path,
-                    json_options.is_expand_dots_enabled(),
-                );
-                term_for_path.append_type_and_str("");
-
-                let value = term_for_path.value();
-                // We skip the 1st byte which is a marker to tell this is json. This isn't present
-                // in the dictionary
-                let byte_path_prefix = value.as_serialized()[1..].to_owned();
+                let byte_path_prefix =
+                    JsonPath::from_json_path(json_path, json_options.is_expand_dots_enabled());
 
                 Ok((field, Some(byte_path_prefix), regex))
             }
@@ -172,12 +175,9 @@ impl WildcardQuery {
 impl BuildTantivyAst for WildcardQuery {
     fn build_tantivy_ast_impl(
         &self,
-        schema: &TantivySchema,
-        tokenizer_manager: &TokenizerManager,
-        _search_fields: &[String],
-        _with_validation: bool,
+        context: &BuildTantivyAstContext,
     ) -> Result<TantivyQueryAst, InvalidQuery> {
-        let (field, path, regex) = match self.to_regex(schema, tokenizer_manager) {
+        let (field, path, regex) = match self.to_regex(context.schema, context.tokenizer_manager) {
             Ok(res) => res,
             Err(InvalidQuery::FieldDoesNotExist { .. }) if self.lenient => {
                 return Ok(TantivyQueryAst::match_none());
@@ -219,6 +219,7 @@ mod tests {
             field: "text_field".to_string(),
             value: "MyString Wh1ch?a.nOrMal Tokenizer would*cut".to_string(),
             lenient: false,
+            case_insensitive: false,
         };
 
         let tokenizer_manager = create_default_quickwit_tokenizer_manager();
@@ -238,7 +239,6 @@ mod tests {
             "raw_lowercase",
             "lowercase",
             "default",
-            "en_stem",
             "chinese_compatible",
             "source_code_default",
             "source_code_with_hex",
@@ -251,6 +251,48 @@ mod tests {
 
             let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
             assert_eq!(regex, "mystring wh1ch.a\\.normal tokenizer would.*cut");
+            assert!(path.is_none());
+        }
+    }
+
+    #[test]
+    fn test_wildcard_query_to_regex_on_escaped_text() {
+        let query = WildcardQuery {
+            field: "text_field".to_string(),
+            value: "MyString Wh1ch\\?a.nOrMal Tokenizer would\\*cut".to_string(),
+            lenient: false,
+            case_insensitive: false,
+        };
+
+        let tokenizer_manager = create_default_quickwit_tokenizer_manager();
+        for tokenizer in ["raw", "whitespace"] {
+            let mut schema_builder = TantivySchema::builder();
+            let text_options = TextOptions::default()
+                .set_indexing_options(TextFieldIndexing::default().set_tokenizer(tokenizer));
+            schema_builder.add_text_field("text_field", text_options);
+            let schema = schema_builder.build();
+
+            let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
+            assert_eq!(regex, "MyString Wh1ch\\?a\\.nOrMal Tokenizer would\\*cut");
+            assert!(path.is_none());
+        }
+
+        for tokenizer in [
+            "raw_lowercase",
+            "lowercase",
+            "default",
+            "chinese_compatible",
+            "source_code_default",
+            "source_code_with_hex",
+        ] {
+            let mut schema_builder = TantivySchema::builder();
+            let text_options = TextOptions::default()
+                .set_indexing_options(TextFieldIndexing::default().set_tokenizer(tokenizer));
+            schema_builder.add_text_field("text_field", text_options);
+            let schema = schema_builder.build();
+
+            let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
+            assert_eq!(regex, "mystring wh1ch\\?a\\.normal tokenizer would\\*cut");
             assert!(path.is_none());
         }
     }
@@ -263,6 +305,7 @@ mod tests {
             field: "json_field.Inner.Fie*ld".to_string(),
             value: "MyString Wh1ch?a.nOrMal Tokenizer would*cut".to_string(),
             lenient: false,
+            case_insensitive: false,
         };
 
         let tokenizer_manager = create_default_quickwit_tokenizer_manager();
@@ -275,14 +318,13 @@ mod tests {
 
             let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
             assert_eq!(regex, "MyString Wh1ch.a\\.nOrMal Tokenizer would.*cut");
-            assert_eq!(path.unwrap(), "Inner\u{1}Fie*ld\0s".as_bytes());
+            assert_eq!(path.unwrap().0, "Inner\u{1}Fie*ld\0s".as_bytes());
         }
 
         for tokenizer in [
             "raw_lowercase",
             "lowercase",
             "default",
-            "en_stem",
             "chinese_compatible",
             "source_code_default",
             "source_code_with_hex",
@@ -295,7 +337,7 @@ mod tests {
 
             let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
             assert_eq!(regex, "mystring wh1ch.a\\.normal tokenizer would.*cut");
-            assert_eq!(path.unwrap(), "Inner\u{1}Fie*ld\0s".as_bytes());
+            assert_eq!(path.unwrap().0, "Inner\u{1}Fie*ld\0s".as_bytes());
         }
     }
 
@@ -305,6 +347,7 @@ mod tests {
             field: "my_missing_field".to_string(),
             value: "My query value*".to_string(),
             lenient: false,
+            case_insensitive: false,
         };
         let tokenizer_manager = create_default_quickwit_tokenizer_manager();
         let schema = single_text_field_schema("my_field", "whitespace");
@@ -316,5 +359,83 @@ mod tests {
             panic!("unexpected error: {err:?}");
         };
         assert_eq!(missing_field_full_path, "my_missing_field");
+    }
+
+    #[test]
+    fn test_wildcard_query_to_regex_on_text_case_insensitive() {
+        let query = WildcardQuery {
+            field: "text_field".to_string(),
+            value: "MyString Wh1ch?a.nOrMal Tokenizer would*cut".to_string(),
+            lenient: false,
+            case_insensitive: true,
+        };
+
+        let tokenizer_manager = create_default_quickwit_tokenizer_manager();
+        for tokenizer in ["raw", "whitespace"] {
+            let mut schema_builder = TantivySchema::builder();
+            let text_options = TextOptions::default()
+                .set_indexing_options(TextFieldIndexing::default().set_tokenizer(tokenizer));
+            schema_builder.add_text_field("text_field", text_options);
+            let schema = schema_builder.build();
+
+            let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
+            assert_eq!(regex, "(?i)MyString Wh1ch.a\\.nOrMal Tokenizer would.*cut");
+            assert!(path.is_none());
+        }
+
+        for tokenizer in [
+            "raw_lowercase",
+            "lowercase",
+            "default",
+            "chinese_compatible",
+            "source_code_default",
+            "source_code_with_hex",
+        ] {
+            let mut schema_builder = TantivySchema::builder();
+            let text_options = TextOptions::default()
+                .set_indexing_options(TextFieldIndexing::default().set_tokenizer(tokenizer));
+            schema_builder.add_text_field("text_field", text_options);
+            let schema = schema_builder.build();
+
+            let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
+            assert_eq!(regex, "(?i)mystring wh1ch.a\\.normal tokenizer would.*cut");
+            assert!(path.is_none());
+        }
+    }
+
+    #[test]
+    fn test_wildcard_query_to_regex_on_text_case_insensitive_no_letters() {
+        // When the pattern contains no letters, case_insensitive should have no effect
+        // (no (?i) prefix added).
+        let query = WildcardQuery {
+            field: "text_field".to_string(),
+            value: "1234*5678".to_string(),
+            lenient: false,
+            case_insensitive: true,
+        };
+
+        let tokenizer_manager = create_default_quickwit_tokenizer_manager();
+        for tokenizer in ["raw", "whitespace"] {
+            let schema = single_text_field_schema("text_field", tokenizer);
+            let (_field, path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
+            assert_eq!(regex, "1234.*5678");
+            assert!(path.is_none());
+        }
+    }
+
+    #[test]
+    fn test_wildcard_query_to_regex_on_text_case_insensitive_mixed() {
+        // A pattern with both letters and digits still gets (?i).
+        let query = WildcardQuery {
+            field: "text_field".to_string(),
+            value: "abc123*".to_string(),
+            lenient: false,
+            case_insensitive: true,
+        };
+
+        let tokenizer_manager = create_default_quickwit_tokenizer_manager();
+        let schema = single_text_field_schema("text_field", "raw");
+        let (_field, _path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
+        assert_eq!(regex, "(?i)abc123.*");
     }
 }

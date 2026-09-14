@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use anyhow::Context;
 use clap::{Arg, ArgMatches, arg};
@@ -49,6 +50,7 @@ pub mod index;
 #[cfg(feature = "jemalloc")]
 pub mod jemalloc;
 pub mod logger;
+pub mod maintenance;
 pub mod metrics;
 pub mod service;
 pub mod source;
@@ -105,6 +107,17 @@ fn client_args() -> Vec<Arg> {
             .default_value("0")
             .display_order(4),
     ]
+}
+
+pub fn install_default_crypto_ring_provider() {
+    static CALL_ONLY_ONCE: OnceLock<Result<(), ()>> = OnceLock::new();
+    CALL_ONLY_ONCE
+        .get_or_init(|| {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .map_err(|_| ())
+        })
+        .expect("rustls crypto ring default provider installation should not fail");
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -315,7 +328,7 @@ pub fn make_table<T: Tabled>(
         .with(Modify::new(Rows::new(1..)).with(Alignment::left()))
         .with(Style::ascii())
         .with(Header::new(header))
-        .with(Modify::new(Rows::single(0)).with(Alignment::center()));
+        .with(Modify::new(Rows::new(0..1)).with(Alignment::center()));
 
     table
 }

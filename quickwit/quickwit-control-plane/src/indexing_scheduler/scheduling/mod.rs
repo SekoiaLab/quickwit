@@ -750,15 +750,15 @@ mod tests {
     use itertools::Itertools;
     use quickwit_proto::indexing::{CpuCapacity, IndexingTask, mcpu};
     use quickwit_proto::types::{IndexUid, NodeId, PipelineUid, ShardId, SourceUid};
-    use rand::seq::SliceRandom;
+    use rand::prelude::IndexedRandom;
 
     use super::{
         SourceToSchedule, SourceToScheduleType, build_physical_indexing_plan,
         convert_scheduling_solution_to_physical_plan_single_node_single_source,
     };
     use crate::indexing_plan::PhysicalIndexingPlan;
-    use crate::indexing_scheduler::get_shard_locality_metrics;
     use crate::indexing_scheduler::scheduling::assign_shards;
+    use crate::indexing_scheduler::{MAX_LOAD_PER_PIPELINE, get_shard_locality_metrics};
     use crate::model::ShardLocations;
 
     fn source_id() -> SourceUid {
@@ -856,7 +856,7 @@ mod tests {
         let num_indexers = 10;
         let num_shards: usize = 1000;
         let indexers: Vec<NodeId> = (0..num_indexers)
-            .map(|indexer_id| NodeId::new(format!("indexer{indexer_id}")))
+            .map(|indexer_id| NodeId::from_str(&format!("indexer{indexer_id}")))
             .collect();
         let source_uids: Vec<SourceUid> = std::iter::repeat_with(source_id).take(1_000).collect();
         let shard_ids: Vec<ShardId> = (0..num_shards as u64).map(ShardId::from).collect();
@@ -875,7 +875,7 @@ mod tests {
         for indexer in &indexers {
             indexer_id_to_cpu_capacities.insert(indexer.as_str().to_string(), mcpu(16_000));
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         let mut shard_locations = ShardLocations::default();
         for shard_id in &shard_ids {
@@ -936,6 +936,146 @@ mod tests {
             assert!(expected_tasks[0].shard_ids.is_empty());
             assert_eq!(&expected_tasks[1].source_id, &source_uid1.source_id);
             assert!(expected_tasks[1].shard_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_build_physical_plan_with_pipeline_limit() {
+        let indexer1 = "indexer1".to_string();
+        let indexer2 = "indexer2".to_string();
+        let source_uid0 = source_id();
+        let source_uid1 = source_id();
+        let source_0 = SourceToSchedule {
+            source_uid: source_uid0.clone(),
+            source_type: SourceToScheduleType::Sharded {
+                shard_ids: (0..16).map(ShardId::from).collect(),
+                load_per_shard: NonZeroU32::new(800).unwrap(),
+            },
+            params_fingerprint: 0,
+        };
+        let source_1 = SourceToSchedule {
+            source_uid: source_uid1.clone(),
+            source_type: SourceToScheduleType::NonSharded {
+                num_pipelines: 4,
+                load_per_pipeline: NonZeroU32::new(MAX_LOAD_PER_PIPELINE.cpu_millis()).unwrap(),
+            },
+            params_fingerprint: 0,
+        };
+        let mut indexer_id_to_cpu_capacities = FnvHashMap::default();
+        indexer_id_to_cpu_capacities.insert(indexer1.clone(), mcpu(16_000));
+        indexer_id_to_cpu_capacities.insert(indexer2.clone(), mcpu(16_000));
+        let shard_locations = ShardLocations::default();
+        let indexing_plan = build_physical_indexing_plan(
+            &[source_0, source_1],
+            &indexer_id_to_cpu_capacities,
+            None,
+            &shard_locations,
+        );
+        assert_eq!(indexing_plan.indexing_tasks_per_indexer().len(), 2);
+
+        let node1_plan = indexing_plan.indexer(&indexer1).unwrap();
+        let node2_plan = indexing_plan.indexer(&indexer2).unwrap();
+
+        let source_0_on_node1 = node1_plan
+            .iter()
+            .filter(|task| task.source_id == source_uid0.source_id)
+            .count();
+        let source_0_on_node2 = node2_plan
+            .iter()
+            .filter(|task| task.source_id == source_uid0.source_id)
+            .count();
+        assert!(source_0_on_node1 <= 3);
+        assert!(source_0_on_node2 <= 3);
+        assert_eq!(source_0_on_node1 + source_0_on_node2, 4);
+
+        let source_1_on_node1 = node1_plan
+            .iter()
+            .filter(|task| task.source_id == source_uid1.source_id)
+            .count();
+        let source_1_on_node2 = node2_plan
+            .iter()
+            .filter(|task| task.source_id == source_uid1.source_id)
+            .count();
+        assert!(source_1_on_node1 <= 3);
+        assert!(source_1_on_node2 <= 3);
+        assert_eq!(source_1_on_node1 + source_1_on_node2, 4);
+    }
+
+    #[test]
+    fn test_build_physical_plan_second_iteration() {
+        let indexer1 = "indexer1".to_string();
+        let indexer2 = "indexer2".to_string();
+        let indexer3 = "indexer3".to_string();
+        let mut sources = Vec::new();
+        for _ in 0..10 {
+            sources.push(SourceToSchedule {
+                source_uid: source_id(),
+                source_type: SourceToScheduleType::NonSharded {
+                    num_pipelines: 4,
+                    load_per_pipeline: NonZeroU32::new(MAX_LOAD_PER_PIPELINE.cpu_millis()).unwrap(),
+                },
+                params_fingerprint: 0,
+            });
+        }
+        let mut indexer_id_to_cpu_capacities = FnvHashMap::default();
+        indexer_id_to_cpu_capacities.insert(indexer1.clone(), mcpu(16_000));
+        indexer_id_to_cpu_capacities.insert(indexer2.clone(), mcpu(16_000));
+        indexer_id_to_cpu_capacities.insert(indexer3.clone(), mcpu(16_000));
+        let shard_locations = ShardLocations::default();
+        let indexing_plan = build_physical_indexing_plan(
+            &sources,
+            &indexer_id_to_cpu_capacities,
+            None,
+            &shard_locations,
+        );
+        assert_eq!(indexing_plan.indexing_tasks_per_indexer().len(), 3);
+
+        for source in &sources {
+            let pipelines_per_indexer_for_source = indexing_plan
+                .indexing_tasks_per_indexer()
+                .values()
+                .map(|tasks| {
+                    tasks
+                        .iter()
+                        .filter(|t| t.source_id == source.source_uid.source_id)
+                        .count()
+                })
+                .collect_vec();
+            assert!(pipelines_per_indexer_for_source.contains(&3));
+            assert!(pipelines_per_indexer_for_source.contains(&1));
+            assert!(pipelines_per_indexer_for_source.contains(&0));
+            assert_eq!(pipelines_per_indexer_for_source.iter().sum::<usize>(), 4);
+        }
+
+        for source in &mut sources {
+            if let SourceToScheduleType::NonSharded { num_pipelines, .. } = &mut source.source_type
+            {
+                *num_pipelines = 5;
+            }
+        }
+
+        let new_indexing_plan = build_physical_indexing_plan(
+            &sources,
+            &indexer_id_to_cpu_capacities,
+            Some(&indexing_plan),
+            &shard_locations,
+        );
+
+        for source in &sources {
+            let pipelines_per_indexer_for_source = new_indexing_plan
+                .indexing_tasks_per_indexer()
+                .values()
+                .map(|tasks| {
+                    tasks
+                        .iter()
+                        .filter(|t| t.source_id == source.source_uid.source_id)
+                        .count()
+                })
+                .collect_vec();
+            assert!(pipelines_per_indexer_for_source.contains(&3));
+            assert!(pipelines_per_indexer_for_source.contains(&2));
+            assert!(pipelines_per_indexer_for_source.contains(&0));
+            assert_eq!(pipelines_per_indexer_for_source.iter().sum::<usize>(), 5);
         }
     }
 
@@ -1160,11 +1300,11 @@ mod tests {
             shard2.clone(),
             shard3.clone(),
         ];
-        let node1 = NodeId::new("node1".to_string());
-        let node2 = NodeId::new("node2".to_string());
+        let node1 = NodeId::from_str("node1");
+        let node2 = NodeId::from_str("node2");
         // This node is missing from the capacity map.
         // It should not be assigned any task despite being present in shard locations.
-        let node_missing = NodeId::new("node_missing".to_string());
+        let node_missing = NodeId::from_str("node_missing");
         let mut remaining_num_shards_per_node = HashMap::default();
         remaining_num_shards_per_node
             .insert(node1.as_str().to_string(), NonZeroU32::new(3).unwrap());

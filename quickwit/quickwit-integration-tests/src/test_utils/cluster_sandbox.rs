@@ -43,7 +43,6 @@ use quickwit_serve::{
     ListSplitsQueryParams, RestIngestResponse, SearchRequestQueryString, serve_quickwit,
 };
 use quickwit_storage::StorageResolver;
-use rand::Rng;
 use reqwest::Url;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -127,7 +126,7 @@ impl ClusterSandboxBuilder {
             config.enabled_services.clone_from(&node_builder.services);
             config.jaeger_config.enable_endpoint = true;
             config.cluster_id.clone_from(&cluster_id);
-            config.node_id = NodeId::new(format!("test-node-{node_idx}"));
+            config.node_id = NodeId::from_str(&format!("test-node-{node_idx}"));
             config.data_dir_path = root_data_dir.join(config.node_id.as_str());
             config.metastore_uri =
                 QuickwitUri::from_str(&format!("ram:///{unique_dir_name}/metastore")).unwrap();
@@ -176,10 +175,7 @@ pub struct ResolvedClusterConfig {
 impl ResolvedClusterConfig {
     /// Start a cluster using this config and waits for the nodes to be ready
     pub async fn start(self) -> ClusterSandbox {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("rustls crypto ring default provider installation should not fail");
-
+        quickwit_cli::install_default_crypto_ring_provider();
         let mut node_shutdown_handles = Vec::new();
         let runtimes_config = RuntimesConfig::light_for_tests();
         let storage_resolver = StorageResolver::unconfigured();
@@ -490,7 +486,7 @@ impl ClusterSandbox {
         let data_dir = test_conf
             .0
             .data_dir_path
-            .join(rand::thread_rng().r#gen::<u64>().to_string());
+            .join(rand::random::<u64>().to_string());
         tokio::fs::create_dir(&data_dir).await?;
         let node_config = format!(
             r#"

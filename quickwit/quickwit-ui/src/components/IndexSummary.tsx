@@ -13,28 +13,30 @@
 // limitations under the License.
 
 import styled from "@emotion/styled";
-import { Paper } from "@mui/material";
+import { Alert, Paper } from "@mui/material";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc";
 import { FC, ReactNode } from "react";
-import NumberFormat from "react-number-format";
+import { NumericFormat } from "react-number-format";
 import { Index } from "../utils/models";
 
 dayjs.extend(utc);
 
 const ItemContainer = styled.div`
-padding: 10px;
-display: flex;
-flex-direction: column;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
 `;
 const Row = styled.div`
-padding: 5px;
-display: flex;
-flex-direction: row;
-&:nth-of-type(odd){ background: rgba(0,0,0,0.05) }
+  padding: 5px;
+  display: flex;
+  flex-direction: row;
+  &:nth-of-type(odd) {
+    background: rgba(0, 0, 0, 0.05);
+  }
 `;
 const RowKey = styled.div`
-width: 350px;
+  width: 350px;
 `;
 const IndexRow: FC<{ title: string; children: ReactNode }> = ({
   title,
@@ -49,13 +51,13 @@ const IndexRow: FC<{ title: string; children: ReactNode }> = ({
 export function IndexSummary({ index }: { index: Index }) {
   const all_splits = index.splits;
   const published_splits = all_splits.filter(
-    (split) => split.split_state == "Published",
+    (split) => split.split_state === "Published",
   );
   const num_of_staged_splits = all_splits.filter(
-    (split) => split.split_state == "Staged",
+    (split) => split.split_state === "Staged",
   ).length;
   const num_of_marked_for_delete_splits = all_splits.filter(
-    (split) => split.split_state == "MarkedForDeletion",
+    (split) => split.split_state === "MarkedForDeletion",
   ).length;
   const total_num_docs = published_splits
     .map((split) => split.num_docs)
@@ -73,6 +75,12 @@ export function IndexSummary({ index }: { index: Index }) {
   return (
     <Paper variant="outlined">
       <ItemContainer>
+        {index.split_limit_reached && (
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            Split limit reached. Only the first 10,000 splits were retrieved.
+            The actual total may be higher. Statistics shown are incomplete.
+          </Alert>
+        )}
         <IndexRow title="Created at:">
           {dayjs
             .unix(index.metadata.create_timestamp)
@@ -83,14 +91,14 @@ export function IndexSummary({ index }: { index: Index }) {
           {index.metadata.index_config.index_uri}
         </IndexRow>
         <IndexRow title="Number of published documents:">
-          <NumberFormat
+          <NumericFormat
             value={total_num_docs}
             displayType={"text"}
             thousandSeparator={true}
           />
         </IndexRow>
         <IndexRow title="Size of published documents (uncompressed):">
-          <NumberFormat
+          <NumericFormat
             value={total_uncompressed_num_bytes / 1000000}
             displayType={"text"}
             thousandSeparator={true}
@@ -102,7 +110,7 @@ export function IndexSummary({ index }: { index: Index }) {
           {published_splits.length}
         </IndexRow>
         <IndexRow title="Size of published splits:">
-          <NumberFormat
+          <NumericFormat
             value={total_num_bytes / 1000000}
             displayType={"text"}
             thousandSeparator={true}

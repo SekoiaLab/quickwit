@@ -97,6 +97,9 @@ pub struct SplitMetadata {
     /// the split, expressed in seconds.
     pub time_range: Option<RangeInclusive<i64>>,
 
+    /// The min / max ingestion time in the split.
+    pub secondary_time_range: Option<RangeInclusive<i64>>,
+
     /// Timestamp for tracking when the split was created.
     pub create_timestamp: i64,
 
@@ -132,6 +135,9 @@ pub struct SplitMetadata {
     /// Doc mapping UID used when creating this split. This split may only be merged with other
     /// splits using the same doc mapping UID.
     pub doc_mapping_uid: DocMappingUid,
+
+    /// Set of tantivy doc_ids that have been soft-deleted from this split.
+    pub soft_deleted_doc_ids: BTreeSet<u32>,
 }
 
 impl fmt::Debug for SplitMetadata {
@@ -148,6 +154,7 @@ impl fmt::Debug for SplitMetadata {
             &self.uncompressed_docs_size_in_bytes,
         );
         debug_struct.field("time_range", &self.time_range);
+        debug_struct.field("secondary_time_range", &self.secondary_time_range);
         debug_struct.field("create_timestamp", &self.create_timestamp);
         debug_struct.field("maturity", &self.maturity);
         if !self.tags.is_empty() {
@@ -176,6 +183,9 @@ impl fmt::Debug for SplitMetadata {
         debug_struct.field("footer_offsets", &self.footer_offsets);
         debug_struct.field("delete_opstamp", &self.delete_opstamp);
         debug_struct.field("num_merge_ops", &self.num_merge_ops);
+        if !self.soft_deleted_doc_ids.is_empty() {
+            debug_struct.field("soft_deleted_doc_ids", &self.soft_deleted_doc_ids);
+        }
         debug_struct.finish()
     }
 }
@@ -273,6 +283,7 @@ impl quickwit_config::TestableForRegression for SplitMetadata {
             num_docs: 12303,
             uncompressed_docs_size_in_bytes: 234234,
             time_range: Some(121000..=130198),
+            secondary_time_range: None,
             create_timestamp: 3,
             maturity: SplitMaturity::Immature {
                 maturation_period: Duration::from_secs(4),
@@ -281,6 +292,7 @@ impl quickwit_config::TestableForRegression for SplitMetadata {
             footer_offsets: 1000..2000,
             num_merge_ops: 3,
             doc_mapping_uid: DocMappingUid::default(),
+            soft_deleted_doc_ids: BTreeSet::new(),
         }
     }
 
@@ -406,6 +418,7 @@ mod tests {
             num_docs: 100,
             uncompressed_docs_size_in_bytes: 1024,
             time_range: Some(0..=100),
+            secondary_time_range: Some(120000..=130000),
             create_timestamp: 1629867600,
             maturity: SplitMaturity::Mature,
             tags: {
@@ -421,16 +434,17 @@ mod tests {
             delete_opstamp: 0,
             num_merge_ops: 0,
             doc_mapping_uid: DocMappingUid::default(),
+            soft_deleted_doc_ids: BTreeSet::new(),
         };
 
-        let expected_output = "SplitMetadata { split_id: \"split-1\", index_uid: IndexUid { \
-                               index_id: \"00000000-0000-0000-0000-000000000000\", \
-                               incarnation_id: Ulid(0) }, partition_id: 0, source_id: \
-                               \"source-1\", node_id: \"node-1\", num_docs: 100, \
-                               uncompressed_docs_size_in_bytes: 1024, time_range: Some(0..=100), \
-                               create_timestamp: 1629867600, maturity: Mature, tags: \
-                               \"{\\\"🐱\\\", \\\"😻\\\", \\\"😼\\\", \\\"😿\\\", and 1 more}\", \
-                               footer_offsets: 0..1024, delete_opstamp: 0, num_merge_ops: 0 }";
+        let expected_output =
+            "SplitMetadata { split_id: \"split-1\", index_uid: IndexUid { index_id: \
+             \"00000000-0000-0000-0000-000000000000\", incarnation_id: Ulid(0) }, partition_id: \
+             0, source_id: \"source-1\", node_id: \"node-1\", num_docs: 100, \
+             uncompressed_docs_size_in_bytes: 1024, time_range: Some(0..=100), \
+             secondary_time_range: Some(120000..=130000), create_timestamp: 1629867600, maturity: \
+             Mature, tags: \"{\\\"🐱\\\", \\\"😻\\\", \\\"😼\\\", \\\"😿\\\", and 1 more}\", \
+             footer_offsets: 0..1024, delete_opstamp: 0, num_merge_ops: 0 }";
 
         assert_eq!(format!("{split_metadata:?}"), expected_output);
     }
