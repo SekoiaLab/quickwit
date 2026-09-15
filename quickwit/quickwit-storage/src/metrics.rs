@@ -41,8 +41,8 @@ pub struct StorageMetrics {
     pub object_storage_request_duration: HistogramVec<2>,
     pub object_storage_get_slice_in_flight_count: IntGauge,
     pub object_storage_get_slice_in_flight_num_bytes: IntGauge,
-    pub object_storage_download_num_bytes: IntCounterVec<1>,
-    pub object_storage_download_errors: IntCounterVec<1>,
+    pub object_storage_download_num_bytes: IntCounterVec<2>,
+    pub object_storage_download_errors: IntCounterVec<2>,
     pub object_storage_upload_num_bytes: IntCounterVec<1>,
 }
 
@@ -108,10 +108,12 @@ impl Default for StorageMetrics {
             ),
             object_storage_download_num_bytes: new_counter_vec(
                 "object_storage_download_num_bytes",
+                // Whole objects and byte ranges are recorded separately, their size
+                // distributions differ by orders of magnitude.
                 "Amount of data downloaded from object storage.",
                 "storage",
                 &[],
-                ["status"],
+                ["status", "kind"],
             ),
             object_storage_download_errors: new_counter_vec(
                 "object_storage_download_errors",
@@ -122,7 +124,7 @@ impl Default for StorageMetrics {
                  during download.",
                 "storage",
                 &[],
-                ["status"],
+                ["status", "kind"],
             ),
             object_storage_upload_num_bytes: new_counter_vec(
                 "object_storage_upload_num_bytes",
