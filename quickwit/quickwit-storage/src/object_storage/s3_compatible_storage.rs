@@ -29,10 +29,10 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
 use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::builders::ObjectIdentifierBuilder;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use base64::prelude::{BASE64_STANDARD, Engine};
+use bytes::Bytes;
 use futures::{StreamExt, stream};
 use once_cell::sync::{Lazy, OnceCell};
 use quickwit_aws::retry::{AwsRetryable, aws_retry};
@@ -47,8 +47,12 @@ use tokio::sync::Semaphore;
 use tracing::{info, instrument, warn};
 
 use crate::metrics::object_storage_get_slice_in_flight_guards;
-use crate::metrics_wrappers::{ActionLabel, RequestMetricsWrapperExt, copy_with_download_metrics};
+use crate::metrics_wrappers::{
+    ActionLabel, DownloadKind, RequestMetricsWrapperExt, collect_with_download_metrics,
+    copy_with_download_metrics,
+};
 use crate::object_storage::MultiPartPolicy;
+use crate::stable_deref_bytes::into_owned_bytes;
 use crate::storage::SendableAsync;
 use crate::{
     BulkDeleteError, DeleteFailure, OwnedBytes, Storage, StorageError, StorageErrorKind,
@@ -633,12 +637,16 @@ impl S3CompatibleObjectStorage {
         Ok(get_object_output)
     }
 
-    async fn get_to_vec(
+    async fn get_to_bytes(
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
-    ) -> StorageResult<Vec<u8>> {
-        let cap = range_opt.as_ref().map(Range::len).unwrap_or(0);
+    ) -> StorageResult<Bytes> {
+        let download_kind = if range_opt.is_some() {
+            DownloadKind::Slice
+        } else {
+            DownloadKind::Object
+        };
         let get_object_output = aws_retry(&self.retry_params, || {
             self.get_object(path, range_opt.clone())
         })
@@ -646,9 +654,8 @@ impl S3CompatibleObjectStorage {
         // only record ranged get request as being in flight
         let _in_flight_guards =
             range_opt.map(|range| object_storage_get_slice_in_flight_guards(range.len()));
-        let mut buf: Vec<u8> = Vec::with_capacity(cap);
-        download_all(get_object_output.body, &mut buf).await?;
-        Ok(buf)
+        let payload = collect_with_download_metrics(get_object_output.body, download_kind).await?;
+        Ok(payload)
     }
 
     /// Bulk delete implementation based on the DeleteObject API:
@@ -784,20 +791,12 @@ impl S3CompatibleObjectStorage {
     }
 }
 
-async fn download_all(byte_stream: ByteStream, output: &mut Vec<u8>) -> io::Result<()> {
-    output.clear();
-    let mut body_stream_reader = BufReader::new(byte_stream.into_async_read());
-    copy_with_download_metrics(&mut body_stream_reader, output).await?;
-    // When calling `get_all`, the Vec capacity is not properly set.
-    output.shrink_to_fit();
-    Ok(())
-}
-
 #[async_trait]
 impl Storage for S3CompatibleObjectStorage {
     async fn check_connectivity(&self) -> anyhow::Result<()> {
         // we ignore error as we never close the semaphore
-        let _permit = REQUEST_SEMAPHORE.acquire().await;
+        let _permit: Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> =
+            REQUEST_SEMAPHORE.acquire().await;
         self.s3_client
             .list_objects_v2()
             .bucket(self.bucket.clone())
@@ -831,7 +830,7 @@ impl Storage for S3CompatibleObjectStorage {
         let get_object_output =
             aws_retry(&self.retry_params, || self.get_object(path, None)).await?;
         let mut body_read = BufReader::new(get_object_output.body.into_async_read());
-        copy_with_download_metrics(&mut body_read, output).await?;
+        copy_with_download_metrics(&mut body_read, output, DownloadKind::Object).await?;
         output.flush().await?;
         Ok(())
     }
@@ -869,9 +868,9 @@ impl Storage for S3CompatibleObjectStorage {
     #[instrument(level = "debug", skip(self, range), fields(range.start = range.start, range.end = range.end))]
     async fn get_slice(&self, path: &Path, range: Range<usize>) -> StorageResult<OwnedBytes> {
         let _permit = REQUEST_SEMAPHORE.acquire().await;
-        self.get_to_vec(path, Some(range.clone()))
+        self.get_to_bytes(path, Some(range.clone()))
             .await
-            .map(OwnedBytes::new)
+            .map(into_owned_bytes)
             .map_err(|err| {
                 err.add_context(format!(
                     "failed to fetch slice {:?} for object: {}/{}",
@@ -903,9 +902,9 @@ impl Storage for S3CompatibleObjectStorage {
     async fn get_all(&self, path: &Path) -> StorageResult<OwnedBytes> {
         let _permit = REQUEST_SEMAPHORE.acquire().await;
         let bytes = self
-            .get_to_vec(path, None)
+            .get_to_bytes(path, None)
             .await
-            .map(OwnedBytes::new)
+            .map(into_owned_bytes)
             .map_err(|err| {
                 err.add_context(format!(
                     "failed to fetch object: {}/{}",
