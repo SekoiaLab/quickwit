@@ -6472,9 +6472,13 @@ dependencies = [
  "aws-sdk-s3",
  "aws-sdk-sqs",
  "aws-smithy-async",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
  "futures",
+ "mini-moka",
  "quickwit-common",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
