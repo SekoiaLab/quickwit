@@ -40,6 +40,8 @@ use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError
 use mini_moka::sync::Cache;
 use tokio::sync::watch;
 
+use crate::metrics::DNS_METRICS;
+
 // We refresh once every 5 seconds. S3's DNS varies very rapidly.
 const DNS_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 
@@ -117,7 +119,10 @@ impl Default for CachingDnsResolver {
 
 fn spawn_refresh_dns(ips_tx: tokio::sync::watch::Sender<Vec<IpAddr>>, host: String) {
     tokio::task::spawn(async move {
-        let Ok(socket_addrs) = tokio::net::lookup_host((host.as_str(), 0)).await else {
+        let timer = DNS_METRICS.resolve_duration_seconds.start_timer();
+        let lookup_res = tokio::net::lookup_host((host.as_str(), 0)).await;
+        timer.observe_duration();
+        let Ok(socket_addrs) = lookup_res else {
             quickwit_common::rate_limited_error!(limit_per_min = 10, %host, "failed to refresh DNS");
             return;
         };
