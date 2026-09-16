@@ -35,6 +35,14 @@ pub struct StorageMetrics {
     pub split_footer_cache: ComponentCacheMetrics,
     pub split_footer_disk_cache: ComponentCacheMetrics,
     pub searcher_split_cache: ComponentCacheMetrics,
+    /// Per-suffix breakdown of the lookups served by the shared `QuickwitCache` pool.
+    ///
+    /// The pool itself reports a single aggregate hit rate under
+    /// `component_name="fastfields"`, which cannot tell us whether `.fast` regressed or
+    /// which suffix is winning the shared space. These counters are recorded *in addition*
+    /// to the pool's own metrics, so the two must not be summed together.
+    pub cache_route_events: IntCounterVec<2>,
+    pub cache_route_hit_bytes: IntCounterVec<1>,
     pub get_slice_timeout_successes: [IntCounter; 3],
     pub get_slice_timeout_all_timeouts: IntCounter,
     pub object_storage_requests_total: IntCounterVec<2>,
@@ -70,6 +78,22 @@ impl Default for StorageMetrics {
             partial_request_cache: ComponentCacheMetrics::for_component("partial_request"),
             predicate_cache: ComponentCacheMetrics::for_component("predicate"),
             searcher_split_cache: ComponentCacheMetrics::for_component("searcher_split"),
+            cache_route_events: new_counter_vec(
+                "route_events_total",
+                "Lookups on the shared storage cache, by file suffix and outcome. Recorded in \
+                 addition to the pool's own component metrics, do not sum the two.",
+                "cache",
+                &[],
+                ["suffix", "outcome"],
+            ),
+            cache_route_hit_bytes: new_counter_vec(
+                "route_hit_bytes_total",
+                "Bytes served from the shared storage cache, by file suffix. Approximates the \
+                 object storage traffic avoided by that suffix.",
+                "cache",
+                &[],
+                ["suffix"],
+            ),
             shortlived_cache: CacheMetricCounters::new_active("shortlived"),
             split_footer_cache: ComponentCacheMetrics::for_component("splitfooter"),
             split_footer_disk_cache: ComponentCacheMetrics::for_component("splitfooter_disk"),
@@ -159,6 +183,7 @@ pub struct CacheMetricCounters {
     pub hits_num_items: IntCounter,
     pub hits_num_bytes: IntCounter,
     pub misses_num_items: IntCounter,
+    pub admission_rejected_num_items: IntCounter,
     pub evict_num_items: IntCounter,
     pub evict_num_bytes: IntCounter,
 }
@@ -194,6 +219,14 @@ impl CacheMetricCounters {
             misses_num_items: new_counter(
                 "cache_misses_total",
                 "Number of cache misses by component",
+                CACHE_METRICS_NAMESPACE,
+                &[("component_name", component_name)],
+            ),
+            admission_rejected_num_items: new_counter(
+                "cache_admission_rejected_total",
+                "Number of puts rejected without being stored, by component. Either the value \
+                 exceeds the cache capacity, or eviction was withheld because every eviction \
+                 candidate had been accessed too recently.",
                 CACHE_METRICS_NAMESPACE,
                 &[("component_name", component_name)],
             ),
@@ -296,6 +329,12 @@ impl ComponentCacheMetrics {
             misses_num_items: new_counter(
                 "virtual_cache_misses_total",
                 "Number of cache misses by component",
+                CACHE_METRICS_NAMESPACE,
+                &labels,
+            ),
+            admission_rejected_num_items: new_counter(
+                "virtual_cache_admission_rejected_total",
+                "Number of puts rejected without being stored, by component.",
                 CACHE_METRICS_NAMESPACE,
                 &labels,
             ),
