@@ -6472,8 +6472,12 @@ dependencies = [
  "aws-sdk-s3",
  "aws-sdk-sqs",
  "aws-smithy-async",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
  "futures",
+ "once_cell",
  "quickwit-common",
+ "serial_test",
  "tokio",
 ]
 

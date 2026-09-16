@@ -17,10 +17,16 @@ aws-sdk-kinesis = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true }
 aws-sdk-sqs = { workspace = true, optional = true }
 aws-smithy-async = { workspace = true }
+aws-smithy-http-client = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
 futures = { workspace = true }
+once_cell = { workspace = true }
 tokio = { workspace = true }
 
 quickwit-common = { workspace = true }
+
+[dev-dependencies]
+serial_test = { workspace = true }
 
 [features]
 kinesis = ["aws-sdk-kinesis"]
