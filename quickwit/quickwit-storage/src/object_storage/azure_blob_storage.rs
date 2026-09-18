@@ -586,9 +586,11 @@ async fn download_all(
     chunk_stream: &mut Pageable<GetBlobResponse, AzureError>,
     download_kind: DownloadKind,
 ) -> Result<Bytes, AzureErrorWrapper> {
-    // Dropping this future before the body is exhausted drops the guard, which
-    // records the partial download as cancelled.
-    let mut metrics_guard = DownloadMetricsGuard::new(download_kind);
+    // The guard only comes into existence once a response has arrived: a
+    // failure or a cancellation before that is a request failure, recorded as
+    // such and not as a download error. Past that point, dropping this future
+    // drops the guard, which records the partial download as cancelled.
+    let mut metrics_guard_opt: Option<DownloadMetricsGuard> = None;
     let mut segments: Vec<Bytes> = Vec::new();
     let mut total_num_bytes: usize = 0;
     while let Some(chunk_result) = chunk_stream
@@ -597,9 +599,13 @@ async fn download_all(
         .await
     {
         let chunk_response = chunk_result.map_err(|error| {
-            metrics_guard.set_status(DownloadStatus::Failed(AZURE_STREAM_ERROR));
+            if let Some(metrics_guard) = &mut metrics_guard_opt {
+                metrics_guard.set_status(DownloadStatus::Failed(AZURE_STREAM_ERROR));
+            }
             AzureErrorWrapper::from(error)
         })?;
+        let metrics_guard =
+            metrics_guard_opt.get_or_insert_with(|| DownloadMetricsGuard::new(download_kind));
         let mut segment_stream = chunk_response.data;
         while let Some(segment_res) = segment_stream.next().await {
             let segment = segment_res.map_err(|error| {
@@ -611,7 +617,9 @@ async fn download_all(
             segments.push(segment);
         }
     }
-    metrics_guard.set_status(DownloadStatus::Done);
+    if let Some(mut metrics_guard) = metrics_guard_opt {
+        metrics_guard.set_status(DownloadStatus::Done);
+    }
     Ok(coalesce_segments(segments, total_num_bytes))
 }
 
