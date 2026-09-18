@@ -800,9 +800,8 @@ pub(crate) async fn search_partial_hits_phase(
         leaf_search_responses.into_iter().map(Ok).collect_vec();
     let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
     let span = info_span!("merge_fruits");
-    let mut leaf_search_response = searcher_context
-        .search_thread_pool
-        .run_cpu_intensive(
+    let mut leaf_search_response = crate::search_thread_pool()
+        .run_cpu_intensive_with_extra_tags(
             move || {
                 let _span_guard = span.enter();
                 merge_collector.merge_fruits(leaf_search_results)
