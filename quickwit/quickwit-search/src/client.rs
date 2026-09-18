@@ -308,7 +308,7 @@ mod tests {
         let grpc_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let mut connections = Vec::new();
-            // accept connection and let them hanging
+            // accept connection and leave them hanging
             while let Ok((connection, _)) = listener.accept().await {
                 connections.push(connection);
             }
