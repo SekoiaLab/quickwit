@@ -117,20 +117,22 @@ impl Default for CachingDnsResolver {
     }
 }
 
-fn spawn_refresh_dns(ips_tx: tokio::sync::watch::Sender<Vec<IpAddr>>, host: String) {
+fn spawn_refresh_dns(dns_entry: Arc<DnsEntry>, host: String) {
     tokio::task::spawn(async move {
         let timer = DNS_METRICS.resolve_duration_seconds.start_timer();
         let lookup_res = tokio::net::lookup_host((host.as_str(), 0)).await;
         timer.observe_duration();
         let Ok(socket_addrs) = lookup_res else {
             quickwit_common::rate_limited_error!(limit_per_min = 10, %host, "failed to refresh DNS");
+            dns_entry.next_resolve_attempt.store(0, Ordering::Relaxed);
             return;
         };
         let ips: Vec<IpAddr> = socket_addrs.map(|socket_addr| socket_addr.ip()).collect();
         if ips.is_empty() {
+            dns_entry.next_resolve_attempt.store(0, Ordering::Relaxed);
             return;
         }
-        let _ = ips_tx.send(ips);
+        let _ = dns_entry.ip_addresses_tx.send(ips);
     });
 }
 
@@ -148,7 +150,7 @@ impl ResolveDns for CachingDnsResolver {
             dns_entry
         };
         if dns_entry.should_resolve() {
-            spawn_refresh_dns(dns_entry.ip_addresses_tx.clone(), host.clone());
+            spawn_refresh_dns(dns_entry.clone(), host.clone());
         }
         DnsFuture::new(async move {
             {
