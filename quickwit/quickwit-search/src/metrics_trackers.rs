@@ -134,7 +134,6 @@ impl std::fmt::Display for SplitsByOutcomeDisp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Destructure to make sure we update this if a state is added
         let SplitsByOutcome {
-            cancel_warmup_queue,
             pruned_before_warmup,
             pruned_after_warmup,
             cancel_before_warmup,
@@ -147,7 +146,6 @@ impl std::fmt::Display for SplitsByOutcomeDisp {
         } = self.0;
         let mut sep = "{";
         for (name, val) in [
-            ("cancel_warmup_queue", cancel_warmup_queue),
             ("pruned_before_warmup", pruned_before_warmup),
             ("pruned_after_warmup", pruned_after_warmup),
             ("cancel_before_warmup", cancel_before_warmup),
@@ -334,7 +332,6 @@ mod tests {
     fn test_splits_by_outcome_disp_all_fields() {
         assert_eq!(
             disp(SplitsByOutcome {
-                cancel_warmup_queue: 0,
                 pruned_before_warmup: 1,
                 pruned_after_warmup: 2,
                 cancel_before_warmup: 3,

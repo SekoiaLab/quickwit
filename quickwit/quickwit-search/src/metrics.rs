@@ -43,7 +43,6 @@ fn print_if_not_null(
 ///
 /// Cancellation counters cover two scenarios: errors in splits and timeouts.
 pub struct SplitSearchOutcomeCounters {
-    pub cancel_warmup_queue: IntCounter,
     pub cancel_before_warmup: IntCounter,
     pub cache_hit: IntCounter,
     pub processed_from_metadata: IntCounter,
@@ -57,7 +56,6 @@ pub struct SplitSearchOutcomeCounters {
 
 impl fmt::Display for SplitSearchOutcomeCounters {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        print_if_not_null("cancel_warmup_queue", &self.cancel_warmup_queue, f)?;
         print_if_not_null("cancel_before_warmup", &self.cancel_before_warmup, f)?;
         print_if_not_null("cache_hit", &self.cache_hit, f)?;
         print_if_not_null("processed_from_metadata", &self.processed_from_metadata, f)?;
@@ -99,8 +97,6 @@ impl SplitSearchOutcomeCounters {
 
     pub fn new_from_counter_vec(search_split_outcome_vec: IntCounterVec<1>) -> Self {
         SplitSearchOutcomeCounters {
-            cancel_warmup_queue: search_split_outcome_vec
-                .with_label_values(["cancel_warmup_queue"]),
             cancel_before_warmup: search_split_outcome_vec
                 .with_label_values(["cancel_before_warmup"]),
             cache_hit: search_split_outcome_vec.with_label_values(["cache_hit"]),
@@ -123,7 +119,6 @@ impl SplitSearchOutcomeCounters {
         let Self {
             pruned_before_warmup,
             pruned_after_warmup,
-            cancel_warmup_queue,
             cancel_before_warmup,
             cancel_warmup,
             cancel_cpu_queue,
@@ -135,7 +130,6 @@ impl SplitSearchOutcomeCounters {
         SplitsByOutcome {
             pruned_before_warmup: pruned_before_warmup.get(),
             pruned_after_warmup: pruned_after_warmup.get(),
-            cancel_warmup_queue: cancel_warmup_queue.get(),
             cancel_before_warmup: cancel_before_warmup.get(),
             cancel_warmup: cancel_warmup.get(),
             cancel_cpu_queue: cancel_cpu_queue.get(),
