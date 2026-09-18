@@ -120,6 +120,16 @@ mod tests {
     }
 
     #[test]
+    fn test_should_not_retry_on_timeout() {
+        let retry_policy = LeafSearchRetryPolicy {};
+        let request = mock_leaf_search_request();
+        let response_res = Result::<LeafSearchResponse, SearchError>::Err(SearchError::Timeout(
+            "timeout exceeded".to_string(),
+        ));
+        assert!(retry_policy.retry_request(request, &response_res).is_none());
+    }
+
+    #[test]
     fn test_should_not_retry_if_result_is_ok_and_no_failing_splits() {
         let retry_policy = LeafSearchRetryPolicy {};
         let request = mock_leaf_search_request();
