@@ -485,11 +485,6 @@ fn scan_shard(shard_path: &Path) -> Vec<(String, u64, SystemTime)> {
         let Ok(dir_entry) = dir_entry_res else {
             continue;
         };
-        if let Ok(file_type) = dir_entry.file_type()
-            && !file_type.is_file()
-        {
-            continue;
-        }
         let Ok(file_name) = dir_entry.file_name().into_string() else {
             continue;
         };
