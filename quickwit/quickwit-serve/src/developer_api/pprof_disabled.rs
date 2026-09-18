@@ -23,9 +23,11 @@ fn not_implemented_handler() -> impl warp::Reply {
 
 /// pprof/start disabled
 /// pprof/flamegraph disabled
+/// pprof/folded disabled
 pub fn pprof_handlers() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone
 {
     let start_profiler = { warp::path!("pprof" / "start").map(not_implemented_handler) };
-    let stop_profiler = { warp::path!("pprof" / "flamegraph").map(not_implemented_handler) };
-    start_profiler.or(stop_profiler)
+    let get_flamegraph = { warp::path!("pprof" / "flamegraph").map(not_implemented_handler) };
+    let get_folded = { warp::path!("pprof" / "folded").map(not_implemented_handler) };
+    start_profiler.or(get_flamegraph).or(get_folded)
 }

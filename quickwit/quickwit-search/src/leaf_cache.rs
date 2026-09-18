@@ -15,6 +15,7 @@
 use std::ops::{Bound, RangeBounds};
 
 use prost::Message;
+use quickwit_config::CacheConfig;
 use quickwit_proto::search::{
     CountHits, LeafSearchResponse, SearchRequest, SplitIdAndFooterOffsets,
 };
@@ -43,10 +44,10 @@ pub struct LeafSearchCache {
 // queries which vary only by search_after.
 
 impl LeafSearchCache {
-    pub fn new(capacity: usize) -> LeafSearchCache {
+    pub fn new(config: &CacheConfig) -> LeafSearchCache {
         LeafSearchCache {
-            content: MemorySizedCache::with_capacity_in_bytes(
-                capacity,
+            content: MemorySizedCache::from_config(
+                config,
                 &quickwit_storage::STORAGE_METRICS.partial_request_cache,
             ),
         }
@@ -76,7 +77,7 @@ impl LeafSearchCache {
 }
 
 /// A key inside a [`LeafSearchCache`].
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
 struct CacheKey {
     /// The split this entry refers to
     split_id: SplitId,
@@ -85,6 +86,9 @@ struct CacheKey {
     /// The effective time range of the request, that is, the intersection of the timerange
     /// requested, and the timerange covered by the split.
     merged_time_range: HalfOpenRange,
+    /// The number of soft deleted documents in the split.
+    /// This assumes that the list of deleted docs is append only for a split.
+    soft_deleted_docs_len: usize,
 }
 
 impl CacheKey {
@@ -106,6 +110,7 @@ impl CacheKey {
             split_id: split_info.split_id,
             request: search_request,
             merged_time_range,
+            soft_deleted_docs_len: split_info.soft_deleted_doc_ids.len(),
         }
     }
 }
@@ -193,10 +198,10 @@ pub struct PredicateCacheImpl {
 }
 
 impl PredicateCacheImpl {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(config: &CacheConfig) -> Self {
         PredicateCacheImpl {
-            content: MemorySizedCache::with_capacity_in_bytes(
-                capacity,
+            content: MemorySizedCache::from_config(
+                config,
                 &quickwit_storage::STORAGE_METRICS.predicate_cache,
             ),
         }
@@ -235,6 +240,7 @@ impl quickwit_query::query_ast::PredicateCache for PredicateCacheImpl {
 
 #[cfg(test)]
 mod tests {
+    use bytesize::ByteSize;
     use quickwit_proto::search::{
         LeafSearchResponse, PartialHit, ResourceStats, SearchRequest, SortValue,
         SplitIdAndFooterOffsets,
@@ -244,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_leaf_search_cache_no_timestamp() {
-        let cache = LeafSearchCache::new(64_000_000);
+        let cache = LeafSearchCache::new(&ByteSize::mb(64).into());
 
         let split_1 = SplitIdAndFooterOffsets {
             split_id: "split_1".to_string(),
@@ -253,6 +259,7 @@ mod tests {
             timestamp_start: None,
             timestamp_end: None,
             num_docs: 0,
+            soft_deleted_doc_ids: Vec::new(),
         };
 
         let split_2 = SplitIdAndFooterOffsets {
@@ -262,6 +269,7 @@ mod tests {
             timestamp_start: None,
             timestamp_end: None,
             num_docs: 0,
+            soft_deleted_doc_ids: Vec::new(),
         };
 
         let query_1 = SearchRequest {
@@ -298,6 +306,7 @@ mod tests {
                 split_id: "split_1".to_string(),
             }],
             resource_stats: None,
+            splits_by_outcome: None,
         };
 
         assert!(cache.get(split_1.clone(), query_1.clone()).is_none());
@@ -310,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_leaf_search_cache_timestamp() {
-        let cache = LeafSearchCache::new(64_000_000);
+        let cache = LeafSearchCache::new(&ByteSize::mb(64).into());
 
         let split_1 = SplitIdAndFooterOffsets {
             split_id: "split_1".to_string(),
@@ -319,6 +328,7 @@ mod tests {
             timestamp_start: Some(100),
             timestamp_end: Some(199),
             num_docs: 0,
+            soft_deleted_doc_ids: Vec::new(),
         };
         let split_2 = SplitIdAndFooterOffsets {
             split_id: "split_2".to_string(),
@@ -327,6 +337,7 @@ mod tests {
             timestamp_start: Some(150),
             timestamp_end: Some(249),
             num_docs: 0,
+            soft_deleted_doc_ids: Vec::new(),
         };
         let split_3 = SplitIdAndFooterOffsets {
             split_id: "split_3".to_string(),
@@ -335,6 +346,7 @@ mod tests {
             timestamp_start: Some(150),
             timestamp_end: Some(249),
             num_docs: 0,
+            soft_deleted_doc_ids: Vec::new(),
         };
 
         let query_1 = SearchRequest {
@@ -389,6 +401,7 @@ mod tests {
                 split_id: "split_1".to_string(),
             }],
             resource_stats: Some(ResourceStats::default()),
+            splits_by_outcome: None,
         };
 
         // for split_1, 1 and 1bis cover different timestamp ranges

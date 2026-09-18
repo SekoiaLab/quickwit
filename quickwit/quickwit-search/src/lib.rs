@@ -29,13 +29,17 @@ mod list_fields;
 mod list_fields_cache;
 mod list_terms;
 mod metrics_trackers;
+mod query_cost_classifier;
 mod retry;
 mod root;
 mod scroll_context;
 mod search_job_placer;
 mod search_response_rest;
 mod service;
+mod soft_delete_query;
+mod sort_repr;
 pub(crate) mod top_k_collector;
+mod top_k_computer;
 
 mod metrics;
 mod search_permit_provider;
@@ -52,6 +56,7 @@ use quickwit_proto::metastore::{
     ListIndexesMetadataRequest, ListSplitsRequest, MetastoreService, MetastoreServiceClient,
 };
 use tantivy::schema::NamedFieldDocument;
+use tracing::{info, warn};
 
 /// Refer to this as `crate::Result<T>`.
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -68,6 +73,7 @@ use quickwit_metastore::{
 };
 use quickwit_proto::search::{
     PartialHit, ResourceStats, SearchRequest, SearchResponse, SplitIdAndFooterOffsets,
+    SplitsByOutcome,
 };
 use quickwit_proto::types::IndexUid;
 use quickwit_storage::StorageResolver;
@@ -93,9 +99,87 @@ pub use crate::service::{MockSearchService, SearchService, SearchServiceImpl};
 /// A pool of searcher clients identified by their gRPC socket address.
 pub type SearcherPool = Pool<SocketAddr, SearchServiceClient>;
 
+/// Computes the number of threads to use for the search thread pool.
+///
+/// `None` means the default Rayon thread pool size (i.e. one thread per CPU) should be used.
+///
+/// The number of threads is picked, in order of precedence, from:
+/// - the `QW_SEARCH_THREAD_POOL_NUM_CPUS` environment variable, if set
+/// - all available CPUs, if `QW_SEARCH_THREAD_POOL_USE_ALL_CPUS` is set to true
+/// - all available CPUs but one, otherwise
+fn compute_search_thread_pool_num_threads() -> Option<usize> {
+    if let Some(num_cpus) =
+        quickwit_common::get_from_env_opt::<usize>("QW_SEARCH_THREAD_POOL_NUM_CPUS", false)
+    {
+        if num_cpus == 0 {
+            warn!("QW_SEARCH_THREAD_POOL_NUM_CPUS is set to 0, ignoring it");
+        } else {
+            info!(
+                threads = num_cpus,
+                "search thread pool configured from QW_SEARCH_THREAD_POOL_NUM_CPUS"
+            );
+            return Some(num_cpus);
+        }
+    }
+    let use_all_cpus =
+        quickwit_common::get_bool_from_env("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS", false);
+    if use_all_cpus {
+        info!("search thread pool configured with default Rayon thread pool size");
+        return None;
+    }
+    let threads = usize::max(quickwit_common::num_cpus().saturating_sub(1), 1);
+    info!(threads, "search thread pool configured with one free CPU");
+    Some(threads)
+}
+
 fn search_thread_pool() -> &'static ThreadPool {
     static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
-    SEARCH_THREAD_POOL.get_or_init(|| ThreadPool::new("search", None))
+
+    SEARCH_THREAD_POOL
+        .get_or_init(|| ThreadPool::new("search", compute_search_thread_pool_num_threads()))
+}
+
+#[cfg(test)]
+mod search_thread_pool_tests {
+    // SAFETY: these tests may not be entirely sound if not run with nextest or
+    // --test-threads=1, as they mutate process-wide environment variables. As this is
+    // only test code, and it would be extremely inconvenient to run it another way, we are
+    // keeping it that way.
+
+    use super::compute_search_thread_pool_num_threads;
+
+    #[test]
+    fn test_compute_search_thread_pool_num_threads_from_env_var() {
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS") };
+        unsafe { std::env::set_var("QW_SEARCH_THREAD_POOL_NUM_CPUS", "3") };
+        assert_eq!(compute_search_thread_pool_num_threads(), Some(3));
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_NUM_CPUS") };
+    }
+
+    #[test]
+    fn test_compute_search_thread_pool_num_threads_env_var_takes_precedence() {
+        unsafe { std::env::set_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS", "true") };
+        unsafe { std::env::set_var("QW_SEARCH_THREAD_POOL_NUM_CPUS", "2") };
+        assert_eq!(compute_search_thread_pool_num_threads(), Some(2));
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_NUM_CPUS") };
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS") };
+    }
+
+    #[test]
+    fn test_compute_search_thread_pool_num_threads_use_all_cpus() {
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_NUM_CPUS") };
+        unsafe { std::env::set_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS", "true") };
+        assert_eq!(compute_search_thread_pool_num_threads(), None);
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS") };
+    }
+
+    #[test]
+    fn test_compute_search_thread_pool_num_threads_default() {
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_NUM_CPUS") };
+        unsafe { std::env::remove_var("QW_SEARCH_THREAD_POOL_USE_ALL_CPUS") };
+        let expected = usize::max(quickwit_common::num_cpus().saturating_sub(1), 1);
+        assert_eq!(compute_search_thread_pool_num_threads(), Some(expected));
+    }
 }
 
 /// GlobalDocAddress serves as a hit address.
@@ -172,6 +256,11 @@ fn extract_split_and_footer_offsets(split_metadata: &SplitMetadata) -> SplitIdAn
             .as_ref()
             .map(|time_range| *time_range.end()),
         num_docs: split_metadata.num_docs as u64,
+        soft_deleted_doc_ids: split_metadata
+            .soft_deleted_doc_ids
+            .iter()
+            .copied()
+            .collect(),
     }
 }
 
@@ -322,7 +411,7 @@ pub async fn single_node_search(
     let search_job_placer = SearchJobPlacer::new(searcher_pool.clone());
     let cluster_client = ClusterClient::new(search_job_placer);
     let searcher_config = SearcherConfig::default();
-    let searcher_context = Arc::new(SearcherContext::new(searcher_config, None));
+    let searcher_context = Arc::new(SearcherContext::new(searcher_config, None, None));
     let search_service = Arc::new(SearchServiceImpl::new(
         metastore.clone(),
         storage_resolver,
@@ -390,6 +479,16 @@ pub(crate) fn merge_resource_stats_it<'a>(
     acc_stats
 }
 
+pub(crate) fn merge_splits_by_outcome_it(
+    outcomes_it: impl IntoIterator<Item = Option<SplitsByOutcome>>,
+) -> Option<SplitsByOutcome> {
+    let mut acc: Option<SplitsByOutcome> = None;
+    for new in outcomes_it {
+        merge_splits_by_outcome(new, &mut acc);
+    }
+    acc
+}
+
 fn merge_resource_stats(
     new_stats_opt: &Option<ResourceStats>,
     stat_accs_opt: &mut Option<ResourceStats>,
@@ -403,6 +502,27 @@ fn merge_resource_stats(
             stat_accs.cpu_microsecs += new_stats.cpu_microsecs;
         } else {
             *stat_accs_opt = Some(*new_stats);
+        }
+    }
+}
+
+pub(crate) fn merge_splits_by_outcome(
+    new_opt: Option<SplitsByOutcome>,
+    acc_opt: &mut Option<SplitsByOutcome>,
+) {
+    if let Some(new) = new_opt {
+        if let Some(acc) = acc_opt {
+            acc.pruned_before_warmup += new.pruned_before_warmup;
+            acc.pruned_after_warmup += new.pruned_after_warmup;
+            acc.cancel_before_warmup += new.cancel_before_warmup;
+            acc.cancel_warmup += new.cancel_warmup;
+            acc.cancel_cpu_queue += new.cancel_cpu_queue;
+            acc.cancel_cpu += new.cancel_cpu;
+            acc.processed += new.processed;
+            acc.processed_from_metadata += new.processed_from_metadata;
+            acc.cache_hit += new.cache_hit;
+        } else {
+            *acc_opt = Some(new);
         }
     }
 }
@@ -498,6 +618,62 @@ mod stats_merge_tests {
                 warmup_microsecs: 525,
                 cpu_thread_pool_wait_microsecs: 700,
                 cpu_microsecs: 875,
+            })
+        );
+    }
+
+    #[test]
+    fn test_merge_splits_by_outcome() {
+        let mut acc = None;
+
+        // merging None into None stays None
+        merge_splits_by_outcome(None, &mut acc);
+        assert_eq!(acc, None);
+
+        let outcome = Some(SplitsByOutcome {
+            processed: 3,
+            cache_hit: 1,
+            cancel_warmup: 1,
+            ..Default::default()
+        });
+        merge_splits_by_outcome(outcome, &mut acc);
+        assert_eq!(
+            acc,
+            Some(SplitsByOutcome {
+                processed: 3,
+                cache_hit: 1,
+                cancel_warmup: 1,
+                ..Default::default()
+            })
+        );
+
+        // merging None keeps the accumulator unchanged
+        merge_splits_by_outcome(None, &mut acc);
+        assert_eq!(
+            acc,
+            Some(SplitsByOutcome {
+                processed: 3,
+                cache_hit: 1,
+                cancel_warmup: 1,
+                ..Default::default()
+            })
+        );
+
+        // retry outcome: the failed split succeeded on retry
+        let retry_outcome = Some(SplitsByOutcome {
+            processed: 1,
+            pruned_before_warmup: 2,
+            ..Default::default()
+        });
+        merge_splits_by_outcome(retry_outcome, &mut acc);
+        assert_eq!(
+            acc,
+            Some(SplitsByOutcome {
+                processed: 4,
+                cache_hit: 1,
+                cancel_warmup: 1,
+                pruned_before_warmup: 2,
+                ..Default::default()
             })
         );
     }

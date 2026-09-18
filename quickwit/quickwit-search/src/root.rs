@@ -33,7 +33,7 @@ use quickwit_proto::metastore::{
 use quickwit_proto::search::{
     FetchDocsRequest, FetchDocsResponse, Hit, LeafHit, LeafRequestRef, LeafSearchRequest,
     LeafSearchResponse, PartialHit, SearchPlanResponse, SearchRequest, SearchResponse,
-    SnippetRequest, SortDatetimeFormat, SortField, SortValue, SplitIdAndFooterOffsets,
+    SnippetRequest, SortDatetimeFormat, SortField, SortOrder, SortValue, SplitIdAndFooterOffsets,
 };
 use quickwit_proto::types::{IndexUid, SplitId};
 use quickwit_query::query_ast::{
@@ -45,7 +45,7 @@ use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::collector::Collector;
 use tantivy::schema::{Field, FieldEntry, FieldType, Schema};
-use tracing::{debug, info, info_span, instrument};
+use tracing::{debug, info_span, instrument, record_all};
 
 use crate::cluster_client::ClusterClient;
 use crate::collector::{QuickwitAggregations, make_merge_collector};
@@ -57,6 +57,7 @@ use crate::service::SearcherContext;
 use crate::{
     SearchError, SearchJobPlacer, SearchPlanResponseRest, SearchServiceClient,
     extract_split_and_footer_offsets, list_relevant_splits_with_secondary_time,
+    query_cost_classifier,
 };
 
 /// Maximum accepted scroll TTL.
@@ -161,12 +162,18 @@ pub struct IndexMetasForLeafSearch {
 
 pub(crate) type IndexesMetasForLeafSearch = HashMap<IndexUid, IndexMetasForLeafSearch>;
 
+/// Maps to `true` if the field mapping of all indexes is `datetime` for the
+/// given sort field. Contains an entry for every sort field. Does not ensure
+/// that the field is indeed a datetime in all splits (doc mapping might
+/// have been updated).
+type SortFieldsIsDatetime = HashMap<String, bool>;
+
 #[derive(Debug)]
 struct RequestMetadata {
     timestamp_field_opt: Option<String>,
     query_ast_resolved: QueryAst,
     indexes_meta_for_leaf_search: IndexesMetasForLeafSearch,
-    sort_fields_is_datetime: HashMap<String, bool>,
+    sort_fields_is_datetime: SortFieldsIsDatetime,
 }
 
 /// Validates request against each index's doc mapper and ensures that:
@@ -189,11 +196,10 @@ fn validate_request_and_build_metadata(
     )?;
     let query_ast: QueryAst = serde_json::from_str(&search_request.query_ast)
         .map_err(|err| SearchError::InvalidQuery(err.to_string()))?;
-    let mut indexes_meta_for_leaf_search: HashMap<IndexUid, IndexMetasForLeafSearch> =
-        HashMap::new();
+    let mut indexes_meta_for_leaf_search: IndexesMetasForLeafSearch = HashMap::new();
     let mut query_ast_resolved_opt: Option<QueryAst> = None;
     let mut timestamp_field_opt: Option<String> = None;
-    let mut sort_fields_is_datetime: HashMap<String, bool> = HashMap::new();
+    let mut sort_fields_is_datetime: SortFieldsIsDatetime = HashMap::new();
 
     for index_metadata in indexes_metadata {
         let doc_mapper = build_doc_mapper(
@@ -315,7 +321,7 @@ fn validate_secondary_time(index_metadata: &[IndexMetadata]) -> crate::Result<Op
 fn validate_sort_field_types(
     schema: &Schema,
     sort_fields: &[SortField],
-    sort_field_is_datetime: &mut HashMap<String, bool>,
+    sort_field_is_datetime: &mut SortFieldsIsDatetime,
 ) -> crate::Result<()> {
     for sort_field in sort_fields.iter() {
         if let Some(sort_field_entry) = get_sort_by_field_entry(&sort_field.field_name, schema)? {
@@ -402,6 +408,7 @@ fn simplify_search_request_for_scroll_api(req: &SearchRequest) -> crate::Result<
         count_hits: quickwit_proto::search::CountHits::Underestimate as i32,
         ignore_missing_indexes: req.ignore_missing_indexes,
         split_id: req.split_id.clone(),
+        user_agent: req.user_agent.clone(),
     })
 }
 
@@ -439,16 +446,10 @@ fn validate_sort_by_fields_and_search_after(
     }
 
     let mut search_after_sort_value_count = 0;
-    // TODO: we could validate if the search after sort value types of consistent with the sort
-    // field types.
-    if let Some(sort_by_value) = search_after_partial_hit.sort_value.as_ref() {
-        sort_by_value.sort_value.context("sort value must be set")?;
+    if search_after_partial_hit.sort_value.is_some() {
         search_after_sort_value_count += 1;
     }
-    if let Some(sort_by_value_2) = search_after_partial_hit.sort_value2.as_ref() {
-        sort_by_value_2
-            .sort_value
-            .context("sort value must be set")?;
+    if search_after_partial_hit.sort_value2.is_some() {
         search_after_sort_value_count += 1;
     }
     if search_after_sort_value_count != sort_fields_without_doc_count {
@@ -486,11 +487,6 @@ fn validate_sort_by_field_type(
     has_timestamp_format: bool,
 ) -> crate::Result<()> {
     let field_name = sort_by_field_entry.name();
-    if matches!(sort_by_field_entry.field_type(), FieldType::Str(_)) {
-        return Err(SearchError::InvalidArgument(format!(
-            "sort by field on type text is currently not supported `{field_name}`"
-        )));
-    }
     if !sort_by_field_entry.is_fast() {
         return Err(SearchError::InvalidArgument(format!(
             "sort by field must be a fast field, please add the fast property to your field \
@@ -638,6 +634,7 @@ async fn search_partial_hits_phase_with_scroll(
             cached_partial_hits,
             failed_splits: leaf_search_resp.failed_splits.clone(),
             num_successful_splits: leaf_search_resp.num_successful_splits,
+            splits_by_outcome: leaf_search_resp.splits_by_outcome,
         };
         let scroll_key_and_start_offset: ScrollKeyAndStartOffset =
             ScrollKeyAndStartOffset::new_with_start_offset(
@@ -710,13 +707,18 @@ pub fn get_count_from_metadata(split_metadatas: &[SplitMetadata]) -> Vec<LeafSea
     split_metadatas
         .iter()
         .map(|metadata| LeafSearchResponse {
-            num_hits: metadata.num_docs as u64,
+            num_hits: (metadata.num_docs as u64)
+                .saturating_sub(metadata.soft_deleted_doc_ids.len() as u64),
             partial_hits: Vec::new(),
             failed_splits: Vec::new(),
             num_attempted_splits: 1,
             num_successful_splits: 1,
             intermediate_aggregation_result: None,
             resource_stats: None,
+            splits_by_outcome: Some(quickwit_proto::search::SplitsByOutcome {
+                processed_from_metadata: 1,
+                ..Default::default()
+            }),
         })
         .collect()
 }
@@ -796,12 +798,17 @@ pub(crate) async fn search_partial_hits_phase(
     // Wrap into result for merge_fruits
     let leaf_search_results: Vec<tantivy::Result<LeafSearchResponse>> =
         leaf_search_responses.into_iter().map(Ok).collect_vec();
+    let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
     let span = info_span!("merge_fruits");
-    let leaf_search_response = crate::search_thread_pool()
-        .run_cpu_intensive(move || {
-            let _span_guard = span.enter();
-            merge_collector.merge_fruits(leaf_search_results)
-        })
+    let mut leaf_search_response = crate::search_thread_pool()
+        .run_cpu_intensive_with_extra_tags(
+            move || {
+                let _span_guard = span.enter();
+                merge_collector.merge_fruits(leaf_search_results)
+            },
+            "root_merge",
+            cost_class.as_label(),
+        )
         .await
         .context("failed to merge leaf search responses")?
         .map_err(|error: TantivyError| crate::SearchError::Internal(error.to_string()))?;
@@ -828,8 +835,8 @@ pub(crate) async fn search_partial_hits_phase(
         );
     }
 
-    if !leaf_search_response.failed_splits.is_empty() {
-        quickwit_common::rate_limited_error!(limit_per_min=6, failed_splits = ?leaf_search_response.failed_splits, "leaf search response contains at least one failed split");
+    if leaf_search_response.splits_by_outcome.is_none() {
+        leaf_search_response.splits_by_outcome = Some(Default::default());
     }
 
     Ok(leaf_search_response)
@@ -952,7 +959,7 @@ fn build_hit_with_position(
     if let Some(sort_by_value) = sort_value_opt
         && let Some(output_datetime_format) = &sort_field_1_datetime_format_opt
     {
-        convert_sort_datetime_value(sort_by_value, *output_datetime_format)?;
+        convert_sort_datetime_value_from_nanos(sort_by_value, *output_datetime_format)?;
     }
     let sort_value_2_opt = partial_hit_ref
         .sort_value2
@@ -961,7 +968,7 @@ fn build_hit_with_position(
     if let Some(sort_by_value) = sort_value_2_opt
         && let Some(output_datetime_format) = &sort_field_2_datetime_format_opt
     {
-        convert_sort_datetime_value(sort_by_value, *output_datetime_format)?;
+        convert_sort_datetime_value_from_nanos(sort_by_value, *output_datetime_format)?;
     }
     let position = *hit_order.get(&key).expect("hit order must be present");
     let index_id = split_id_to_index_id_map
@@ -1043,12 +1050,12 @@ async fn root_search_aux(
         num_hits: first_phase_result.num_hits,
         hits,
         elapsed_time_micros: 0u64,
-        errors: Vec::new(),
         scroll_id: scroll_key_and_start_offset_opt
             .as_ref()
             .map(ToString::to_string),
         failed_splits: first_phase_result.failed_splits,
         num_successful_splits: first_phase_result.num_successful_splits,
+        splits_by_outcome: first_phase_result.splits_by_outcome,
     })
 }
 
@@ -1146,7 +1153,7 @@ async fn refine_and_list_matches(
     search_request: &mut SearchRequest,
     indexes_metadata: Vec<IndexMetadata>,
     query_ast_resolved: QueryAst,
-    sort_fields_is_datetime: HashMap<String, bool>,
+    sort_fields_is_datetime: SortFieldsIsDatetime,
     timestamp_field_opt: Option<String>,
     secondary_timestamp_field_opt: Option<String>,
 ) -> crate::Result<Vec<SplitMetadata>> {
@@ -1167,6 +1174,7 @@ async fn refine_and_list_matches(
             &mut search_request.start_timestamp,
             &mut search_request.end_timestamp,
         );
+        refine_timestamps_from_search_after(search_request, timestamp_field);
     }
 
     let mut start_secondary_timestamp_opt: Option<i64> = None;
@@ -1180,7 +1188,15 @@ async fn refine_and_list_matches(
         );
     }
 
-    let tag_filter_ast = extract_tags_from_query(query_ast_resolved);
+    // We might miss some pruning opportunities by restricting the tag filter
+    // AST to the tag fields of the current doc mappings, but sending all
+    // possible filters to the metastore is too expensive for large queries (e.g
+    // TermSet queries with thousands of terms).
+    let tag_field_names: std::collections::BTreeSet<String> = indexes_metadata
+        .iter()
+        .flat_map(|meta| meta.index_config.doc_mapping.tag_fields.iter().cloned())
+        .collect();
+    let tag_filter_ast = extract_tags_from_query(query_ast_resolved, Some(&tag_field_names));
 
     // TODO if search after is set, we sort by timestamp and we don't want to count all results,
     // we can refine more here. Same if we sort by _shard_doc
@@ -1213,6 +1229,7 @@ async fn refine_and_list_matches(
 async fn plan_splits_for_root_search(
     search_request: &mut SearchRequest,
     metastore: &mut MetastoreServiceClient,
+    max_splits_per_search: Option<usize>,
 ) -> crate::Result<(Vec<SplitMetadata>, IndexesMetasForLeafSearch)> {
     let list_indexes_metadatas_request = ListIndexesMetadataRequest {
         index_id_patterns: search_request.index_id_patterns.clone(),
@@ -1246,10 +1263,45 @@ async fn plan_splits_for_root_search(
         secondary_timestamp_field_opt,
     )
     .await?;
+
+    let num_targeted_splits = split_metadatas.len();
+    if let Some(max_total_split_searches) = max_splits_per_search
+        && num_targeted_splits > max_total_split_searches
+    {
+        return Err(SearchError::TooManySplits(format!(
+            "Targeted split limit exceeded ({num_targeted_splits}>{max_total_split_searches})"
+        )));
+    }
+
     Ok((
         split_metadatas,
         request_metadata.indexes_meta_for_leaf_search,
     ))
+}
+
+fn record_request_span(search_request: &SearchRequest) -> tracing::Span {
+    let span = info_span!(
+        "request",
+        indexes = ?PrettySample::new(&search_request.index_id_patterns, 5),
+        user_agent = search_request.user_agent.as_deref().unwrap_or_default(),
+        query_ast = %search_request.query_ast,
+        count_required = search_request.count_hits().as_str_name(),
+        agg = tracing::field::Empty,
+        ts_range = tracing::field::Empty,
+        elapsed_ms = tracing::field::Empty,
+        targeted_splits_bytes = tracing::field::Empty,
+        num_targeted_splits = tracing::field::Empty,
+    );
+    if let Some(agg) = search_request.aggregation_request.as_ref() {
+        record_all!(span, agg = %agg);
+    }
+    if search_request.start_timestamp.is_some() || search_request.end_timestamp.is_some() {
+        record_all!(
+            span,
+            ts_range = ?search_request.start_timestamp..search_request.end_timestamp,
+        );
+    }
+    span
 }
 
 /// Performs a distributed search.
@@ -1266,45 +1318,31 @@ pub async fn root_search(
 ) -> crate::Result<SearchResponse> {
     let start_instant = Instant::now();
 
+    let req_span = record_request_span(&search_request);
+
     let (split_metadatas, indexes_meta_for_leaf_search) = SearchPlanMetricsFuture {
         start: start_instant,
-        tracked: plan_splits_for_root_search(&mut search_request, &mut metastore),
-        is_success: None,
+        user_agent: search_request.user_agent.clone().unwrap_or_default(),
+        tracked: plan_splits_for_root_search(
+            &mut search_request,
+            &mut metastore,
+            searcher_context.searcher_config.max_splits_per_search,
+        ),
+        status: None,
+        req_span: req_span.clone(),
     }
     .await?;
 
-    let num_docs: usize = split_metadatas.iter().map(|split| split.num_docs).sum();
-    let num_splits = split_metadatas.len();
-
-    // It would have been nice to add those in the context of the trace span,
-    // but with our current logging setting, it makes logs too verbose.
-    info!(
-        query_ast = search_request.query_ast.as_str(),
-        agg = search_request.aggregation_request(),
-        start_ts = ?(search_request.start_timestamp()..search_request.end_timestamp()),
-        count_required = search_request.count_hits().as_str_name(),
-        num_docs = num_docs,
-        num_splits = num_splits,
-        "root_search"
-    );
-
-    if let Some(max_total_split_searches) = searcher_context.searcher_config.max_splits_per_search
-        && max_total_split_searches < num_splits
-    {
-        tracing::error!(
-            num_splits,
-            max_total_split_searches,
-            index=?PrettySample::new(search_request.index_id_patterns, 5),
-            query=%search_request.query_ast,
-            "max total splits exceeded"
-        );
-        return Err(SearchError::InvalidArgument(format!(
-            "Number of targeted splits {num_splits} exceeds the limit {max_total_split_searches}"
-        )));
-    }
+    let targeted_splits_bytes: u64 = split_metadatas
+        .iter()
+        .map(|split| split.footer_offsets.end)
+        .sum();
+    let num_targeted_splits = split_metadatas.len();
+    record_all!(req_span, targeted_splits_bytes, num_targeted_splits);
 
     let mut search_response_result = RootSearchMetricsFuture {
         start: start_instant,
+        user_agent: search_request.user_agent.clone().unwrap_or_default(),
         tracked: root_search_aux(
             searcher_context,
             &indexes_meta_for_leaf_search,
@@ -1313,7 +1351,8 @@ pub async fn root_search(
             cluster_client,
         ),
         status: None,
-        num_targeted_splits: num_splits,
+        num_targeted_splits,
+        req_span,
     }
     .await;
 
@@ -1397,12 +1436,11 @@ pub async fn search_plan(
     } else {
         0
     };
-    let sstable_query_count = warmup_info.term_dict_fields.len()
-        + warmup_info
-            .terms_grouped_by_field
-            .values()
-            .map(|terms: &HashMap<tantivy::Term, bool>| terms.len())
-            .sum::<usize>()
+    let sstable_query_count = warmup_info
+        .terms_grouped_by_field
+        .values()
+        .map(|terms: &HashMap<tantivy::Term, bool>| terms.len())
+        .sum::<usize>()
         + warmup_info
             .term_ranges_grouped_by_field
             .values()
@@ -1448,10 +1486,9 @@ pub async fn search_plan(
 /// Converts search after with datetime format to nanoseconds (representation in tantivy).
 /// If the sort field is a datetime field and no datetime format is set, the default format is
 /// milliseconds.
-/// `sort_fields_are_datetime_opt` must be of the same length as `search_request.sort_fields`.
 fn convert_search_after_datetime_values(
     search_request: &mut SearchRequest,
-    sort_fields_is_datetime: &HashMap<String, bool>,
+    sort_fields_is_datetime: &SortFieldsIsDatetime,
 ) -> crate::Result<()> {
     for sort_field in search_request.sort_fields.iter_mut() {
         if *sort_fields_is_datetime
@@ -1488,79 +1525,94 @@ fn convert_search_after_datetime_values(
     Ok(())
 }
 
-/// Convert sort values from input datetime format into nanoseconds.
-/// The conversion is done only for U64 and I64 sort values, an error is returned for other types.
+/// Converts a numerical sort value from the given input datetime format into a `Datetime` sort
+/// value (nanoseconds, tantivy's internal datetime representation).
+/// Only `U64` and `I64` sort values are accepted; an error is returned for other types.
 fn convert_sort_datetime_value_into_nanos(
     sort_value: &mut SortValue,
     input_format: SortDatetimeFormat,
 ) -> crate::Result<()> {
-    match sort_value {
-        SortValue::U64(value) => match input_format {
-            SortDatetimeFormat::UnixTimestampMillis => {
-                *value = value.checked_mul(1_000_000).ok_or_else(|| {
-                    SearchError::Internal(format!(
-                        "sort value defined in milliseconds is too large and cannot be converted \
-                         into nanoseconds: {value}"
-                    ))
-                })?;
-            }
-            SortDatetimeFormat::UnixTimestampNanos => {
-                // Nothing to do as the internal format is nanos.
-            }
-        },
-        SortValue::I64(value) => match input_format {
-            SortDatetimeFormat::UnixTimestampMillis => {
-                *value = value.checked_mul(1_000_000).ok_or_else(|| {
-                    SearchError::Internal(format!(
-                        "sort value defined in milliseconds is too large and cannot be converted \
-                         into nanoseconds: {value}"
-                    ))
-                })?;
-            }
-            SortDatetimeFormat::UnixTimestampNanos => {
-                // Nothing to do as the internal format is nanos.
-            }
-        },
+    // Normalise to i64, even though in theory the sort value should be parsed as i64 anyway.
+    let raw: i64 = match sort_value {
+        SortValue::U64(value) => i64::try_from(*value).map_err(|_| {
+            SearchError::Internal(format!(
+                "sort value is too large to be represented as a datetime: {value}"
+            ))
+        })?,
+        SortValue::I64(value) => *value,
         _ => {
             return Err(SearchError::Internal(format!(
-                "datetime conversion are only support for u64 and i64 sort values, not \
+                "datetime conversion is only supported for u64 and i64 sort values, not \
                  `{sort_value:?}`"
             )));
         }
-    }
+    };
+    let nanos: i64 = match input_format {
+        SortDatetimeFormat::UnixTimestampMillis => raw.checked_mul(1_000_000).ok_or_else(|| {
+            SearchError::Internal(format!(
+                "sort value defined in milliseconds is too large to be a timestamp: {raw}"
+            ))
+        })?,
+        SortDatetimeFormat::UnixTimestampNanos => raw,
+    };
+    *sort_value = SortValue::Datetime(nanos);
     Ok(())
 }
 
-/// Convert sort values from nanoseconds to the requested output format.
-/// The conversion is done only for U64 and I64 sort values, an error is returned for other types.
-fn convert_sort_datetime_value(
+/// Refines the search request's `start_timestamp` / `end_timestamp` from the `search_after`
+/// cursor when the primary sort field is the timestamp field.
+fn refine_timestamps_from_search_after(search_request: &mut SearchRequest, timestamp_field: &str) {
+    let Some(sort_field) = search_request.sort_fields.first() else {
+        return;
+    };
+    if sort_field.field_name != timestamp_field {
+        return;
+    }
+    let sort_order = sort_field.sort_order();
+    let Some(SortValue::Datetime(cursor_nanos)) = search_request
+        .search_after
+        .as_ref()
+        .and_then(|partial_hit| partial_hit.sort_value())
+    else {
+        return;
+    };
+    match sort_order {
+        SortOrder::Desc => {
+            // Subsequent pages only contain documents strictly equal or older than the cursor.
+            // `end_timestamp` is an exclusive upper bound; only ever tighten it (take the min).
+            let end_secs = cursor_nanos / 1_000_000_000 + 1;
+            search_request.end_timestamp = Some(match search_request.end_timestamp {
+                Some(end_timestamp) => end_timestamp.min(end_secs),
+                None => end_secs,
+            });
+        }
+        SortOrder::Asc => {
+            // Subsequent pages only contain documents strictly newer than the cursor.
+            // `start_timestamp` is an inclusive lower bound; only ever tighten it (take the max).
+            // `Option::max` treats `None` as the least restrictive bound.
+            let start_secs = cursor_nanos / 1_000_000_000;
+            search_request.start_timestamp = search_request.start_timestamp.max(Some(start_secs));
+        }
+    }
+}
+
+/// Converts a `Datetime` sort value (nanoseconds, tantivy's internal representation) into the
+/// requested output format, replacing the value in place.
+///
+/// Only the `Datetime` variant is accepted; an error is returned for other types.
+fn convert_sort_datetime_value_from_nanos(
     sort_value: &mut SortValue,
     output_format: SortDatetimeFormat,
 ) -> crate::Result<()> {
-    match sort_value {
-        SortValue::U64(value) => match output_format {
-            SortDatetimeFormat::UnixTimestampMillis => {
-                *value /= 1_000_000;
-            }
-            SortDatetimeFormat::UnixTimestampNanos => {
-                // Nothing todo as the internal format is in nanos.
-            }
-        },
-        SortValue::I64(value) => match output_format {
-            SortDatetimeFormat::UnixTimestampMillis => {
-                *value /= 1_000_000;
-            }
-            SortDatetimeFormat::UnixTimestampNanos => {
-                // Nothing todo as the internal format is in nanos.
-            }
-        },
-        _ => {
-            return Err(SearchError::Internal(format!(
-                "datetime conversion are only support for u64 and i64 sort values, not \
-                 `{sort_value:?}`"
-            )));
-        }
-    }
+    let SortValue::Datetime(nanos) = sort_value else {
+        return Err(SearchError::Internal(format!(
+            "datetime conversion is only supported for datetime sort values, not `{sort_value:?}`"
+        )));
+    };
+    *sort_value = match output_format {
+        SortDatetimeFormat::UnixTimestampMillis => SortValue::I64(*nanos / 1_000_000),
+        SortDatetimeFormat::UnixTimestampNanos => SortValue::I64(*nanos),
+    };
     Ok(())
 }
 
@@ -1597,19 +1649,16 @@ impl ExtractTimestampRange<'_> {
     fn update_start_timestamp(
         &mut self,
         lower_bound: &quickwit_query::JsonLiteral,
-        included: bool,
+        _included: bool,
     ) {
         use quickwit_query::InterpretUserInput;
-        let Some(lower_bound) = tantivy::DateTime::interpret_json(lower_bound) else {
+        let Some(lower_bound_timestamp) = tantivy::DateTime::interpret_json(lower_bound) else {
             return;
         };
-        let mut lower_bound = lower_bound.into_timestamp_secs();
-        if !included {
-            // TODO saturating isn't exactly right, we should replace the RangeQuery with
-            // a match_none, but the visitor doesn't allow mutation.
-            lower_bound = lower_bound.saturating_add(1);
-        }
+        let lower_bound = lower_bound_timestamp.into_timestamp_secs();
 
+        // lower_bound_timestamp has arbitrary precision, so even if it is
+        // excluded its truncated value must be used a start_timestamp.
         self.start_timestamp = self.start_timestamp.max(Some(lower_bound));
     }
 
@@ -2179,25 +2228,63 @@ mod tests {
 
     #[test]
     fn test_convert_sort_datetime_value() {
-        let mut sort_value = SortValue::U64(1617000000000000000);
-        convert_sort_datetime_value(&mut sort_value, SortDatetimeFormat::UnixTimestampMillis)
-            .unwrap();
-        assert_eq!(sort_value, SortValue::U64(1617000000000));
-        let mut sort_value = SortValue::I64(1617000000000000000);
-        convert_sort_datetime_value(&mut sort_value, SortDatetimeFormat::UnixTimestampMillis)
-            .unwrap();
+        // millis output
+        let mut sort_value = SortValue::Datetime(1617000000000000000);
+        convert_sort_datetime_value_from_nanos(
+            &mut sort_value,
+            SortDatetimeFormat::UnixTimestampMillis,
+        )
+        .unwrap();
         assert_eq!(sort_value, SortValue::I64(1617000000000));
 
-        // conversion with float values should fail.
+        // nanos output
+        let mut sort_value = SortValue::Datetime(1617000000000000000);
+        convert_sort_datetime_value_from_nanos(
+            &mut sort_value,
+            SortDatetimeFormat::UnixTimestampNanos,
+        )
+        .unwrap();
+        assert_eq!(sort_value, SortValue::I64(1617000000000000000));
+
+        // non-datetime values should fail.
         let mut sort_value = SortValue::F64(1617000000000000000.0);
-        let error =
-            convert_sort_datetime_value(&mut sort_value, SortDatetimeFormat::UnixTimestampMillis)
-                .unwrap_err();
+        let error = convert_sort_datetime_value_from_nanos(
+            &mut sort_value,
+            SortDatetimeFormat::UnixTimestampMillis,
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "internal error: `datetime conversion are only support for u64 and i64 sort values, \
-             not `F64(1.617e18)``"
+            "internal error: `datetime conversion is only supported for datetime sort values, not \
+             `F64(1.617e18)``"
         );
+    }
+
+    #[test]
+    fn test_sort_datetime_value_roundtrip() {
+        use quickwit_proto::search::SortByValue;
+        let nanos: i64 = 1617000000000000000;
+
+        for format in [
+            SortDatetimeFormat::UnixTimestampMillis,
+            SortDatetimeFormat::UnixTimestampNanos,
+        ] {
+            let mut sort_value = SortValue::Datetime(nanos);
+            convert_sort_datetime_value_from_nanos(&mut sort_value, format).unwrap();
+
+            let json = SortByValue::from(sort_value).into_json();
+
+            let sort_by_value = SortByValue::try_from_json(json).unwrap();
+            let mut sort_value = sort_by_value.sort_value.unwrap();
+
+            convert_sort_datetime_value_into_nanos(&mut sort_value, format).unwrap();
+
+            assert_eq!(
+                sort_value,
+                SortValue::Datetime(nanos),
+                "roundtrip failed for format {format:?}"
+            );
+        }
     }
 
     #[test]
@@ -2208,39 +2295,29 @@ mod tests {
             SortDatetimeFormat::UnixTimestampMillis,
         )
         .unwrap();
-        assert_eq!(sort_value, SortValue::U64(1617000000000000000));
+        assert_eq!(sort_value, SortValue::Datetime(1617000000000000000));
         let mut sort_value = SortValue::I64(1617000000000);
         convert_sort_datetime_value_into_nanos(
             &mut sort_value,
             SortDatetimeFormat::UnixTimestampMillis,
         )
         .unwrap();
-        assert_eq!(sort_value, SortValue::I64(1617000000000000000));
+        assert_eq!(sort_value, SortValue::Datetime(1617000000000000000));
 
         // conversion with a too large millisecond value should fail.
         let mut sort_value = SortValue::I64(1617000000000000);
-        let error = convert_sort_datetime_value_into_nanos(
+        convert_sort_datetime_value_into_nanos(
             &mut sort_value,
             SortDatetimeFormat::UnixTimestampMillis,
         )
         .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "internal error: `sort value defined in milliseconds is too large and cannot be \
-             converted into nanoseconds: 1617000000000000`"
-        );
         // conversion with float values should fail.
         let mut sort_value = SortValue::F64(1617000000000000.0);
-        let error = convert_sort_datetime_value_into_nanos(
+        convert_sort_datetime_value_into_nanos(
             &mut sort_value,
             SortDatetimeFormat::UnixTimestampMillis,
         )
         .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "internal error: `datetime conversion are only support for u64 and i64 sort values, \
-             not `F64(1617000000000000.0)``"
-        );
     }
 
     #[test]
@@ -2411,7 +2488,7 @@ mod tests {
         let timestamp_field = schema_builder.add_date_field("timestamp", FAST);
         let id_field = schema_builder.add_u64_field("id", FAST);
         let no_fast_field = schema_builder.add_u64_field("no_fast", STORED);
-        let text_field = schema_builder.add_text_field("text", STORED);
+        let text_field = schema_builder.add_text_field("text", FAST);
         let schema = schema_builder.build();
         {
             let sort_by_field_entry = schema.get_field_entry(timestamp_field);
@@ -2439,11 +2516,7 @@ mod tests {
         }
         {
             let sort_by_field_entry = schema.get_field_entry(text_field);
-            let error = validate_sort_by_field_type(sort_by_field_entry, true).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "Invalid argument: sort by field on type text is currently not supported `text`"
-            );
+            validate_sort_by_field_type(sort_by_field_entry, false).unwrap();
         }
     }
 
@@ -2987,9 +3060,9 @@ mod tests {
             query_ast: qast_json_helper("test", &["body"]),
             max_hits: 10,
             sort_fields: vec![SortField {
-                field_name: "response_date".to_string(),
+                field_name: "response_time".to_string(),
                 sort_order: SortOrder::Asc.into(),
-                sort_datetime_format: Some(SortDatetimeFormat::UnixTimestampNanos as i32),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3169,9 +3242,9 @@ mod tests {
             query_ast: qast_json_helper("test", &["body"]),
             max_hits: 10,
             sort_fields: vec![SortField {
-                field_name: "response_date".to_string(),
+                field_name: "response_time".to_string(),
                 sort_order: SortOrder::Desc.into(),
-                sort_datetime_format: Some(SortDatetimeFormat::UnixTimestampNanos as i32),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -4449,7 +4522,8 @@ mod tests {
         timestamp_range_extractor.start_timestamp = None;
         timestamp_range_extractor.end_timestamp = None;
         timestamp_range_extractor.visit(&unusual_bounds).unwrap();
-        assert_eq!(timestamp_range_extractor.start_timestamp, Some(1618353942));
+        // > 2021-04-13T22:45:41Z must include any 2021-04-13T22:45:41.xxxZ
+        assert_eq!(timestamp_range_extractor.start_timestamp, Some(1618353941));
         assert_eq!(timestamp_range_extractor.end_timestamp, Some(1620283880));
 
         let wrong_field = quickwit_query::query_ast::RangeQuery {
@@ -4484,6 +4558,225 @@ mod tests {
         timestamp_range_extractor.visit(&high_precision).unwrap();
         assert_eq!(timestamp_range_extractor.start_timestamp, Some(1618353941));
         assert_eq!(timestamp_range_extractor.end_timestamp, Some(1620283880));
+
+        // create bounds from fractional seconds
+        let narrow_fractional_range = quickwit_query::query_ast::RangeQuery {
+            field: timestamp_field.to_string(),
+            lower_bound: Bound::Excluded(JsonLiteral::String(
+                "2022-12-16T10:00:57.148999Z".to_owned(),
+            )),
+            upper_bound: Bound::Included(JsonLiteral::String(
+                "2022-12-16T10:00:57.149001Z".to_owned(),
+            )),
+        }
+        .into();
+
+        let mut timestamp_range_extractor = ExtractTimestampRange {
+            timestamp_field,
+            start_timestamp: None,
+            end_timestamp: None,
+        };
+        timestamp_range_extractor
+            .visit(&narrow_fractional_range)
+            .unwrap();
+        // When we have > 1671184857.148999, we should get >= 1671184857, not >= 1671184858
+        // because the second 1671184857 contains values > 1671184857.148999
+        assert_eq!(timestamp_range_extractor.start_timestamp, Some(1671184857));
+        // When we have <= 1671184857.149001, we should get < 1671184858
+        assert_eq!(timestamp_range_extractor.end_timestamp, Some(1671184858));
+    }
+
+    #[test]
+    fn test_refine_timestamps_from_search_after() {
+        const TS_FIELD: &str = "timestamp";
+
+        // Builds a request sorted by `field` with a datetime `search_after` cursor (in nanos).
+        fn request_with_cursor(
+            field: &str,
+            order: SortOrder,
+            cursor_nanos: Option<i64>,
+        ) -> SearchRequest {
+            SearchRequest {
+                sort_fields: vec![SortField {
+                    field_name: field.to_string(),
+                    sort_order: order as i32,
+                    sort_datetime_format: None,
+                }],
+                search_after: cursor_nanos.map(|nanos| PartialHit {
+                    sort_value: Some(SortByValue {
+                        sort_value: Some(SortValue::Datetime(nanos)),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        // DESC: end_timestamp is an exclusive upper bound, rounded up (div_ceil).
+        // Cursor 1_700_000_000.5s -> end = 1_700_000_001 so splits whose floor-second is
+        // 1_700_000_000 are still searched (they may hold sub-second docs before the cursor).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Desc, Some(1_700_000_000_500_000_000));
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, Some(1_700_000_001));
+            assert_eq!(request.start_timestamp, None);
+        }
+
+        // DESC: cursor exactly on a second boundary -> end = that second (exclusive).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Desc, Some(1_700_000_000_000_000_000));
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, Some(1_700_000_001));
+        }
+
+        // ASC: start_timestamp is an inclusive lower bound, rounded down (floor).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Asc, Some(1_700_000_000_500_000_000));
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.start_timestamp, Some(1_700_000_000));
+            assert_eq!(request.end_timestamp, None);
+        }
+
+        // DESC: an existing, more restrictive end_timestamp is preserved (never widened).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Desc, Some(1_700_000_000_500_000_000));
+            request.end_timestamp = Some(1_600_000_000);
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, Some(1_600_000_000));
+        }
+
+        // DESC: an existing, less restrictive end_timestamp is tightened to the cursor bound.
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Desc, Some(1_700_000_000_500_000_000));
+            request.end_timestamp = Some(1_800_000_000);
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, Some(1_700_000_001));
+        }
+
+        // ASC: an existing, more restrictive start_timestamp is preserved (max).
+        {
+            let mut request =
+                request_with_cursor(TS_FIELD, SortOrder::Asc, Some(1_700_000_000_500_000_000));
+            request.start_timestamp = Some(1_800_000_000);
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.start_timestamp, Some(1_800_000_000));
+        }
+
+        // No-op: the primary sort field is not the timestamp field.
+        {
+            let mut request = request_with_cursor(
+                "other_field",
+                SortOrder::Desc,
+                Some(1_700_000_000_500_000_000),
+            );
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, None);
+            assert_eq!(request.start_timestamp, None);
+        }
+
+        // No-op: no search_after cursor.
+        {
+            let mut request = request_with_cursor(TS_FIELD, SortOrder::Desc, None);
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, None);
+        }
+
+        // No-op: the cursor value is not a datetime (e.g. it was never normalised to nanos).
+        {
+            let mut request = SearchRequest {
+                sort_fields: vec![SortField {
+                    field_name: TS_FIELD.to_string(),
+                    sort_order: SortOrder::Desc as i32,
+                    sort_datetime_format: None,
+                }],
+                search_after: Some(PartialHit {
+                    sort_value: Some(SortByValue {
+                        sort_value: Some(SortValue::I64(1_700_000_000_500_000_000)),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, None);
+        }
+
+        // No-op: empty sort fields.
+        {
+            let mut request = SearchRequest {
+                search_after: Some(PartialHit {
+                    sort_value: Some(SortByValue {
+                        sort_value: Some(SortValue::Datetime(1_700_000_000_500_000_000)),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            refine_timestamps_from_search_after(&mut request, TS_FIELD);
+            assert_eq!(request.end_timestamp, None);
+            assert_eq!(request.start_timestamp, None);
+        }
+    }
+
+    // Regression guard for the call ordering in `refine_and_list_matches`:
+    // `refine_timestamps_from_search_after` only tightens the timestamp bounds when the cursor is
+    // already a `SortValue::Datetime`, which is produced by `convert_search_after_datetime_values`.
+    // If the conversion is moved *after* the refinement, the cursor stays a raw integer, the
+    // refinement silently no-ops, and this test fails without touching any other code.
+    #[tokio::test]
+    async fn test_refine_and_list_matches_refines_timestamps_from_search_after() {
+        const TS_FIELD: &str = "timestamp";
+
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore.expect_list_splits().returning(|_| {
+            Ok(ServiceStream::from(vec![Ok(
+                ListSplitsResponse::try_from_splits(Vec::new()).unwrap(),
+            )]))
+        });
+        let mut metastore = MetastoreServiceClient::from_mock(mock_metastore);
+
+        let index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
+
+        // The cursor arrives as a raw unix-millis integer, exactly as it would before
+        // normalisation.
+        let mut search_request = SearchRequest {
+            index_id_patterns: vec!["test-index".to_string()],
+            sort_fields: vec![SortField {
+                field_name: TS_FIELD.to_string(),
+                sort_order: SortOrder::Desc as i32,
+                sort_datetime_format: None,
+            }],
+            search_after: Some(PartialHit {
+                sort_value: Some(SortByValue {
+                    sort_value: Some(SortValue::I64(1_700_000_000_500)),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sort_fields_is_datetime: SortFieldsIsDatetime =
+            HashMap::from([(TS_FIELD.to_string(), true)]);
+
+        refine_and_list_matches(
+            &mut metastore,
+            &mut search_request,
+            vec![index_metadata],
+            QueryAst::MatchAll,
+            sort_fields_is_datetime,
+            Some(TS_FIELD.to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The cursor (1_700_000_000.5s, DESC) must tighten the exclusive upper bound to the next
+        // second. This only happens if the datetime conversion ran before the refinement.
+        assert_eq!(search_request.end_timestamp, Some(1_700_000_001));
     }
 
     fn create_search_resp(
@@ -5356,7 +5649,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(search_error, SearchError::InvalidArgument { .. }));
+        assert!(matches!(search_error, SearchError::TooManySplits { .. }));
         Ok(())
     }
 }

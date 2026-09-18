@@ -70,7 +70,17 @@ Examples of operation names: `create_index`, `index_metadata`, `delete_index`, `
 | --------- | ----------- | ----------- | ---- |
 | `quickwit_search` | `leaf_searches_splits_total` | Number of leaf searches (count of splits) started | `counter` |
 | `quickwit_search` | `leaf_search_split_duration_secs` | Number of seconds required to run a leaf search over a single split. The timer starts after the semaphore is obtained | `histogram` |
+| `quickwit_search` | `leaf_search_permit_wait_duration_secs` | Number of seconds a single split leaf search waited to acquire a search permit (concurrency slot and memory allocation) | `histogram` |
 | `quickwit_search` | `active_search_threads_count` | Number of threads in use in the CPU thread pool | `gauge` |
+
+## Thread Pool Metrics
+
+| Namespace | Metric Name | Description | Labels | Type |
+| --------- | ----------- | ----------- | ------ | ---- |
+| `quickwit_thread_pool` | `pending_tasks` | Number of tasks waiting in the queue before being processed by the thread pool | [`pool`, `caller`] | `gauge` |
+| `quickwit_thread_pool` | `ongoing_tasks` | Number of tasks being currently processed by threads in the thread pool | [`pool`, `caller`] | `gauge` |
+| `quickwit_thread_pool` | `queue_wait_time_secs` | Amount of time a task waited in the queue before being picked up by a thread in the thread pool | [`pool`, `caller`] | `histogram` |
+| `quickwit_thread_pool` | `run_time_secs` | Amount of time spent actually running a task on a thread pool worker, once it has been picked up from the queue | [`pool`, `caller`] | `histogram` |
 
 ## Storage Metrics
 

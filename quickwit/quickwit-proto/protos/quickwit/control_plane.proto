@@ -69,6 +69,21 @@ service ControlPlaneService {
 
   // Performs a debounced shard pruning request to the metastore.
   rpc PruneShards(quickwit.metastore.PruneShardsRequest) returns (quickwit.metastore.EmptyResponse);
+
+  // Swaps indexing pipelines of different indexes between different indexers.
+  rpc SwapIndexingPipelines(SwapIndexingPipelinesRequest) returns (SwapIndexingPipelinesResponse);
+
+  // Maintenance Mode API
+
+  // Enables maintenance mode on the cluster. When active, the indexing plan is frozen,
+  // metadata mutations (index/source CRUD) are accepted but the plan is not rebuilt, and shard scaling/rebalancing is paused.
+  rpc EnableMaintenanceMode(EnableMaintenanceModeRequest) returns (EnableMaintenanceModeResponse);
+
+  // Disables maintenance mode. Triggers a full indexing plan rebuild to reconcile the cluster.
+  rpc DisableMaintenanceMode(DisableMaintenanceModeRequest) returns (DisableMaintenanceModeResponse);
+
+  // Returns the current maintenance mode status.
+  rpc GetMaintenanceMode(GetMaintenanceModeRequest) returns (GetMaintenanceModeResponse);
 }
 
 // Shard API
@@ -124,4 +139,60 @@ message AdviseResetShardsRequest {
 message AdviseResetShardsResponse {
   repeated quickwit.ingest.ShardIds shards_to_delete = 1;
   repeated quickwit.ingest.ShardIdPositions shards_to_truncate = 2;
+}
+
+message SwapIndexingPipelinesRequest {
+  repeated SwapIndexingPipelinesEntry swaps = 1;
+}
+
+message SwapIndexingPipelinesEntry {
+  string left_node_id = 1;
+  string left_index_id = 2;
+  string right_node_id = 3;
+  optional string right_index_id = 4;
+}
+
+message SwapIndexingPipelinesResponse {
+  repeated SwapIndexingPipelinesResult results = 1;
+}
+
+message SwapIndexingPipelinesResult {
+  SwapIndexingPipelinesEntry swap = 1;
+  bool success = 2;
+  // Human-readable reason when success is false.
+  string reason = 3;
+}
+
+// Maintenance Mode API
+
+message EnableMaintenanceModeRequest {
+}
+
+message EnableMaintenanceModeResponse {
+  // The frozen physical indexing plan serialized as JSON.
+  string frozen_plan_json = 1;
+}
+
+message DisableMaintenanceModeRequest {
+}
+
+message DisableMaintenanceModeResponse {
+}
+
+message GetMaintenanceModeRequest {
+}
+
+message GetMaintenanceModeResponse {
+  bool is_maintenance_mode = 1;
+  // If maintenance mode is active, the RFC 3339 datetime string when it was enabled.
+  optional string enabled_at = 2;
+}
+
+message MaintenanceFrozenPlanForNode {
+  string index_id = 1;
+  repeated quickwit.indexing.IndexingTask indexing_tasks = 2;
+}
+
+message MaintenanceFrozenPlan {
+  repeated MaintenanceFrozenPlanForNode state_per_node = 2;
 }

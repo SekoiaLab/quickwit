@@ -43,6 +43,9 @@ pub struct ReportSplit {
     /// The storage uri. This URI does NOT include the split id.
     #[prost(string, tag = "1")]
     pub storage_uri: ::prost::alloc::string::String,
+    /// The size of the split file, in bytes.
+    #[prost(uint64, tag = "3")]
+    pub num_bytes: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -187,6 +190,9 @@ pub struct SearchRequest {
     pub ignore_missing_indexes: bool,
     #[prost(string, optional, tag = "19")]
     pub split_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// The user agent of the client that initiated the search request.
+    #[prost(string, optional, tag = "20")]
+    pub user_agent: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -197,7 +203,7 @@ pub struct SortField {
     pub sort_order: i32,
     /// Optional sort value format for datetime field only.
     /// If none, the default output format for datetime field is
-    /// unix_timestamp_nanos.
+    /// unix_timestamp_millis.
     #[prost(enumeration = "SortDatetimeFormat", optional, tag = "3")]
     pub sort_datetime_format: ::core::option::Option<i32>,
 }
@@ -214,9 +220,6 @@ pub struct SearchResponse {
     /// server-side and expressed in microseconds.
     #[prost(uint64, tag = "3")]
     pub elapsed_time_micros: u64,
-    /// The searcherrors that occurred formatted as string.
-    #[prost(string, repeated, tag = "4")]
-    pub errors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Postcard-encoded aggregation response
     #[prost(bytes = "vec", optional, tag = "9")]
     pub aggregation_postcard: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
@@ -234,6 +237,9 @@ pub struct SearchResponse {
     /// Total number of successful splits searched.
     #[prost(uint64, tag = "8")]
     pub num_successful_splits: u64,
+    /// Statistics on the split outcomes
+    #[prost(message, optional, tag = "10")]
+    pub splits_by_outcome: ::core::option::Option<SplitsByOutcome>,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -275,6 +281,34 @@ pub struct LeafSearchRequest {
     /// split files.
     #[prost(string, repeated, tag = "9")]
     pub index_uris: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Split outcome counters
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SplitsByOutcome {
+    #[prost(uint64, tag = "1")]
+    pub pruned_before_warmup: u64,
+    #[prost(uint64, tag = "2")]
+    pub pruned_after_warmup: u64,
+    /// Cancelled before warmup started (error or timeout)
+    #[prost(uint64, tag = "3")]
+    pub cancel_before_warmup: u64,
+    #[prost(uint64, tag = "4")]
+    pub processed: u64,
+    #[prost(uint64, tag = "5")]
+    pub processed_from_metadata: u64,
+    /// Resolved by the partial request cache
+    #[prost(uint64, tag = "6")]
+    pub cache_hit: u64,
+    /// Cancelled during warmup (error or timeout)
+    #[prost(uint64, tag = "7")]
+    pub cancel_warmup: u64,
+    /// Cancelled while waiting in the CPU thread pool queue
+    #[prost(uint64, tag = "8")]
+    pub cancel_cpu_queue: u64,
+    /// Cancelled during CPU processing (error or timeout)
+    #[prost(uint64, tag = "9")]
+    pub cancel_cpu: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -327,6 +361,9 @@ pub struct SplitIdAndFooterOffsets {
     /// The number of docs in the split
     #[prost(uint64, tag = "6")]
     pub num_docs: u64,
+    /// Tantivy doc IDs that have been soft-deleted from this split
+    #[prost(uint32, repeated, tag = "7")]
+    pub soft_deleted_doc_ids: ::prost::alloc::vec::Vec<u32>,
 }
 /// Hits returned by a FetchDocRequest.
 ///
@@ -407,16 +444,16 @@ pub struct PartialHit {
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Ord, PartialOrd)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SortByValue {
-    #[prost(oneof = "sort_by_value::SortValue", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "sort_by_value::SortValue", tags = "1, 2, 3, 4, 5, 6")]
     pub sort_value: ::core::option::Option<sort_by_value::SortValue>,
 }
 /// Nested message and enum types in `SortByValue`.
 pub mod sort_by_value {
     #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
     #[serde(rename_all = "snake_case")]
-    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum SortValue {
         #[prost(uint64, tag = "1")]
         U64(u64),
@@ -426,6 +463,10 @@ pub mod sort_by_value {
         F64(f64),
         #[prost(bool, tag = "4")]
         Boolean(bool),
+        #[prost(string, tag = "5")]
+        Str(::prost::alloc::string::String),
+        #[prost(int64, tag = "6")]
+        Datetime(i64),
     }
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -457,6 +498,9 @@ pub struct LeafSearchResponse {
     >,
     #[prost(message, optional, tag = "8")]
     pub resource_stats: ::core::option::Option<ResourceStats>,
+    /// Split outcome counters for all splits targeted by this leaf request.
+    #[prost(message, optional, tag = "9")]
+    pub splits_by_outcome: ::core::option::Option<SplitsByOutcome>,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -886,6 +930,35 @@ pub mod search_service_client {
                 .insert(GrpcMethod::new("quickwit.search.SearchService", "FetchDocs"));
             self.inner.unary(req, path, codec).await
         }
+        /// Streams document contents from the document store.
+        /// This method takes `PartialHit`s and streams back `LeafHit`s in batches
+        /// to avoid hitting gRPC message size limits.
+        pub async fn stream_fetch_docs(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FetchDocsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::FetchDocsResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.search.SearchService/StreamFetchDocs",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("quickwit.search.SearchService", "StreamFetchDocs"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// Root list terms API.
         /// This RPC identifies the set of splits on which the query should run on,
         /// and dispatches the several calls to `LeafListTerms`.
@@ -1165,6 +1238,22 @@ pub mod search_service_server {
             request: tonic::Request<super::FetchDocsRequest>,
         ) -> std::result::Result<
             tonic::Response<super::FetchDocsResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the StreamFetchDocs method.
+        type StreamFetchDocsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::FetchDocsResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Streams document contents from the document store.
+        /// This method takes `PartialHit`s and streams back `LeafHit`s in batches
+        /// to avoid hitting gRPC message size limits.
+        async fn stream_fetch_docs(
+            &self,
+            request: tonic::Request<super::FetchDocsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::StreamFetchDocsStream>,
             tonic::Status,
         >;
         /// Root list terms API.
@@ -1447,6 +1536,53 @@ pub mod search_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.search.SearchService/StreamFetchDocs" => {
+                    #[allow(non_camel_case_types)]
+                    struct StreamFetchDocsSvc<T: SearchService>(pub Arc<T>);
+                    impl<
+                        T: SearchService,
+                    > tonic::server::ServerStreamingService<super::FetchDocsRequest>
+                    for StreamFetchDocsSvc<T> {
+                        type Response = super::FetchDocsResponse;
+                        type ResponseStream = T::StreamFetchDocsStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FetchDocsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SearchService>::stream_fetch_docs(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StreamFetchDocsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

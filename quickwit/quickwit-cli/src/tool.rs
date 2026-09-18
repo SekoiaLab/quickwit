@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use std::{env, fmt, io};
 
 use anyhow::{Context, bail};
+use bytesize::ByteSize;
 use clap::{ArgMatches, Command, arg};
 use colored::{ColoredString, Colorize};
 use humantime::format_duration;
@@ -34,11 +35,13 @@ use quickwit_common::uri::Uri;
 use quickwit_config::service::QuickwitService;
 use quickwit_config::{
     CLI_SOURCE_ID, IndexerConfig, NodeConfig, SourceConfig, SourceInputFormat, SourceParams,
-    TransformConfig, VecSourceParams,
+    TransformConfig, VecSourceParams, is_delete_task_service_disabled,
 };
+use quickwit_directories::BundleDirectory;
 use quickwit_index_management::{IndexService, clear_cache_directory};
 use quickwit_indexing::IndexingPipeline;
 use quickwit_indexing::actors::{IndexingService, MergePipeline, MergeSchedulerService};
+use quickwit_indexing::mature_merge::{MatureMergeConfig, run_mature_merge_on_schedule};
 use quickwit_indexing::models::{
     DetachIndexingPipeline, DetachMergePipeline, IndexingStatistics, SpawnPipeline,
 };
@@ -53,6 +56,9 @@ use quickwit_serve::{
     BodyFormat, SearchRequestQueryString, SortBy, search_request_from_api_request,
 };
 use quickwit_storage::{BundleStorage, Storage};
+use tantivy::Index;
+use tantivy::directory::FileSlice;
+use tantivy::schema::FieldType;
 use thousands::Separable;
 use tracing::{debug, info};
 
@@ -136,6 +142,16 @@ pub fn build_tool_command() -> Command {
                 ])
             )
         .subcommand(
+            Command::new("analyze-split-file")
+                .about("Analyze a local split file.")
+                .long_about("Analyzes the contents of a local .split file. Does not require a node config or metastore access.")
+                .args(&[
+                    arg!(--"split-file" <SPLIT_FILE> "Path to the local .split file to analyze.")
+                        .display_order(1)
+                        .required(true),
+                ])
+            )
+        .subcommand(
             Command::new("gc")
                 .display_order(10)
                 .about("Garbage collects stale staged splits and splits marked for deletion.")
@@ -161,6 +177,67 @@ pub fn build_tool_command() -> Command {
                     arg!(--source <SOURCE_ID> "ID of the target source.")
                         .display_order(2)
                         .required(true),
+                ])
+            )
+        .subcommand(
+            Command::new("merge-mature")
+                .display_order(10)
+                .about("Merges mature splits across all indexes and nodes.")
+                .long_about(
+                    "Scans indexes for merge opportunities in mature splits. Considers opportunities \
+                     across all origin nodes and sources. If `--cron-schedule` is not set, runs once \
+                     and exits."
+                )
+                .args(&[
+                    arg!(--"dry-run"
+                        "Prints the planned merge operations without executing them.")
+                        .required(false),
+                    arg!(--"max-concurrent-merges" <MAX_CONCURRENT_MERGES>
+                        "Maximum number of merges to run concurrently (default: 10).")
+                        .display_order(1)
+                        .required(false),
+                    arg!(--"retention-safety-buffer-days" <RETENTION_SAFETY_BUFFER_DAYS>
+                        "Splits within this many days of the retention cutoff are excluded (default: 5).")
+                        .display_order(2)
+                        .required(false),
+                    arg!(--"min-merge-group-size" <MIN_MERGE_GROUP_SIZE>
+                        "Minimum number of splits in a group to trigger a merge (default: 5).")
+                        .display_order(3)
+                        .required(false),
+                    arg!(--"input-split-max-num-docs" <INPUT_SPLIT_MAX_NUM_DOCS>
+                        "Maximum number of docs in a split for it to be eligible (default: 10_000).")
+                        .display_order(4)
+                        .required(false),
+                    arg!(--"max-merge-group-size" <MAX_MERGE_GROUP_SIZE>
+                        "Maximum number of splits per merge operation (default: 100).")
+                        .display_order(5)
+                        .required(false),
+                    arg!(--"split-target-num-docs" <SPLIT_TARGET_NUM_DOCS>
+                        "Maximum total docs per merge operation (default: 5_000_000).")
+                        .display_order(6)
+                        .required(false),
+                    arg!(--"split-timestamp-days-range" <SPLIT_TIMESTAMP_DAYS_RANGE>
+                        "Group splits that span this many days together. If unset (default), merges \
+                         are attempted successively for 0, 1, and 2 day spans.")
+                        .display_order(7)
+                        .required(false),
+                    arg!(--"index-parallelism" <INDEX_PARALLELISM>
+                        "Number of indexes processed concurrently (default: 50).")
+                        .display_order(8)
+                        .required(false),
+                    arg!(--"index-id-patterns" <INDEX_ID_PATTERNS>
+                        "Comma-separated list of index ID patterns to include (default: '*').")
+                        .display_order(9)
+                        .required(false),
+                    arg!(--"cron-schedule" <CRON_SCHEDULE>
+                        "Cron expression controlling how often mature merges run. If unset, runs once \
+                        and exits.")
+                        .display_order(10)
+                        .required(false),
+                    arg!(--"metrics"
+                        "Expose Prometheus metrics on the REST listen address during the run.")
+                        .display_order(11)
+                        .required(false),
                 ])
             )
         .arg_required_else_help(true)
@@ -208,6 +285,13 @@ pub struct MergeArgs {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub struct MatureMergeArgs {
+    pub config_uri: Uri,
+    pub merge_config: MatureMergeConfig,
+    pub serve_metrics: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct ExtractSplitArgs {
     pub config_uri: Uri,
     pub index_id: IndexId,
@@ -216,12 +300,19 @@ pub struct ExtractSplitArgs {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub struct AnalyzeSplitFileArgs {
+    pub split_file: PathBuf,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub enum ToolCliCommand {
     GarbageCollect(GarbageCollectIndexArgs),
     LocalIngest(LocalIngestDocsArgs),
     LocalSearch(LocalSearchArgs),
     Merge(MergeArgs),
+    MatureMerge(MatureMergeArgs),
     ExtractSplit(ExtractSplitArgs),
+    AnalyzeSplitFile(AnalyzeSplitFileArgs),
 }
 
 impl ToolCliCommand {
@@ -234,7 +325,9 @@ impl ToolCliCommand {
             "local-ingest" => Self::parse_local_ingest_args(submatches),
             "local-search" => Self::parse_local_search_args(submatches),
             "merge" => Self::parse_merge_args(submatches),
+            "merge-mature" => Self::parse_mature_merge_args(submatches),
             "extract-split" => Self::parse_extract_split_args(submatches),
+            "analyze-split-file" => Self::analyze_split_file_args(submatches),
             _ => bail!("unknown tool subcommand `{subcommand}`"),
         }
     }
@@ -385,13 +478,104 @@ impl ToolCliCommand {
         }))
     }
 
+    fn parse_mature_merge_args(mut matches: ArgMatches) -> anyhow::Result<Self> {
+        let config_uri = matches
+            .remove_one::<String>("config")
+            .map(|uri_str| Uri::from_str(&uri_str))
+            .expect("`config` should be a required arg.")?;
+        let defaults = MatureMergeConfig::default();
+        let dry_run = matches.get_flag("dry-run");
+        let max_concurrent_merges = matches
+            .remove_one::<String>("max-concurrent-merges")
+            .map(|s| s.parse::<usize>())
+            .transpose()?
+            .unwrap_or(defaults.max_concurrent_merges);
+        let retention_safety_buffer_days = matches
+            .remove_one::<String>("retention-safety-buffer-days")
+            .map(|s| s.parse::<u64>())
+            .transpose()?
+            .unwrap_or(defaults.retention_safety_buffer_days);
+        let min_merge_group_size = matches
+            .remove_one::<String>("min-merge-group-size")
+            .map(|s| s.parse::<usize>())
+            .transpose()?
+            .unwrap_or(defaults.min_merge_group_size);
+        let input_split_max_num_docs = matches
+            .remove_one::<String>("input-split-max-num-docs")
+            .map(|s| s.parse::<usize>())
+            .transpose()?
+            .unwrap_or(defaults.input_split_max_num_docs);
+        let max_merge_group_size = matches
+            .remove_one::<String>("max-merge-group-size")
+            .map(|s| s.parse::<usize>())
+            .transpose()?
+            .unwrap_or(defaults.max_merge_group_size);
+        let split_target_num_docs = matches
+            .remove_one::<String>("split-target-num-docs")
+            .map(|s| s.parse::<usize>())
+            .transpose()?
+            .unwrap_or(defaults.split_target_num_docs);
+        let split_timestamp_days_range = matches
+            .remove_one::<String>("split-timestamp-days-range")
+            .map(|s| s.parse::<u8>())
+            .transpose()?
+            .or(defaults.split_timestamp_days_range);
+        let index_parallelism = matches
+            .remove_one::<String>("index-parallelism")
+            .map(|s| s.parse::<usize>())
+            .transpose()?
+            .unwrap_or(defaults.index_parallelism);
+        let index_id_patterns = matches
+            .remove_one::<String>("index-id-patterns")
+            .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+            .unwrap_or(defaults.index_id_patterns);
+        let cron_schedule = matches
+            .remove_one::<String>("cron-schedule")
+            .or(defaults.cron_schedule);
+        let serve_metrics = matches.get_flag("metrics");
+
+        if max_concurrent_merges == 0 {
+            bail!("`max-concurrent-merges` must be greater than or equal to 1.");
+        }
+        if index_parallelism == 0 {
+            bail!("`index-parallelism` must be greater than or equal to 1.");
+        }
+        Ok(Self::MatureMerge(MatureMergeArgs {
+            config_uri,
+            serve_metrics,
+            merge_config: MatureMergeConfig {
+                dry_run,
+                max_concurrent_merges,
+                retention_safety_buffer_days,
+                min_merge_group_size,
+                input_split_max_num_docs,
+                max_merge_group_size,
+                split_target_num_docs,
+                split_timestamp_days_range,
+                index_parallelism,
+                index_id_patterns,
+                cron_schedule,
+            },
+        }))
+    }
+
+    fn analyze_split_file_args(mut matches: ArgMatches) -> anyhow::Result<Self> {
+        let split_file = matches
+            .remove_one::<String>("split-file")
+            .map(PathBuf::from)
+            .expect("`split-file` should be a required arg.");
+        Ok(Self::AnalyzeSplitFile(AnalyzeSplitFileArgs { split_file }))
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         match self {
             Self::GarbageCollect(args) => garbage_collect_index_cli(args).await,
             Self::LocalIngest(args) => local_ingest_docs_cli(args).await,
             Self::LocalSearch(args) => local_search_cli(args).await,
             Self::Merge(args) => merge_cli(args).await,
+            Self::MatureMerge(args) => merge_mature_cli(args).await,
             Self::ExtractSplit(args) => extract_split_cli(args).await,
+            Self::AnalyzeSplitFile(args) => analyze_split_file_cli(args).await,
         }
     }
 }
@@ -459,6 +643,7 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
         IngesterPool::default(),
         storage_resolver,
         EventBroker::default(),
+        is_delete_task_service_disabled(),
     )
     .await?;
     let (indexing_server_mailbox, indexing_server_handle) =
@@ -555,7 +740,7 @@ pub async fn local_search_cli(args: LocalSearchArgs) -> anyhow::Result<()> {
         split_id: None,
     };
     let search_request =
-        search_request_from_api_request(vec![args.index_id], search_request_query_string)?;
+        search_request_from_api_request(vec![args.index_id], search_request_query_string, None)?;
     debug!(search_request=?search_request, "search-request");
     let search_response: SearchResponse =
         single_node_search(search_request, metastore, storage_resolver).await?;
@@ -597,6 +782,7 @@ pub async fn merge_cli(args: MergeArgs) -> anyhow::Result<()> {
         IngesterPool::default(),
         storage_resolver,
         EventBroker::default(),
+        is_delete_task_service_disabled(),
     )
     .await?;
     let (indexing_service_mailbox, indexing_service_handle) =
@@ -648,6 +834,38 @@ pub async fn merge_cli(args: MergeArgs) -> anyhow::Result<()> {
         bail!(pipeline_exit_status);
     }
     println!("{} Merge successful.", "✔".color(GREEN_COLOR));
+    Ok(())
+}
+
+pub async fn merge_mature_cli(args: MatureMergeArgs) -> anyhow::Result<()> {
+    debug!(args=?args, "merge-mature");
+    info!(merge_config=?args.merge_config, "merge-mature configuration");
+    println!("❯ Scanning all indexes for mature merge opportunities...");
+    let config = load_node_config(&args.config_uri).await?;
+    let (storage_resolver, metastore_resolver) =
+        get_resolvers(&config.storage_configs, &config.metastore_configs);
+    let metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
+
+    let runtimes_config = RuntimesConfig::default();
+    start_actor_runtimes(
+        runtimes_config,
+        &HashSet::from_iter([QuickwitService::Indexer]),
+    )?;
+
+    if args.serve_metrics {
+        let metrics_addr = config.rest_config.listen_addr;
+        tokio::spawn(serve_metrics(metrics_addr));
+    }
+
+    run_mature_merge_on_schedule(
+        metastore,
+        storage_resolver,
+        &config.data_dir_path,
+        args.merge_config.clone(),
+        config.node_id,
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -745,6 +963,149 @@ async fn extract_split_cli(args: ExtractSplitArgs) -> anyhow::Result<()> {
     }
 
     println!("{} Split successfully extracted.", "✔".color(GREEN_COLOR));
+    Ok(())
+}
+
+fn print_per_field(
+    label: &str,
+    usage: &tantivy::space_usage::PerFieldSpaceUsage,
+    // Per-JSON-field sub-key breakdown: field_name -> sorted (sub_key, bytes)
+    json_sub_keys: &std::collections::HashMap<String, Vec<(String, u64)>>,
+) {
+    let total = usage.total().get_bytes();
+    if total == 0 {
+        return;
+    }
+    let mut fields: Vec<_> = usage.fields().collect();
+    fields.sort_by_key(|f| std::cmp::Reverse(f.total()));
+    println!("  {label:<14}  {}", ByteSize(total));
+    for field in &fields {
+        println!(
+            "    {:<40}  {}",
+            field.field_name(),
+            ByteSize(field.total().get_bytes())
+        );
+        if let Some(sub_keys) = json_sub_keys.get(field.field_name()) {
+            for (key, bytes) in sub_keys {
+                println!("      {:<38}  {}", key, ByteSize(*bytes));
+            }
+        }
+    }
+}
+
+async fn analyze_split_file_cli(args: AnalyzeSplitFileArgs) -> anyhow::Result<()> {
+    debug!(args=?args, "extract-split-file");
+    println!("❯ Extracting split file...");
+
+    let split_file_path = args.split_file.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve split file path `{}`",
+            args.split_file.display()
+        )
+    })?;
+    let split_data_vec = std::fs::read(&split_file_path)
+        .with_context(|| format!("failed to read split file `{}`", split_file_path.display()))?;
+
+    // --- Tantivy space usage analysis ---
+    let file_slice = FileSlice::from(split_data_vec);
+    match BundleDirectory::open_split(file_slice)
+        .and_then(|dir| Index::open(dir).map_err(std::io::Error::other))
+    {
+        Ok(index) => {
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+            let seg_reader = searcher.segment_reader(0);
+            let schema = index.schema();
+            let usage = searcher.space_usage()?;
+            if let Some(seg) = usage.segments().first() {
+                println!("\n{} docs:", seg.num_docs());
+
+                // Scan each JSON field's term dictionary and accumulate postings / positions
+                // bytes separately per top-level sub-key.
+                // Result maps: field_name -> sorted Vec<(sub_key, bytes)>
+                let mut postings_sub_keys: std::collections::HashMap<String, Vec<(String, u64)>> =
+                    std::collections::HashMap::new();
+                let mut positions_sub_keys: std::collections::HashMap<String, Vec<(String, u64)>> =
+                    std::collections::HashMap::new();
+                for (field, field_entry) in schema.fields() {
+                    if !matches!(field_entry.field_type(), FieldType::JsonObject(_)) {
+                        continue;
+                    }
+                    let inv_index = seg_reader.inverted_index(field)?;
+                    let mut stream = inv_index.terms().stream()?;
+                    let mut postings_per_key: std::collections::BTreeMap<String, u64> =
+                        std::collections::BTreeMap::new();
+                    let mut positions_per_key: std::collections::BTreeMap<String, u64> =
+                        std::collections::BTreeMap::new();
+                    // Term key layout for JSON fields: [path bytes][0x00][value type][value bytes]
+                    // Path segments are separated by 0x01. No type-code prefix in the SSTable key.
+                    while let Some((key_bytes, term_info)) = stream.next() {
+                        let path_end = key_bytes
+                            .iter()
+                            .position(|&b| b == 0x00)
+                            .unwrap_or(key_bytes.len());
+                        let path_bytes = &key_bytes[..path_end];
+                        // Replace 0x01 segment separators with '.' to reconstruct the full path.
+                        let full_path: String = path_bytes
+                            .split(|&b| b == 0x01)
+                            .map(|seg| std::str::from_utf8(seg).unwrap_or("<non-utf8>"))
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let top_key = full_path;
+                        *postings_per_key.entry(top_key.clone()).or_default() +=
+                            term_info.postings_range.len() as u64;
+                        *positions_per_key.entry(top_key).or_default() +=
+                            term_info.positions_range.len() as u64;
+                    }
+                    let field_name = field_entry.name().to_string();
+                    let mut postings_sorted: Vec<_> = postings_per_key.into_iter().collect();
+                    postings_sorted.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+                    postings_sub_keys.insert(field_name.clone(), postings_sorted);
+                    let mut positions_sorted: Vec<_> = positions_per_key.into_iter().collect();
+                    positions_sorted.retain(|(_, b)| *b > 0);
+                    positions_sorted.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+                    positions_sub_keys.insert(field_name, positions_sorted);
+                }
+
+                print_per_field(
+                    "term dict",
+                    seg.termdict(),
+                    &std::collections::HashMap::new(),
+                );
+                print_per_field("postings", seg.postings(), &postings_sub_keys);
+                print_per_field("positions", seg.positions(), &positions_sub_keys);
+                print_per_field(
+                    "fast fields",
+                    seg.fast_fields(),
+                    &std::collections::HashMap::new(),
+                );
+                print_per_field(
+                    "field norms",
+                    seg.fieldnorms(),
+                    &std::collections::HashMap::new(),
+                );
+                let store = seg.store();
+                let store_total = store.total().get_bytes();
+                if store_total > 0 {
+                    println!("  {:<14}  {}", "store", ByteSize(store_total));
+                    println!(
+                        "    {:<40}  {}",
+                        "data",
+                        ByteSize(store.data_usage().get_bytes())
+                    );
+                    println!(
+                        "    {:<40}  {}",
+                        "offsets",
+                        ByteSize(store.offsets_usage().get_bytes())
+                    );
+                }
+                println!();
+            }
+        }
+        Err(err) => {
+            debug!("could not open split as tantivy index for space analysis: {err:#}");
+        }
+    }
     Ok(())
 }
 
@@ -954,4 +1315,49 @@ async fn create_empty_cluster(config: &NodeConfig) -> anyhow::Result<Cluster> {
     .await?;
 
     Ok(cluster)
+}
+
+/// A shortcut to expose the metrics without loading the whole quickwit_serve
+/// machinery.
+async fn serve_metrics(addr: std::net::SocketAddr) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(err) => {
+            tracing::warn!("metrics server could not bind to {addr}: {err}");
+            return;
+        }
+    };
+    tracing::info!("metrics server listening on http://{addr}/metrics");
+    loop {
+        let Ok((mut stream, _peer)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            let is_metrics = request.starts_with("GET /metrics");
+            let (status, body) = if is_metrics {
+                match quickwit_common::metrics::metrics_text_payload() {
+                    Ok(payload) => ("200 OK", payload),
+                    Err(e) => {
+                        tracing::error!("failed to encode prometheus metrics: {e}");
+                        ("500 Internal Server Error", String::new())
+                    }
+                }
+            } else {
+                ("404 Not Found", String::new())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: \
+                 {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+    }
 }

@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use quickwit_common::rate_limited_warn;
 use quickwit_common::uri::Uri;
 use quickwit_config::SplitCacheLimits;
 use ulid::Ulid;
@@ -58,8 +59,13 @@ impl Eq for SplitKey {}
 #[derive(Clone, Debug)]
 enum Status {
     Candidate(CandidateSplit),
-    Downloading { alive_token: Weak<()> },
-    OnDisk { num_bytes: u64 },
+    Downloading {
+        alive_token: Weak<()>,
+        num_bytes: u64,
+    },
+    OnDisk {
+        num_bytes: u64,
+    },
 }
 
 impl PartialEq for Status {
@@ -97,6 +103,11 @@ pub struct SplitInfo {
 ///
 /// It is possible for the split table size in bytes to exceed its limits, by at
 /// most one split.
+///
+/// This accounts for the size of splits that are currently downloading as well as splits
+/// already on disk: we know a split's size as soon as it becomes a download candidate, so we
+/// reserve that space upfront. This way, several concurrent downloads can never complete and
+/// push the total disk usage over the configured limits.
 pub struct SplitTable {
     on_disk_splits: BTreeSet<SplitKey>,
     downloading_splits: BTreeSet<SplitKey>,
@@ -105,6 +116,7 @@ pub struct SplitTable {
     origin_time: Instant,
     limits: SplitCacheLimits,
     on_disk_bytes: u64,
+    downloading_bytes: u64,
 }
 
 impl SplitTable {
@@ -121,6 +133,7 @@ impl SplitTable {
             origin_time,
             limits,
             on_disk_bytes: 0u64,
+            downloading_bytes: 0u64,
         };
         split_table.acknowledge_on_disk_splits(existing_filepaths);
         split_table
@@ -136,6 +149,7 @@ impl SplitTable {
                 status: Status::OnDisk { num_bytes },
             };
             self.insert(split_info);
+            record_split_added_to_disk(num_bytes);
         }
     }
 }
@@ -144,36 +158,59 @@ fn compute_timestamp(start: Instant) -> LastAccessDate {
     start.elapsed().as_micros() as u64
 }
 
+fn record_split_added_to_disk(num_bytes: u64) {
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .active_cache_metrics
+        .in_cache_count
+        .inc();
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .active_cache_metrics
+        .in_cache_num_bytes
+        .add(num_bytes as i64);
+}
+
+fn record_split_evicted(num_bytes: u64) {
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .active_cache_metrics
+        .in_cache_count
+        .dec();
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .active_cache_metrics
+        .in_cache_num_bytes
+        .sub(num_bytes as i64);
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .active_cache_metrics
+        .evict_num_items
+        .inc();
+    crate::metrics::STORAGE_METRICS
+        .searcher_split_cache
+        .active_cache_metrics
+        .evict_num_bytes
+        .inc_by(num_bytes);
+}
+
 impl SplitTable {
     fn remove(&mut self, split_ulid: Ulid) -> Option<SplitInfo> {
         let split_info = self.split_to_status.remove(&split_ulid)?;
         let split_queue: &mut BTreeSet<SplitKey> = match split_info.status {
             Status::Candidate { .. } => &mut self.candidate_splits,
-            Status::Downloading { .. } => &mut self.downloading_splits,
+            Status::Downloading { num_bytes, .. } => {
+                self.downloading_bytes -= num_bytes;
+                &mut self.downloading_splits
+            }
             Status::OnDisk { num_bytes } => {
                 self.on_disk_bytes -= num_bytes;
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .in_cache_count
-                    .dec();
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .in_cache_num_bytes
-                    .sub(num_bytes as i64);
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .evict_num_items
-                    .inc();
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .evict_num_bytes
-                    .inc_by(num_bytes);
                 &mut self.on_disk_splits
             }
         };
         let is_in_queue = split_queue.remove(&split_info.split_key);
         assert!(is_in_queue);
-        if let Status::Downloading { alive_token } = &split_info.status
+        if let Status::Downloading { alive_token, .. } = &split_info.status
             && alive_token.strong_count() == 0
         {
             return None;
@@ -190,7 +227,7 @@ impl SplitTable {
         let mut splits_to_remove = Vec::new();
         for split in &self.downloading_splits {
             if let Some(split_info) = self.split_to_status.get(&split.split_ulid)
-                && let Status::Downloading { alive_token } = &split_info.status
+                && let Status::Downloading { alive_token, .. } = &split_info.status
                 && alive_token.strong_count() == 0
             {
                 splits_to_remove.push(split.split_ulid);
@@ -213,17 +250,12 @@ impl SplitTable {
                 self.truncate_candidate_list();
                 self.candidate_splits.insert(split_info.split_key)
             }
-            Status::Downloading { .. } => self.downloading_splits.insert(split_info.split_key),
+            Status::Downloading { num_bytes, .. } => {
+                self.downloading_bytes += num_bytes;
+                self.downloading_splits.insert(split_info.split_key)
+            }
             Status::OnDisk { num_bytes } => {
                 self.on_disk_bytes += num_bytes;
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .in_cache_count
-                    .inc();
-                crate::metrics::STORAGE_METRICS
-                    .searcher_split_cache
-                    .in_cache_num_bytes
-                    .add(num_bytes as i64);
                 self.on_disk_splits.insert(split_info.split_key)
             }
         };
@@ -238,20 +270,19 @@ impl SplitTable {
         assert!(split_ulid_was_absent);
     }
 
-    /// Touch the file, updating its last access time, possibly extending its life in the
-    /// cache (if in cache).
+    /// Touches the file, updating its last access time, possibly extending its
+    /// life in the cache (if in cache). The split's file size is used when
+    /// registering a brand new download candidate.
     ///
-    /// If the file is already on the disk cache, return `Some(num_bytes)`.
-    /// If the file is not in cache, return `None`, and register the file in the candidate for
-    /// download list.
-    pub fn touch(&mut self, split_ulid: Ulid, storage_uri: &Uri, read_only: bool) -> Option<u64> {
+    /// Returns `true` if the file is already on the disk cache.
+    /// Returns `false` if the file is not in cache (the file is registered as
+    /// candidate in the download list).
+    pub fn touch(&mut self, split_ulid: Ulid, storage_uri: &Uri, num_bytes: u64) -> bool {
         let timestamp = compute_timestamp(self.origin_time);
         let status = self.mutate_split(split_ulid, |old_split_info| {
             if let Some(mut split_info) = old_split_info {
                 split_info.split_key.last_accessed = timestamp;
                 Some(split_info)
-            } else if read_only {
-                None
             } else {
                 let split_key = SplitKey {
                     split_ulid,
@@ -261,15 +292,12 @@ impl SplitTable {
                     storage_uri: storage_uri.clone(),
                     split_ulid,
                     living_token: Arc::new(()),
+                    num_bytes,
                 });
                 Some(SplitInfo { split_key, status })
             }
         });
-        if let Some(Status::OnDisk { num_bytes }) = status {
-            Some(num_bytes)
-        } else {
-            None
-        }
+        matches!(status, Some(Status::OnDisk { .. }))
     }
 
     /// Mutates a split ulid.
@@ -288,25 +316,7 @@ impl SplitTable {
         Some(new_status)
     }
 
-    fn change_split_status(&mut self, split_ulid: Ulid, status: Status) {
-        let start_time = self.origin_time;
-        self.mutate_split(split_ulid, move |split_info_opt| {
-            if let Some(mut split_info) = split_info_opt {
-                split_info.status = status;
-                Some(split_info)
-            } else {
-                Some(SplitInfo {
-                    split_key: SplitKey {
-                        last_accessed: compute_timestamp(start_time),
-                        split_ulid,
-                    },
-                    status,
-                })
-            }
-        });
-    }
-
-    pub(crate) fn report(&mut self, split_ulid: Ulid, storage_uri: Uri) {
+    pub(crate) fn report(&mut self, split_ulid: Ulid, storage_uri: Uri, num_bytes: u64) {
         let origin_time = self.origin_time;
         self.mutate_split(split_ulid, move |split_info_opt| {
             if let Some(split_info) = split_info_opt {
@@ -321,6 +331,7 @@ impl SplitTable {
                 storage_uri,
                 split_ulid,
                 living_token: Arc::new(()),
+                num_bytes,
             });
             Some(SplitInfo { split_key, status })
         });
@@ -336,7 +347,45 @@ impl SplitTable {
     }
 
     pub(crate) fn register_as_downloaded(&mut self, split_ulid: Ulid, num_bytes: u64) {
-        self.change_split_status(split_ulid, Status::OnDisk { num_bytes });
+        let start_time = self.origin_time;
+        self.mutate_split(split_ulid, move |split_info_opt| {
+            let new_status = Status::OnDisk { num_bytes };
+            if let Some(mut split_info) = split_info_opt {
+                let was_expected_download = matches!(
+                    split_info.status,
+                    Status::Downloading { num_bytes: expected_dl_bytes, .. }
+                        if expected_dl_bytes == num_bytes
+                );
+                if !was_expected_download {
+                    // This can happen during initial upgrade (indexers sending
+                    // 0 as size) but shouldn't happen afterwards.
+                    rate_limited_warn!(
+                        limit_per_min = 1,
+                        downloaded_bytes = num_bytes,
+                        previous_status = ?split_info.status,
+                        %split_ulid,
+                        "unexpected split status when reported in cache"
+                    );
+                }
+                split_info.status = new_status;
+                Some(split_info)
+            } else {
+                // This is not expected to happen.
+                rate_limited_warn!(
+                    limit_per_min = 1,
+                    %split_ulid,
+                    "split registered in cache without being reported first"
+                );
+                Some(SplitInfo {
+                    split_key: SplitKey {
+                        last_accessed: compute_timestamp(start_time),
+                        split_ulid,
+                    },
+                    status: new_status,
+                })
+            }
+        });
+        record_split_added_to_disk(num_bytes);
     }
 
     /// Change the state of the given split from candidate to downloading state,
@@ -353,7 +402,10 @@ impl SplitTable {
         let alive_token = Arc::downgrade(&candidate_split.living_token);
         self.insert(SplitInfo {
             split_key: split_info.split_key,
-            status: Status::Downloading { alive_token },
+            status: Status::Downloading {
+                alive_token,
+                num_bytes: candidate_split.num_bytes,
+            },
         });
         Some(candidate_split)
     }
@@ -363,7 +415,9 @@ impl SplitTable {
     }
 
     fn is_out_of_limits(&self) -> bool {
-        if self.on_disk_splits.is_empty() {
+        if self.on_disk_splits.is_empty() && self.downloading_splits.is_empty() {
+            // Always allow at least one split to be downloaded/kept, even if it alone exceeds
+            // the configured limits.
             return false;
         }
         if self.on_disk_splits.len() + self.downloading_splits.len()
@@ -371,7 +425,7 @@ impl SplitTable {
         {
             return true;
         }
-        if self.on_disk_bytes > self.limits.max_num_bytes.as_u64() {
+        if self.on_disk_bytes + self.downloading_bytes > self.limits.max_num_bytes.as_u64() {
             return true;
         }
         false
@@ -408,6 +462,11 @@ impl SplitTable {
             }
             Err(NoRoomAvailable)
         } else {
+            for split_info in &split_infos {
+                if let Status::OnDisk { num_bytes } = split_info.status {
+                    record_split_evicted(num_bytes);
+                }
+            }
             Ok(split_infos
                 .into_iter()
                 .map(|split_info| split_info.split_key.split_ulid)
@@ -442,6 +501,7 @@ pub(crate) struct CandidateSplit {
     pub storage_uri: Uri,
     pub split_ulid: Ulid,
     pub living_token: Arc<()>,
+    pub num_bytes: u64,
 }
 
 pub(crate) struct DownloadOpportunity {
@@ -488,8 +548,8 @@ mod tests {
         let ulids = sorted_split_ulids(2);
         let ulid1 = ulids[0];
         let ulid2 = ulids[1];
-        split_table.report(ulid1, Uri::for_test(TEST_STORAGE_URI));
-        split_table.report(ulid2, Uri::for_test(TEST_STORAGE_URI));
+        split_table.report(ulid1, Uri::for_test(TEST_STORAGE_URI), 10_000);
+        split_table.report(ulid2, Uri::for_test(TEST_STORAGE_URI), 20_000);
         let candidate = split_table.best_candidate().unwrap();
         assert_eq!(candidate.split_ulid, ulid2);
     }
@@ -508,10 +568,10 @@ mod tests {
         let ulids = sorted_split_ulids(2);
         let ulid1 = ulids[0];
         let ulid2 = ulids[1];
-        split_table.report(ulid1, Uri::for_test(TEST_STORAGE_URI));
-        split_table.report(ulid2, Uri::for_test(TEST_STORAGE_URI));
-        let num_bytes_opt = split_table.touch(ulid1, &Uri::for_test("s3://test1/"), false);
-        assert!(num_bytes_opt.is_none());
+        split_table.report(ulid1, Uri::for_test(TEST_STORAGE_URI), 10_000);
+        split_table.report(ulid2, Uri::for_test(TEST_STORAGE_URI), 20_000);
+        let is_on_disk = split_table.touch(ulid1, &Uri::for_test("s3://test1/"), 15_000);
+        assert!(!is_on_disk);
         let candidate = split_table.best_candidate().unwrap();
         assert_eq!(candidate.split_ulid, ulid1);
     }
@@ -528,25 +588,53 @@ mod tests {
             Default::default(),
         );
         let ulid1 = Ulid::new();
-        split_table.report(ulid1, Uri::for_test(TEST_STORAGE_URI));
+        split_table.report(ulid1, Uri::for_test(TEST_STORAGE_URI), 10_000_000);
         assert_eq!(split_table.num_bytes(), 0);
         let download = split_table.start_download(ulid1);
         assert!(download.is_some());
         assert!(split_table.start_download(ulid1).is_none());
         split_table.register_as_downloaded(ulid1, 10_000_000);
         assert_eq!(split_table.num_bytes(), 10_000_000);
-        assert_eq!(
-            split_table.touch(ulid1, &Uri::for_test(TEST_STORAGE_URI), false),
-            Some(10_000_000)
-        );
+        assert!(split_table.touch(ulid1, &Uri::for_test(TEST_STORAGE_URI), 10_000_000));
         let ulid2 = Ulid::new();
-        split_table.report(ulid2, Uri::for_test("s3://test`/"));
+        split_table.report(ulid2, Uri::for_test("s3://test`/"), 3_000_000);
         let download = split_table.start_download(ulid2);
         assert!(download.is_some());
         assert!(split_table.start_download(ulid2).is_none());
         assert_eq!(split_table.num_bytes(), 10_000_000);
         split_table.register_as_downloaded(ulid2, 3_000_000);
         assert_eq!(split_table.num_bytes(), 13_000_000);
+    }
+
+    #[test]
+    fn test_downloading_splits_count_towards_byte_limit() {
+        let mut split_table = SplitTable::with_limits_and_existing_splits(
+            SplitCacheLimits {
+                max_num_bytes: ByteSize::kb(100),
+                max_num_splits: NonZeroU32::new(10).unwrap(),
+                num_concurrent_downloads: NonZeroU32::new(2).unwrap(),
+                max_file_descriptors: NonZeroU32::new(100).unwrap(),
+            },
+            Default::default(),
+        );
+        let ulids = sorted_split_ulids(2);
+        let ulid1 = ulids[0];
+        let ulid2 = ulids[1];
+        split_table.report(ulid2, Uri::for_test(TEST_STORAGE_URI), 10_000);
+        // Reported last, so it is the best (most recently touched) candidate. Its size
+        // alone exceeds the configured byte limit.
+        split_table.report(ulid1, Uri::for_test(TEST_STORAGE_URI), 150_000);
+
+        // The cache always makes progress: the best candidate is allowed to start
+        // downloading even though its size alone exceeds the limit.
+        let opportunity = split_table.find_download_opportunity().unwrap();
+        assert_eq!(opportunity.split_to_download.split_ulid, ulid1);
+        assert_eq!(split_table.downloading_bytes, 150_000);
+
+        // A second, concurrent download is blocked: the first split's size (still only
+        // "downloading", not yet on disk) already exceeds the byte limit on its own, and
+        // there is nothing on disk yet to evict to make room for the new candidate.
+        assert!(split_table.find_download_opportunity().is_none());
     }
 
     #[test]
@@ -571,11 +659,11 @@ mod tests {
             (split_ulids[5], 300_000),
         ];
         for (split_ulid, num_bytes) in splits {
-            split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI));
+            split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI), num_bytes);
             split_table.register_as_downloaded(split_ulid, num_bytes);
         }
         let new_ulid = Ulid::new();
-        split_table.report(new_ulid, Uri::for_test(TEST_STORAGE_URI));
+        split_table.report(new_ulid, Uri::for_test(TEST_STORAGE_URI), 50_000);
         let DownloadOpportunity {
             splits_to_delete,
             split_to_download,
@@ -609,11 +697,11 @@ mod tests {
             (split_ulids[5], 300_000),
         ];
         for (split_ulid, num_bytes) in splits {
-            split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI));
+            split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI), num_bytes);
             split_table.register_as_downloaded(split_ulid, num_bytes);
         }
         let new_ulid = Ulid::new();
-        split_table.report(new_ulid, Uri::for_test(TEST_STORAGE_URI));
+        split_table.report(new_ulid, Uri::for_test(TEST_STORAGE_URI), 50_000);
         let DownloadOpportunity {
             splits_to_delete,
             split_to_download,
@@ -634,10 +722,10 @@ mod tests {
             Default::default(),
         );
         let split_ulid = Ulid::new();
-        split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI));
+        split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI), 42_000);
         let candidate = split_table.start_download(split_ulid).unwrap();
         // This report should be cancelled as we have a download currently running.
-        split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI));
+        split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI), 42_000);
 
         assert!(split_table.start_download(split_ulid).is_none());
         std::mem::drop(candidate);
@@ -646,7 +734,7 @@ mod tests {
         assert!(split_table.start_download(split_ulid).is_none());
 
         // This report should be considered as our candidate (and its alive token has been dropped)
-        split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI));
+        split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI), 42_000);
 
         let candidate2 = split_table.start_download(split_ulid).unwrap();
         assert_eq!(candidate2.split_ulid, split_ulid);
@@ -665,7 +753,7 @@ mod tests {
         );
         for i in 1..2_000 {
             let split_ulid = Ulid::new();
-            split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI));
+            split_table.report(split_ulid, Uri::for_test(TEST_STORAGE_URI), 1_024);
             assert_eq!(
                 split_table.candidate_splits.len(),
                 i.min(super::MAX_NUM_CANDIDATES)
@@ -691,6 +779,7 @@ mod tests {
                 storage_uri: Uri::for_test(TEST_STORAGE_URI),
                 split_ulid,
                 living_token: Arc::new(()),
+                num_bytes: 4_096,
             };
             let split_info = SplitInfo {
                 split_key: SplitKey {

@@ -17,12 +17,11 @@ use std::sync::Arc;
 use anyhow::Context;
 pub use prefix::{AutomatonQuery, JsonPathPrefix};
 use serde::{Deserialize, Serialize};
-use tantivy::Term;
 use tantivy::schema::{Field, FieldType, Schema as TantivySchema};
 
 use super::{BuildTantivyAst, BuildTantivyAstContext, QueryAst};
 use crate::query_ast::TantivyQueryAst;
-use crate::{InvalidQuery, find_field_or_hit_dynamic};
+use crate::{InvalidQuery, JsonPath, find_field_or_hit_dynamic};
 
 /// A Regex query
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
@@ -51,7 +50,7 @@ impl RegexQuery {
     pub fn to_field_and_regex(
         &self,
         schema: &TantivySchema,
-    ) -> Result<(Field, Option<Vec<u8>>, String), InvalidQuery> {
+    ) -> Result<(Field, Option<JsonPath>, String), InvalidQuery> {
         let Some((field, field_entry, json_path)) = find_field_or_hit_dynamic(&self.field, schema)
         else {
             return Err(InvalidQuery::FieldDoesNotExist {
@@ -79,17 +78,8 @@ impl RegexQuery {
                     ))
                 })?;
 
-                let mut term_for_path = Term::from_field_json_path(
-                    field,
-                    json_path,
-                    json_options.is_expand_dots_enabled(),
-                );
-                term_for_path.append_type_and_str("");
-
-                let value = term_for_path.value();
-                // We skip the 1st byte which is a marker to tell this is json. This isn't present
-                // in the dictionary
-                let byte_path_prefix = value.as_serialized()[1..].to_owned();
+                let byte_path_prefix =
+                    JsonPath::from_json_path(json_path, json_options.is_expand_dots_enabled());
                 Ok((field, Some(byte_path_prefix), self.regex.clone()))
             }
             _ => Err(InvalidQuery::SchemaError(
@@ -125,8 +115,10 @@ mod prefix {
     use tantivy::schema::Field;
     use tantivy_fst::Automaton;
 
+    use crate::JsonPath;
+
     pub struct JsonPathPrefix<A> {
-        pub prefix: Vec<u8>,
+        pub prefix: JsonPath,
         pub automaton: Arc<A>,
     }
 
@@ -246,13 +238,15 @@ mod prefix {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
     use std::sync::Arc;
 
-    use tantivy::schema::{Schema as TantivySchema, TEXT};
+    use tantivy::schema::{Schema as TantivySchema, TEXT, Type};
     use tantivy_fst::{Automaton, Regex};
 
     use super::prefix::JsonPathPrefixState;
     use super::{JsonPathPrefix, RegexQuery};
+    use crate::JsonPath;
 
     #[test]
     fn test_regex_query_text_field() {
@@ -282,7 +276,7 @@ mod tests {
         };
         let (field, path, regex) = query.to_field_and_regex(&schema).unwrap();
         assert_eq!(field, schema.get_field("field").unwrap());
-        assert_eq!(path.unwrap(), b"sub\x01field\0s");
+        assert_eq!(path.unwrap().deref(), b"sub\x01field\0s");
         assert_eq!(regex, query.regex);
 
         // i believe this is how concatenated field behave
@@ -292,7 +286,7 @@ mod tests {
         };
         let (field, path, regex) = query_empty_path.to_field_and_regex(&schema).unwrap();
         assert_eq!(field, schema.get_field("field").unwrap());
-        assert_eq!(path.unwrap(), b"\0s");
+        assert_eq!(path.unwrap().deref(), b"\0s");
         assert_eq!(regex, query_empty_path.regex);
     }
 
@@ -300,7 +294,7 @@ mod tests {
     fn test_json_prefix_automaton_empty_path() {
         let regex = Arc::new(Regex::new("e(f|g.*)").unwrap());
         let empty_path_automaton = JsonPathPrefix {
-            prefix: Vec::new(),
+            prefix: JsonPath::default(),
             automaton: regex.clone(),
         };
 
@@ -311,8 +305,10 @@ mod tests {
     #[test]
     fn test_json_prefix_automaton() {
         let regex = Arc::new(Regex::new("e(f|g.*)").unwrap());
+        // JsonPath::from_json_path encodes "ab" as b"ab\0s" (null separator + string
+        // type marker), so the prefix is 4 bytes, not 2.
         let automaton = JsonPathPrefix {
-            prefix: b"ab".to_vec(),
+            prefix: JsonPath::from_json_path("ab", false),
             automaton: regex.clone(),
         };
 
@@ -333,41 +329,53 @@ mod tests {
         assert!(!automaton.is_match(&a));
 
         let ab = automaton.accept(&a, b'b');
-        assert_eq!(ab, JsonPathPrefixState::Inner(regex.start()));
+        assert!(matches!(ab, JsonPathPrefixState::Prefix(_)));
         assert!(automaton.can_match(&ab));
         assert!(!automaton.is_match(&ab));
+
+        // consume the null byte separator
+        let ab0 = automaton.accept(&ab, b'\0');
+        assert!(matches!(ab0, JsonPathPrefixState::Prefix(_)));
+        assert!(automaton.can_match(&ab0));
+        assert!(!automaton.is_match(&ab0));
+
+        // consume the string type marker — prefix is now fully consumed
+        let inner_start = automaton.accept(&ab0, Type::Str.to_code());
+        assert_eq!(inner_start, JsonPathPrefixState::Inner(regex.start()));
+        assert!(automaton.can_match(&inner_start));
+        assert!(!automaton.is_match(&inner_start));
 
         // starting here, we just take that we passthrough correctly,
         // and reply to can_match as well as possible
         // (we don't test will_always_match because Regex doesn't support it)
-        let abc = automaton.accept(&ab, b'c');
-        assert!(matches!(abc, JsonPathPrefixState::Inner(_)));
-        assert!(!automaton.can_match(&abc));
-        assert!(!automaton.is_match(&abc));
+        let inner_c = automaton.accept(&inner_start, b'c');
+        assert!(matches!(inner_c, JsonPathPrefixState::Inner(_)));
+        assert!(!automaton.can_match(&inner_c));
+        assert!(!automaton.is_match(&inner_c));
 
-        let abe = automaton.accept(&ab, b'e');
-        assert!(matches!(abe, JsonPathPrefixState::Inner(_)));
-        assert!(automaton.can_match(&abe));
-        assert!(!automaton.is_match(&abe));
+        let inner_e = automaton.accept(&inner_start, b'e');
+        assert!(matches!(inner_e, JsonPathPrefixState::Inner(_)));
+        assert!(automaton.can_match(&inner_e));
+        assert!(!automaton.is_match(&inner_e));
 
-        let abef = automaton.accept(&abe, b'f');
-        assert!(matches!(abef, JsonPathPrefixState::Inner(_)));
-        assert!(automaton.can_match(&abef));
-        assert!(automaton.is_match(&abef));
+        let inner_ef = automaton.accept(&inner_e, b'f');
+        assert!(matches!(inner_ef, JsonPathPrefixState::Inner(_)));
+        assert!(automaton.can_match(&inner_ef));
+        assert!(automaton.is_match(&inner_ef));
 
-        let abefg = automaton.accept(&abef, b'g');
-        assert!(matches!(abefg, JsonPathPrefixState::Inner(_)));
-        assert!(!automaton.can_match(&abefg));
-        assert!(!automaton.is_match(&abefg));
+        let inner_efg = automaton.accept(&inner_ef, b'g');
+        assert!(matches!(inner_efg, JsonPathPrefixState::Inner(_)));
+        assert!(!automaton.can_match(&inner_efg));
+        assert!(!automaton.is_match(&inner_efg));
 
-        let abeg = automaton.accept(&abe, b'g');
-        assert!(matches!(abeg, JsonPathPrefixState::Inner(_)));
-        assert!(automaton.can_match(&abeg));
-        assert!(automaton.is_match(&abeg));
+        let inner_eg = automaton.accept(&inner_e, b'g');
+        assert!(matches!(inner_eg, JsonPathPrefixState::Inner(_)));
+        assert!(automaton.can_match(&inner_eg));
+        assert!(automaton.is_match(&inner_eg));
 
-        let abegh = automaton.accept(&abeg, b'h');
-        assert!(matches!(abegh, JsonPathPrefixState::Inner(_)));
-        assert!(automaton.can_match(&abegh));
-        assert!(automaton.is_match(&abegh));
+        let inner_egh = automaton.accept(&inner_eg, b'h');
+        assert!(matches!(inner_egh, JsonPathPrefixState::Inner(_)));
+        assert!(automaton.can_match(&inner_egh));
+        assert!(automaton.is_match(&inner_egh));
     }
 }
