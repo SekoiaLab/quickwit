@@ -107,7 +107,7 @@ impl SearchServiceClient {
                 .root_search(request)
                 .await
                 .map(|tonic_response| tonic_response.into_inner())
-                .map_err(|tonic_error| parse_grpc_error(&tonic_error)),
+                .map_err(|tonic_error| parse_grpc_error(tonic_error, "root_search")),
             SearchServiceClientImpl::Local(service) => service.root_search(request).await,
         }
     }
@@ -122,7 +122,7 @@ impl SearchServiceClient {
                 .leaf_search(request)
                 .await
                 .map(|tonic_response| tonic_response.into_inner())
-                .map_err(|tonic_error| parse_grpc_error(&tonic_error)),
+                .map_err(|tonic_error| parse_grpc_error(tonic_error, "leaf_search")),
             SearchServiceClientImpl::Local(service) => service.leaf_search(request).await,
         }
     }
@@ -138,7 +138,7 @@ impl SearchServiceClient {
                 let tonic_response = grpc_client
                     .leaf_list_fields(tonic_request)
                     .await
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))?;
+                    .map_err(|tonic_error| parse_grpc_error(tonic_error, "leaf_list_fields"))?;
                 Ok(tonic_response.into_inner())
             }
             SearchServiceClientImpl::Local(service) => service.leaf_list_fields(request).await,
@@ -157,10 +157,10 @@ impl SearchServiceClient {
                 let all_hits = grpc_client
                     .stream_fetch_docs(tonic_request)
                     .await
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))?
+                    .map_err(|tonic_error| parse_grpc_error(tonic_error, "stream_fetch_docs"))?
                     .into_inner()
                     // TODO stream item errors are all collapsed into SearchError::Internal
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))
+                    .map_err(|tonic_error| parse_grpc_error(tonic_error, "stream_fetch_docs"))
                     .try_fold(
                         Vec::with_capacity(nb_docs_fetched),
                         |mut acc, response| async move {
@@ -186,7 +186,7 @@ impl SearchServiceClient {
                 let tonic_response = grpc_client
                     .leaf_list_terms(tonic_request)
                     .await
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))?;
+                    .map_err(|tonic_error| parse_grpc_error(tonic_error, "leaf_list_terms"))?;
                 Ok(tonic_response.into_inner())
             }
             SearchServiceClientImpl::Local(service) => service.leaf_list_terms(request).await,
@@ -206,7 +206,7 @@ impl SearchServiceClient {
                 let grpc_resp: tonic::Response<quickwit_proto::search::GetKvResponse> = grpc_client
                     .get_kv(get_kv_req)
                     .await
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))?;
+                    .map_err(|tonic_error| parse_grpc_error(tonic_error, "get_kv"))?;
                 let get_search_after_context_resp = grpc_resp.into_inner();
                 Ok(get_search_after_context_resp.payload)
             }
@@ -225,7 +225,7 @@ impl SearchServiceClient {
                 grpc_client
                     .put_kv(put_kv_req)
                     .await
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))?;
+                    .map_err(|tonic_error| parse_grpc_error(tonic_error, "put_kv"))?;
             }
         }
         Ok(())
@@ -287,4 +287,46 @@ pub fn create_search_client_from_channel(
         .max_decoding_message_size(max_message_size.0 as usize)
         .max_encoding_message_size(max_message_size.0 as usize);
     SearchServiceClient::from_grpc_client(client, grpc_addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use quickwit_proto::search::LeafSearchRequest;
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::SearchError;
+
+    /// Checks that the timeout of the `tower` layer wrapping the channel is reported as a
+    /// `SearchError::Timeout`, and not as an opaque internal error. This is what prevents the
+    /// leaf search retry policy from retrying a leaf that timed out.
+    #[tokio::test]
+    async fn test_channel_timeout_is_reported_as_a_timeout() {
+        // A listener that accepts connections but never completes the HTTP/2 handshake, so
+        // that the request hangs until the timeout layer fires.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let grpc_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut connections = Vec::new();
+            // accept connection and let them hanging
+            while let Ok((connection, _)) = listener.accept().await {
+                connections.push(connection);
+            }
+        });
+        let channel = Endpoint::from_shared(format!("http://{grpc_addr}"))
+            .unwrap()
+            .connect_lazy();
+        let timeout_channel = Timeout::new(channel, Duration::from_millis(200));
+        let mut client =
+            create_search_client_from_channel(grpc_addr, timeout_channel, ByteSize::mb(1));
+
+        let search_error = client
+            .leaf_search(LeafSearchRequest::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(search_error, SearchError::Timeout(_)),
+            "unexpected error: {search_error:?}"
+        );
+    }
 }

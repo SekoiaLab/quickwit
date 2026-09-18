@@ -166,13 +166,20 @@ pub fn deserialize_doc_mapper(doc_mapper_str: &str) -> crate::Result<Arc<DocMapp
 #[async_trait]
 impl SearchService for SearchServiceImpl {
     async fn root_search(&self, search_request: SearchRequest) -> crate::Result<SearchResponse> {
-        let search_result = root_search(
-            &self.searcher_context,
-            search_request,
-            self.metastore.clone(),
-            &self.cluster_client,
+        // Timeouts are also enforced on the leaf, so we leave a small margin
+        // for the fetch_docs phase and network overhead.
+        let timeout =
+            self.searcher_context.searcher_config.request_timeout() + Duration::from_secs(2);
+        let search_result = tokio::time::timeout(
+            timeout,
+            root_search(
+                &self.searcher_context,
+                search_request,
+                self.metastore.clone(),
+                &self.cluster_client,
+            ),
         )
-        .await?;
+        .await??;
         Ok(search_result)
     }
 
