@@ -176,8 +176,9 @@ pub fn scrape_tokio_runtime_metrics(handle: &tokio::runtime::Handle, label: &'st
 
 struct PrometheusRuntimeMetrics {
     scheduled_tasks: IntGauge,
-    worker_busy_duration_milliseconds_total: IntCounter,
+    worker_busy_duration_microsecs_total: IntCounter,
     worker_busy_ratio: Gauge,
+    worker_polls_total: IntCounter,
     worker_threads: IntGauge,
 }
 
@@ -190,9 +191,9 @@ impl PrometheusRuntimeMetrics {
                 "runtime",
                 &[("runtime_type", label)],
             ),
-            worker_busy_duration_milliseconds_total: new_counter(
-                "tokio_worker_busy_duration_milliseconds_total",
-                " The total amount of time worker threads were busy.",
+            worker_busy_duration_microsecs_total: new_counter(
+                "tokio_worker_busy_duration_microsecs_total",
+                "The total amount of time worker threads were busy.",
                 "runtime",
                 &[("runtime_type", label)],
             ),
@@ -200,6 +201,15 @@ impl PrometheusRuntimeMetrics {
                 "tokio_worker_busy_ratio",
                 "The ratio of time worker threads were busy since the last time runtime metrics \
                  were collected.",
+                "runtime",
+                &[("runtime_type", label)],
+            ),
+            #[cfg(tokio_unstable)]
+            worker_polls_total: new_counter(
+                "tokio_worker_polls_total",
+                "The total number of times worker threads polled a task. Divide \
+                 `tokio_worker_busy_duration_microsecs_total` by this to obtain the average poll \
+                 duration.",
                 "runtime",
                 &[("runtime_type", label)],
             ),
@@ -215,9 +225,12 @@ impl PrometheusRuntimeMetrics {
     pub fn update(&mut self, runtime_metrics: &RuntimeMetrics) {
         self.scheduled_tasks
             .set(runtime_metrics.total_local_queue_depth as i64);
-        self.worker_busy_duration_milliseconds_total
-            .inc_by(runtime_metrics.total_busy_duration.as_millis() as u64);
+        self.worker_busy_duration_microsecs_total
+            .inc_by(runtime_metrics.total_busy_duration.as_micros() as u64);
         self.worker_busy_ratio.set(runtime_metrics.busy_ratio());
+        #[cfg(tokio_unstable)]
+        self.worker_polls_total
+            .inc_by(runtime_metrics.total_polls_count);
         self.worker_threads
             .set(runtime_metrics.workers_count as i64);
     }
