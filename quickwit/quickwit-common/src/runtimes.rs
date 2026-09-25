@@ -21,7 +21,7 @@ use prometheus::{Gauge, IntCounter, IntGauge};
 use tokio::runtime::Runtime;
 use tokio_metrics::{RuntimeMetrics, RuntimeMonitor};
 
-use crate::metrics::{new_counter, new_float_gauge, new_gauge};
+use crate::metrics::{new_counter, new_counter_vec, new_float_gauge, new_gauge};
 
 static RUNTIMES: OnceCell<HashMap<RuntimeType, tokio::runtime::Runtime>> = OnceCell::new();
 
@@ -103,6 +103,7 @@ fn start_runtimes(config: RuntimesConfig) -> HashMap<RuntimeType, Runtime> {
     if disable_lifo_slot {
         blocking_runtime_builder.disable_lifo_slot();
     }
+    configure_poll_time_histogram(&mut blocking_runtime_builder);
     let blocking_runtime = blocking_runtime_builder
         .worker_threads(config.num_threads_blocking)
         .thread_name_fn(|| {
@@ -117,7 +118,9 @@ fn start_runtimes(config: RuntimesConfig) -> HashMap<RuntimeType, Runtime> {
     scrape_tokio_runtime_metrics(blocking_runtime.handle(), "blocking");
     runtimes.insert(RuntimeType::Blocking, blocking_runtime);
 
-    let non_blocking_runtime = tokio::runtime::Builder::new_multi_thread()
+    let mut non_blocking_runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    configure_poll_time_histogram(&mut non_blocking_runtime_builder);
+    let non_blocking_runtime = non_blocking_runtime_builder
         .worker_threads(config.num_threads_non_blocking)
         .thread_name_fn(|| {
             static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
@@ -160,12 +163,78 @@ impl RuntimeType {
     }
 }
 
+/// Enables the Tokio poll time histogram on `runtime_builder`, when
+/// `QW_TOKIO_POLL_TIME_HISTOGRAM` is set.
+///
+/// The histogram times every individual task poll. It is the only runtime metric that
+/// tells a heavy tail of slow polls apart from a uniform slowdown, but it costs two
+/// `Instant::now()` calls per poll, hence the opt-in.
+pub fn configure_poll_time_histogram(runtime_builder: &mut tokio::runtime::Builder) {
+    if !crate::get_bool_from_env("QW_TOKIO_POLL_TIME_HISTOGRAM", false) {
+        return;
+    }
+    #[cfg(not(tokio_unstable))]
+    {
+        let _ = runtime_builder;
+        tracing::warn!(
+            "`QW_TOKIO_POLL_TIME_HISTOGRAM` requires `--cfg tokio_unstable`, ignoring it"
+        );
+    }
+    #[cfg(tokio_unstable)]
+    {
+        // `precision_exact(0)` makes each bucket twice as wide as the previous one.
+        // Tokio rounds the bounds to powers of two, yielding 22 buckets that span ~8us to
+        // ~8.6s. Polls longer than that land in the final, unbounded bucket.
+        let log_histogram = tokio::runtime::LogHistogram::builder()
+            .min_value(Duration::from_micros(10))
+            .max_value(Duration::from_secs(8))
+            .precision_exact(0)
+            .build();
+        runtime_builder
+            .enable_metrics_poll_time_histogram()
+            .metrics_poll_time_histogram_configuration(
+                tokio::runtime::HistogramConfiguration::log(log_histogram),
+            );
+    }
+}
+
+/// Upper bounds of the runtime's poll time histogram buckets, formatted as Prometheus `le`
+/// label values. Empty when the histogram is disabled.
+fn poll_time_bucket_bounds(handle: &tokio::runtime::Handle) -> Vec<String> {
+    #[cfg(not(tokio_unstable))]
+    {
+        let _ = handle;
+        Vec::new()
+    }
+    #[cfg(tokio_unstable)]
+    {
+        let runtime_metrics = handle.metrics();
+        if !runtime_metrics.poll_time_histogram_enabled() {
+            return Vec::new();
+        }
+        let num_buckets = runtime_metrics.poll_time_histogram_num_buckets();
+        (0..num_buckets)
+            .map(|bucket| {
+                if bucket + 1 == num_buckets {
+                    // The last bucket stretches to `u64::MAX` nanoseconds.
+                    "+Inf".to_string()
+                } else {
+                    let bucket_end = runtime_metrics.poll_time_histogram_bucket_range(bucket).end;
+                    bucket_end.as_secs_f64().to_string()
+                }
+            })
+            .collect()
+    }
+}
+
 /// Spawns a background task
 pub fn scrape_tokio_runtime_metrics(handle: &tokio::runtime::Handle, label: &'static str) {
     let runtime_monitor = RuntimeMonitor::new(handle);
+    let poll_time_bucket_bounds = poll_time_bucket_bounds(handle);
     handle.spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
-        let mut prometheus_runtime_metrics = PrometheusRuntimeMetrics::new(label);
+        let mut prometheus_runtime_metrics =
+            PrometheusRuntimeMetrics::new(label, &poll_time_bucket_bounds);
 
         for tokio_runtime_metrics in runtime_monitor.intervals() {
             interval.tick().await;
@@ -178,12 +247,33 @@ struct PrometheusRuntimeMetrics {
     scheduled_tasks: IntGauge,
     worker_busy_duration_microsecs_total: IntCounter,
     worker_busy_ratio: Gauge,
+    /// Cumulative poll duration buckets, ordered by increasing `le`. Empty when the poll
+    /// time histogram is disabled.
+    poll_duration_seconds_buckets: Vec<IntCounter>,
     worker_polls_total: IntCounter,
     worker_threads: IntGauge,
 }
 
 impl PrometheusRuntimeMetrics {
-    pub fn new(label: &'static str) -> Self {
+    pub fn new(label: &'static str, poll_time_bucket_bounds: &[String]) -> Self {
+        let poll_duration_seconds_buckets = if poll_time_bucket_bounds.is_empty() {
+            Vec::new()
+        } else {
+            let poll_duration_seconds_bucket = new_counter_vec::<1>(
+                "tokio_poll_duration_seconds_bucket",
+                "Cumulative number of task polls that completed within the bucket's upper bound \
+                 `le`, in seconds.",
+                "runtime",
+                &[("runtime_type", label)],
+                ["le"],
+            );
+            poll_time_bucket_bounds
+                .iter()
+                .map(|bucket_bound| {
+                    poll_duration_seconds_bucket.with_label_values([bucket_bound.as_str()])
+                })
+                .collect()
+        };
         Self {
             scheduled_tasks: new_gauge(
                 "tokio_scheduled_tasks",
@@ -204,6 +294,7 @@ impl PrometheusRuntimeMetrics {
                 "runtime",
                 &[("runtime_type", label)],
             ),
+            poll_duration_seconds_buckets,
             #[cfg(tokio_unstable)]
             worker_polls_total: new_counter(
                 "tokio_worker_polls_total",
@@ -229,8 +320,21 @@ impl PrometheusRuntimeMetrics {
             .inc_by(runtime_metrics.total_busy_duration.as_micros() as u64);
         self.worker_busy_ratio.set(runtime_metrics.busy_ratio());
         #[cfg(tokio_unstable)]
-        self.worker_polls_total
-            .inc_by(runtime_metrics.total_polls_count);
+        {
+            self.worker_polls_total
+                .inc_by(runtime_metrics.total_polls_count);
+            // `poll_time_histogram` holds this interval's per-bucket counts. Prometheus
+            // buckets are cumulative, so each one takes the sum of all buckets up to it.
+            let mut cumulative_count = 0;
+            for (bucket_counter, bucket_count) in self
+                .poll_duration_seconds_buckets
+                .iter()
+                .zip(&runtime_metrics.poll_time_histogram)
+            {
+                cumulative_count += *bucket_count;
+                bucket_counter.inc_by(cumulative_count);
+            }
+        }
         self.worker_threads
             .set(runtime_metrics.workers_count as i64);
     }
@@ -259,5 +363,43 @@ mod tests {
         let runtime = RuntimesConfig::with_num_cpus(3);
         assert_eq!(runtime.num_threads_blocking, 3);
         assert_eq!(runtime.num_threads_non_blocking, 1);
+    }
+
+    #[cfg(tokio_unstable)]
+    #[test]
+    fn test_poll_time_bucket_bounds() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        // The histogram is opt-in: a runtime built without it exposes no buckets.
+        assert!(poll_time_bucket_bounds(runtime.handle()).is_empty());
+
+        let log_histogram = tokio::runtime::LogHistogram::builder()
+            .min_value(Duration::from_micros(10))
+            .max_value(Duration::from_secs(8))
+            .precision_exact(0)
+            .build();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .enable_metrics_poll_time_histogram()
+            .metrics_poll_time_histogram_configuration(tokio::runtime::HistogramConfiguration::log(
+                log_histogram,
+            ))
+            .build()
+            .unwrap();
+        let bucket_bounds = poll_time_bucket_bounds(runtime.handle());
+
+        assert_eq!(bucket_bounds.last().unwrap(), "+Inf");
+        // Bounds are seconds, strictly increasing, and bracket the range we configured.
+        let finite_bounds: Vec<f64> = bucket_bounds[..bucket_bounds.len() - 1]
+            .iter()
+            .map(|bucket_bound| bucket_bound.parse().unwrap())
+            .collect();
+        assert!(finite_bounds.windows(2).all(|bounds| bounds[0] < bounds[1]));
+        assert!(*finite_bounds.first().unwrap() <= 10e-6);
+        assert!(*finite_bounds.last().unwrap() >= 8.0);
     }
 }
