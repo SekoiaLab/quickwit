@@ -67,6 +67,7 @@ use quickwit_common::pubsub::{EventBroker, EventSubscriptionHandle};
 use quickwit_common::rate_limiter::RateLimiterSettings;
 use quickwit_common::retry::RetryParams;
 use quickwit_common::runtimes::RuntimesConfig;
+use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_common::spawn_named_task;
 use quickwit_common::tower::{
     BalanceChannel, BoxFutureInfaillible, BoxLayer, BufferLayer, Change, CircuitBreakerEvaluator,
@@ -872,14 +873,14 @@ pub async fn serve_quickwit(
         cluster.clone(),
     ));
     let grpc_join_handle = async move {
-        spawn_named_task(grpc_server, "grpc_server")
+        spawn_named_task(grpc_server.detect_slow_poll("grpc_server"), "grpc_server")
             .await
             .expect("tasks running the gRPC server should not panic or be cancelled")
             .context("gRPC server failed")
     };
 
     let rest_join_handle = async move {
-        spawn_named_task(rest_server, "rest_server")
+        spawn_named_task(rest_server.detect_slow_poll("rest_server"), "rest_server")
             .await
             .expect("tasks running the REST server should not panic or be cancelled")
             .context("REST server failed")
