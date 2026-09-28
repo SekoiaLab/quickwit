@@ -39,9 +39,8 @@ static POLL_DURATION_HISTOGRAM: Lazy<HistogramVec<1>> = Lazy::new(|| {
         "task_poll_duration_seconds",
         "Duration of individual polls of futures instrumented with `detect_slow_poll`. A poll \
          blocks a tokio worker for its entire duration. Nested instrumentation points report \
-         inclusive times: `a` includes `a:b`. With task poll attribution enabled, `a>` covers \
-         tasks spawned (transitively) while `a` was being polled, and `unattributed` the other \
-         tasks, both excluding the time already reported by an instrumentation point.",
+         inclusive times: `a` includes `a:b`. With task poll attribution enabled, `s3` covers the \
+         polls of the tasks spawned by the S3 client (its pooled connections).",
         "runtime",
         &[],
         ["name"],
@@ -49,49 +48,62 @@ static POLL_DURATION_HISTOGRAM: Lazy<HistogramVec<1>> = Lazy::new(|| {
     )
 });
 
-/// What a task spawned from the current thread gets attributed to.
-#[derive(Clone, Copy)]
-enum SpawnContext {
-    /// A future instrumented with `detect_slow_poll(name)` is being polled.
-    Instrumented(&'static str),
-    /// A task that was itself spawned from an instrumented context is being polled.
-    #[cfg_attr(not(tokio_unstable), allow(dead_code))]
-    SpawnedFrom(&'static Histogram),
-}
-
 thread_local! {
-    static SPAWN_CONTEXT: Cell<Option<SpawnContext>> = const { Cell::new(None) };
-    /// Number of `DetectSlowPoll` polls currently on this thread's stack.
-    static INSTRUMENTED_POLL_DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// Time spent in outermost `DetectSlowPoll` polls since the current task poll started.
-    static INSTRUMENTED_POLL_NANOS: Cell<u64> = const { Cell::new(0) };
+    /// Whether the tasks spawned from this thread right now do work for S3: set while an S3
+    /// request, or a task spawned by one, is being polled.
+    static IN_S3: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Publishes the instrumentation point being polled in the thread-local context, and
-/// restores the previous context on drop, including when the inner poll panics.
-struct InstrumentedPollGuard {
-    previous_context: Option<SpawnContext>,
-    depth: u32,
-    start: Instant,
+/// Restores the previous value of [`IN_S3`] on drop, including when the inner poll panics.
+struct InS3Guard {
+    previous: bool,
 }
 
-impl InstrumentedPollGuard {
-    fn enter(name: &'static str) -> Self {
-        let previous_context = SPAWN_CONTEXT.replace(Some(SpawnContext::Instrumented(name)));
-        let depth = INSTRUMENTED_POLL_DEPTH.get();
-        INSTRUMENTED_POLL_DEPTH.set(depth + 1);
-        InstrumentedPollGuard {
-            previous_context,
-            depth,
-            start: Instant::now(),
+impl InS3Guard {
+    fn enter() -> Self {
+        InS3Guard {
+            previous: IN_S3.replace(true),
         }
     }
 }
 
-impl Drop for InstrumentedPollGuard {
+impl Drop for InS3Guard {
     fn drop(&mut self) {
-        SPAWN_CONTEXT.set(self.previous_context);
-        INSTRUMENTED_POLL_DEPTH.set(self.depth);
+        IN_S3.set(self.previous);
+    }
+}
+
+/// Extension trait marking a future as an S3 request.
+pub trait S3ScopeExt: Sized {
+    /// With task poll attribution enabled (see [`configure_task_poll_attribution`]), the tasks
+    /// spawned while this future is being polled, and their own descendants, are recorded as
+    /// `s3`.
+    ///
+    /// The S3 client's connections run in tasks spawned by the first request that needed
+    /// them, then shared by every later request through the pool: this attributes their work
+    /// to S3 rather than to whichever caller opened them.
+    fn in_s3_scope(self) -> S3Scope<Self>;
+}
+
+impl<F: Future> S3ScopeExt for F {
+    fn in_s3_scope(self) -> S3Scope<F> {
+        S3Scope { inner: self }
+    }
+}
+
+/// Future returned by [`S3ScopeExt::in_s3_scope`].
+#[pin_project]
+pub struct S3Scope<F> {
+    #[pin]
+    inner: F,
+}
+
+impl<F: Future> Future for S3Scope<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _in_s3_guard = InS3Guard::enter();
+        self.project().inner.poll(cx)
     }
 }
 
@@ -138,15 +150,9 @@ impl<F: Future> Future for DetectSlowPoll<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let guard = InstrumentedPollGuard::enter(this.name);
+        let start = Instant::now();
         let poll = this.inner.poll(cx);
-        let elapsed = guard.start.elapsed();
-        if guard.depth == 0 {
-            // Outermost instrumentation point: task poll attribution must not count this
-            // time a second time. Nested points are already covered by their parent.
-            INSTRUMENTED_POLL_NANOS.set(INSTRUMENTED_POLL_NANOS.get() + elapsed.as_nanos() as u64);
-        }
-        drop(guard);
+        let elapsed = start.elapsed();
         this.poll_duration_histogram.observe(elapsed.as_secs_f64());
         if elapsed >= *SLOW_POLL_LOG_THRESHOLD {
             crate::rate_limited_warn!(
@@ -160,18 +166,13 @@ impl<F: Future> Future for DetectSlowPoll<F> {
     }
 }
 
-/// Installs task hooks on `runtime_builder` that attribute every task poll to an
-/// instrumentation point, when `QW_TOKIO_TASK_POLL_ATTRIBUTION` is set.
+/// Installs task hooks on `runtime_builder` that record the polls of the tasks spawned by
+/// S3 requests (see [`S3ScopeExt::in_s3_scope`]) under `s3`, when
+/// `QW_TOKIO_TASK_POLL_ATTRIBUTION` is set.
 ///
-/// A task spawned while `detect_slow_poll(name)` is being polled is labelled `name>`, and
-/// so are the tasks it spawns in turn. This reaches tasks spawned by libraries (hyper
-/// connections, h2 streams, ...) that cannot be wrapped directly. Tasks spawned outside of
-/// any instrumented context are labelled `unattributed`. Polls are recorded in
-/// `quickwit_runtime_task_poll_duration_seconds`, minus the time already reported by the
-/// outermost instrumentation point polled within them.
-///
-/// It costs a lookup in a sharded map and two `Instant::now()` calls per task poll, hence
-/// the opt-in.
+/// These tasks are spawned by the S3 client's HTTP library, so they cannot be wrapped with
+/// [`DetectSlowPollExt::detect_slow_poll`] directly. It costs a lookup in a sharded set per
+/// task poll, hence the opt-in.
 pub fn configure_task_poll_attribution(runtime_builder: &mut tokio::runtime::Builder) {
     if !crate::get_bool_from_env("QW_TOKIO_TASK_POLL_ATTRIBUTION", false) {
         return;
@@ -184,13 +185,12 @@ pub fn configure_task_poll_attribution(runtime_builder: &mut tokio::runtime::Bui
         );
     }
     #[cfg(tokio_unstable)]
-    task_poll_attribution::install(runtime_builder);
+    s3_task_polls::install(runtime_builder);
 }
 
 #[cfg(tokio_unstable)]
-mod task_poll_attribution {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
+mod s3_task_polls {
+    use std::collections::HashSet;
     use std::hash::{BuildHasher, RandomState};
     use std::sync::Mutex;
 
@@ -201,61 +201,29 @@ mod task_poll_attribution {
 
     const NUM_SHARDS: usize = 64;
 
-    /// Remainders shorter than this, left after subtracting the instrumented time from a
-    /// task poll, are the overhead of the wrappers themselves: they would only inflate the
-    /// poll count.
-    const MIN_UNINSTRUMENTED_NANOS: u64 = 1_000;
-
-    /// Label of every live task spawned from an instrumented context.
-    struct TaskLabels {
+    /// Ids of the live tasks spawned by S3 requests.
+    struct S3Tasks {
         hasher: RandomState,
-        shards: [Mutex<HashMap<Id, &'static Histogram>>; NUM_SHARDS],
+        shards: [Mutex<HashSet<Id>>; NUM_SHARDS],
     }
 
-    impl TaskLabels {
-        fn shard(&self, task_id: Id) -> &Mutex<HashMap<Id, &'static Histogram>> {
+    impl S3Tasks {
+        fn shard(&self, task_id: Id) -> &Mutex<HashSet<Id>> {
             &self.shards[self.hasher.hash_one(task_id) as usize % NUM_SHARDS]
         }
     }
 
-    static TASK_LABELS: Lazy<TaskLabels> = Lazy::new(|| TaskLabels {
+    static S3_TASKS: Lazy<S3Tasks> = Lazy::new(|| S3Tasks {
         hasher: RandomState::new(),
-        shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        shards: std::array::from_fn(|_| Mutex::new(HashSet::new())),
     });
 
-    // Histograms are leaked so that the per-poll bookkeeping only copies references. There
-    // is one per instrumentation point, so they are bounded like the label values.
-    static UNATTRIBUTED_HISTOGRAM: Lazy<&'static Histogram> = Lazy::new(|| {
-        Box::leak(Box::new(
-            POLL_DURATION_HISTOGRAM.with_label_values(["unattributed"]),
-        ))
-    });
-    static SPAWNED_FROM_HISTOGRAMS: Lazy<Mutex<HashMap<&'static str, &'static Histogram>>> =
-        Lazy::new(Default::default);
+    static S3_POLL_DURATION_HISTOGRAM: Lazy<Histogram> =
+        Lazy::new(|| POLL_DURATION_HISTOGRAM.with_label_values(["s3"]));
 
     thread_local! {
-        static SPAWNED_FROM_HISTOGRAMS_CACHE: RefCell<HashMap<&'static str, &'static Histogram>> =
-            RefCell::new(HashMap::new());
-        /// Start and label of the task poll in progress on this worker.
-        static TASK_POLL: Cell<Option<(Instant, &'static Histogram)>> = const { Cell::new(None) };
-    }
-
-    /// Histogram of the tasks spawned from the instrumentation point `name`.
-    fn spawned_from_histogram(name: &'static str) -> &'static Histogram {
-        SPAWNED_FROM_HISTOGRAMS_CACHE.with_borrow_mut(|cache| {
-            *cache.entry(name).or_insert_with(|| {
-                *SPAWNED_FROM_HISTOGRAMS
-                    .lock()
-                    .unwrap()
-                    .entry(name)
-                    .or_insert_with(|| {
-                        let label = format!("{name}>");
-                        Box::leak(Box::new(
-                            POLL_DURATION_HISTOGRAM.with_label_values([&label]),
-                        ))
-                    })
-            })
-        })
+        /// Start of the S3 task poll in progress on this worker, if any.
+        static S3_TASK_POLL_START: Cell<Option<Instant>> = const { Cell::new(None) };
     }
 
     pub(super) fn install(runtime_builder: &mut tokio::runtime::Builder) {
@@ -267,51 +235,32 @@ mod task_poll_attribution {
     }
 
     fn on_task_spawn(task_meta: &TaskMeta<'_>) {
-        let histogram = match SPAWN_CONTEXT.get() {
-            None => return,
-            Some(SpawnContext::Instrumented(name)) => spawned_from_histogram(name),
-            Some(SpawnContext::SpawnedFrom(histogram)) => histogram,
-        };
+        if !IN_S3.get() {
+            return;
+        }
         let task_id = task_meta.id();
-        TASK_LABELS
-            .shard(task_id)
-            .lock()
-            .unwrap()
-            .insert(task_id, histogram);
+        S3_TASKS.shard(task_id).lock().unwrap().insert(task_id);
     }
 
     fn on_task_terminate(task_meta: &TaskMeta<'_>) {
         // Also called for `spawn_blocking` tasks, which never went through `on_task_spawn`.
         let task_id = task_meta.id();
-        TASK_LABELS.shard(task_id).lock().unwrap().remove(&task_id);
+        S3_TASKS.shard(task_id).lock().unwrap().remove(&task_id);
     }
 
     fn on_before_task_poll(task_meta: &TaskMeta<'_>) {
         let task_id = task_meta.id();
-        let label_opt: Option<&'static Histogram> = TASK_LABELS
-            .shard(task_id)
-            .lock()
-            .unwrap()
-            .get(&task_id)
-            .copied();
-        SPAWN_CONTEXT.set(label_opt.map(SpawnContext::SpawnedFrom));
-        // Reset in case a previous poll panicked in the middle of an instrumented poll.
-        INSTRUMENTED_POLL_DEPTH.set(0);
-        INSTRUMENTED_POLL_NANOS.set(0);
-        let histogram = label_opt.unwrap_or(*UNATTRIBUTED_HISTOGRAM);
-        TASK_POLL.set(Some((Instant::now(), histogram)));
+        let is_s3_task = S3_TASKS.shard(task_id).lock().unwrap().contains(&task_id);
+        // Tasks spawned by an S3 task, e.g. a connection spawned by a background connect, do
+        // S3 work too.
+        IN_S3.set(is_s3_task);
+        S3_TASK_POLL_START.set(is_s3_task.then(Instant::now));
     }
 
     fn on_after_task_poll(_task_meta: &TaskMeta<'_>) {
-        let Some((start, histogram)) = TASK_POLL.take() else {
-            return;
-        };
-        let elapsed_nanos = start.elapsed().as_nanos() as u64;
-        SPAWN_CONTEXT.set(None);
-        let instrumented_nanos = INSTRUMENTED_POLL_NANOS.replace(0);
-        let uninstrumented_nanos = elapsed_nanos.saturating_sub(instrumented_nanos);
-        if instrumented_nanos == 0 || uninstrumented_nanos >= MIN_UNINSTRUMENTED_NANOS {
-            histogram.observe(Duration::from_nanos(uninstrumented_nanos).as_secs_f64());
+        IN_S3.set(false);
+        if let Some(start) = S3_TASK_POLL_START.take() {
+            S3_POLL_DURATION_HISTOGRAM.observe(start.elapsed().as_secs_f64());
         }
     }
 }
@@ -345,7 +294,7 @@ mod tests {
 
     #[cfg(tokio_unstable)]
     #[test]
-    fn test_task_poll_attribution() {
+    fn test_s3_task_polls() {
         fn spin(duration: Duration) {
             let start = Instant::now();
             while start.elapsed() < duration {
@@ -354,54 +303,37 @@ mod tests {
         }
         let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
         runtime_builder.worker_threads(1).enable_all();
-        task_poll_attribution::install(&mut runtime_builder);
+        s3_task_polls::install(&mut runtime_builder);
         let runtime = runtime_builder.build().unwrap();
 
-        // The label values are unique to this test, but `unattributed` is shared: this is the
-        // only test installing the hooks, and it only asserts lower bounds on it.
-        let parent_histogram = POLL_DURATION_HISTOGRAM.with_label_values(["test_parent"]);
-        let spawned_histogram = POLL_DURATION_HISTOGRAM.with_label_values(["test_parent>"]);
-        let nested_spawned_histogram =
-            POLL_DURATION_HISTOGRAM.with_label_values(["test_parent:nested>"]);
-        let unattributed_histogram = POLL_DURATION_HISTOGRAM.with_label_values(["unattributed"]);
-        let unattributed_sum_before = unattributed_histogram.get_sample_sum();
+        // This is the only test installing the hooks, so it is the only one recording `s3`.
+        let s3_histogram = POLL_DURATION_HISTOGRAM.with_label_values(["s3"]);
+        let s3_sum_before = s3_histogram.get_sample_sum();
 
         runtime.block_on(async {
-            // A task spawned from an instrumented future, which spawns a task in turn: both
-            // are attributed to `test_parent>`.
-            let parent_task = tokio::spawn(
-                async {
-                    tokio::spawn(async {
-                        spin(Duration::from_millis(20));
-                        tokio::spawn(async { spin(Duration::from_millis(20)) })
-                            .await
-                            .unwrap();
-                    })
-                    .await
-                    .unwrap();
-                    async { tokio::spawn(async {}).await.unwrap() }
-                        .detect_slow_poll("test_parent:nested")
-                        .await;
-                }
-                .detect_slow_poll("test_parent"),
-            );
-            parent_task.await.unwrap();
+            // A task spawned by an S3 request, and the task it spawns in turn, do S3 work.
+            // `tokio::spawn` spawns when called, so it must run inside the S3 scope.
+            async {
+                tokio::spawn(async {
+                    spin(Duration::from_millis(10));
+                    tokio::spawn(async { spin(Duration::from_millis(10)) })
+                        .await
+                        .unwrap();
+                })
+                .await
+            }
+            .in_s3_scope()
+            .await
+            .unwrap();
 
-            // An uninstrumented task, whose time lands in `unattributed`.
-            tokio::spawn(async { spin(Duration::from_millis(20)) })
+            // Tasks spawned outside of an S3 request don't.
+            tokio::spawn(async { spin(Duration::from_millis(100)) })
                 .await
                 .unwrap();
         });
 
-        // Both descendants spun 20ms each.
-        assert!(spawned_histogram.get_sample_sum() >= 0.035);
-        // The parent itself did not spin: its task poll is fully covered by `test_parent`, and
-        // must not be reported again in `unattributed`.
-        assert!(parent_histogram.get_sample_sum() < 0.010);
-        // A task spawned inside a nested instrumentation point is labelled after it.
-        assert_eq!(nested_spawned_histogram.get_sample_count(), 1);
-        let unattributed_sum = unattributed_histogram.get_sample_sum() - unattributed_sum_before;
-        assert!(unattributed_sum >= 0.015, "{unattributed_sum}");
-        assert!(unattributed_sum < 0.035, "{unattributed_sum}");
+        let s3_sum = s3_histogram.get_sample_sum() - s3_sum_before;
+        assert!(s3_sum >= 0.018, "{s3_sum}");
+        assert!(s3_sum < 0.090, "{s3_sum}");
     }
 }
