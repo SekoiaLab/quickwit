@@ -29,7 +29,10 @@ use tokio::signal;
 use tracing::{debug, info};
 
 use crate::checklist::{BLUE_COLOR, RED_COLOR};
-use crate::{config_cli_arg, get_resolvers, load_node_config, start_actor_runtimes};
+use crate::{
+    config_cli_arg, get_resolvers, load_node_config, s3_assembly_thread_pool_for_services,
+    start_actor_runtimes,
+};
 
 pub fn build_run_command() -> Command {
     Command::new("run")
@@ -108,14 +111,16 @@ impl RunCliCommand {
         let version_text = BuildInfo::get_version_text();
         info!("quickwit version: {version_text}");
         let mut node_config = load_node_config(&self.config_uri).await?;
-        let (storage_resolver, metastore_resolver) =
-            get_resolvers(&node_config.storage_configs, &node_config.metastore_configs);
-        crate::busy_detector::set_enabled(true);
-
         if let Some(services) = &self.services {
             info!(services = %services.iter().join(", "), "setting services from override");
             node_config.enabled_services.clone_from(services);
         }
+        let (storage_resolver, metastore_resolver) = get_resolvers(
+            &node_config.storage_configs,
+            &node_config.metastore_configs,
+            s3_assembly_thread_pool_for_services(&node_config.enabled_services),
+        );
+        crate::busy_detector::set_enabled(true);
         // TODO move in serve quickwit?
         let runtimes_config = RuntimesConfig::default();
         start_actor_runtimes(runtimes_config, &node_config.enabled_services)?;

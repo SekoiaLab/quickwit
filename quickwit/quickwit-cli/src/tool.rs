@@ -586,7 +586,7 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
 
     let config = load_node_config(&args.config_uri).await?;
     let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs);
+        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
     let mut metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
 
     let source_params = if let Some(uri) = args.input_path_opt.as_ref() {
@@ -716,7 +716,7 @@ pub async fn local_search_cli(args: LocalSearchArgs) -> anyhow::Result<()> {
     println!("❯ Searching directly on the index storage (without calling REST API)...");
     let config = load_node_config(&args.config_uri).await?;
     let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs);
+        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
     let metastore: MetastoreServiceClient =
         metastore_resolver.resolve(&config.metastore_uri).await?;
     let aggs = args
@@ -755,7 +755,7 @@ pub async fn merge_cli(args: MergeArgs) -> anyhow::Result<()> {
     println!("❯ Merging splits locally...");
     let config = load_node_config(&args.config_uri).await?;
     let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs);
+        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
     let mut metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
     run_index_checklist(&mut metastore, &storage_resolver, &args.index_id, None).await?;
     // The indexing service needs to update its cluster chitchat state so that the control plane is
@@ -843,7 +843,7 @@ pub async fn merge_mature_cli(args: MatureMergeArgs) -> anyhow::Result<()> {
     println!("❯ Scanning all indexes for mature merge opportunities...");
     let config = load_node_config(&args.config_uri).await?;
     let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs);
+        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
     let metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
 
     let runtimes_config = RuntimesConfig::default();
@@ -875,7 +875,7 @@ pub async fn garbage_collect_index_cli(args: GarbageCollectIndexArgs) -> anyhow:
 
     let config = load_node_config(&args.config_uri).await?;
     let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs);
+        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
     let metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
     let mut index_service = IndexService::new(metastore, storage_resolver);
     let removal_info = index_service
@@ -940,7 +940,7 @@ async fn extract_split_cli(args: ExtractSplitArgs) -> anyhow::Result<()> {
 
     let config = load_node_config(&args.config_uri).await?;
     let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs);
+        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
     let metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
     let index_metadata = metastore
         .index_metadata(IndexMetadataRequest::for_index_id(args.index_id))
