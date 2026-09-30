@@ -39,6 +39,7 @@ use quickwit_aws::http_client::s3_http_client;
 use quickwit_aws::retry::{AwsRetryable, aws_retry};
 use quickwit_aws::{aws_behavior_version, get_aws_config};
 use quickwit_common::retry::{Retry, RetryParams};
+use quickwit_common::thread_pool::ThreadPool;
 use quickwit_common::uri::Uri;
 use quickwit_common::{chunk_range, into_u64_range};
 use quickwit_config::{S3EncryptionConfig, S3StorageConfig};
@@ -97,6 +98,11 @@ pub struct S3CompatibleObjectStorage {
     disable_multi_object_delete: bool,
     disable_multipart_upload: bool,
     encryption: Option<S3EncryptionConfig>,
+    /// Thread pool on which large multi-segment response bodies are assembled into a single
+    /// buffer. `None` assembles them inline on the tokio worker. This is not part of the storage
+    /// config: it is set by the node that builds the storage (see
+    /// [`Self::with_assembly_thread_pool`]).
+    assembly_thread_pool: Option<ThreadPool>,
 }
 
 impl fmt::Debug for S3CompatibleObjectStorage {
@@ -106,6 +112,7 @@ impl fmt::Debug for S3CompatibleObjectStorage {
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
             .field("encryption", &self.encryption)
+            .field("assembly_thread_pool", &self.assembly_thread_pool.is_some())
             .finish()
     }
 }
@@ -202,6 +209,7 @@ impl S3CompatibleObjectStorage {
             disable_multi_object_delete,
             disable_multipart_upload,
             encryption: s3_storage_config.encryption.clone(),
+            assembly_thread_pool: None,
         })
     }
 
@@ -210,16 +218,16 @@ impl S3CompatibleObjectStorage {
     /// This method overrides any existing prefix. (It does NOT
     /// append the argument to any existing prefix.)
     pub fn with_prefix(self, prefix: PathBuf) -> Self {
+        Self { prefix, ..self }
+    }
+
+    /// Assembles large multi-segment response bodies on `thread_pool` instead of the tokio
+    /// worker polling the download. See
+    /// [`crate::metrics_wrappers::collect_with_download_metrics`] for the threshold.
+    pub fn with_assembly_thread_pool(self, thread_pool: ThreadPool) -> Self {
         Self {
-            s3_client: self.s3_client,
-            uri: self.uri,
-            bucket: self.bucket,
-            prefix,
-            multipart_policy: self.multipart_policy,
-            retry_params: self.retry_params,
-            disable_multi_object_delete: self.disable_multi_object_delete,
-            disable_multipart_upload: self.disable_multipart_upload,
-            encryption: self.encryption,
+            assembly_thread_pool: Some(thread_pool),
+            ..self
         }
     }
 
@@ -657,7 +665,12 @@ impl S3CompatibleObjectStorage {
         // only record ranged get request as being in flight
         let _in_flight_guards =
             range_opt.map(|range| object_storage_get_slice_in_flight_guards(range.len()));
-        let payload = collect_with_download_metrics(get_object_output.body, download_kind).await?;
+        let payload = collect_with_download_metrics(
+            get_object_output.body,
+            download_kind,
+            self.assembly_thread_pool.as_ref(),
+        )
+        .await?;
         Ok(payload)
     }
 
@@ -1041,6 +1054,7 @@ mod tests {
             disable_multi_object_delete: false,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
         };
         assert_eq!(
             s3_storage.relative_path("indexes/foo"),
@@ -1089,6 +1103,7 @@ mod tests {
             disable_multi_object_delete: true,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
         };
         let _ = s3_storage
             .bulk_delete(&[Path::new("foo"), Path::new("bar")])
@@ -1127,6 +1142,7 @@ mod tests {
             disable_multi_object_delete: false,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
         };
         let _ = s3_storage
             .bulk_delete(&[Path::new("foo"), Path::new("bar")])
@@ -1210,6 +1226,7 @@ mod tests {
             disable_multi_object_delete: false,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
         };
         let bulk_delete_error = s3_storage
             .bulk_delete(&[
@@ -1302,6 +1319,7 @@ mod tests {
             disable_multi_object_delete: false,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
         };
         s3_storage
             .put(Path::new("my-path"), Box::new(vec![1, 2, 3]))
@@ -1345,6 +1363,7 @@ mod tests {
                     key_md5: "SomeBase64MD5Value=".to_string(),
                     read_only,
                 }),
+                assembly_thread_pool: None,
             };
 
             let small_payload = vec![1u8; 100];
@@ -1446,6 +1465,7 @@ mod tests {
                     key_md5: "SomeBase64MD5Value=".to_string(),
                     read_only,
                 }),
+                assembly_thread_pool: None,
             };
 
             // Test multipart upload with large payload that triggers multipart (15MB > 10MB
