@@ -403,9 +403,6 @@ async fn warm_up_automatons(
                                         "automaton_warmup_build",
                                         cost_class.as_label(),
                                     )
-                                    .detect_slow_poll(
-                                        "leaf_single_split:warm_up_automatons_build_regex",
-                                    )
                                     .await
                                     .context("regex build panicked during warmup")?
                                     .with_context(|| {
