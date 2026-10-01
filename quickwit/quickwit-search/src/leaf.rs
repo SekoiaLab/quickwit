@@ -23,7 +23,7 @@ use anyhow::Context;
 use bytesize::ByteSize;
 use futures::future::try_join_all;
 use quickwit_common::pretty::PrettySample;
-use quickwit_common::slow_poll::{DetectSlowPollExt, SlowPollPhase};
+use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
 use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
 use quickwit_proto::search::{
@@ -363,25 +363,15 @@ async fn warm_up_automatons(
     terms_grouped_by_field: &HashMap<Field, HashSet<Automaton>>,
     cost_class: QueryCostClass,
 ) -> anyhow::Result<()> {
-    // Tantivy calls the executor once the matching term dictionary blocks are selected and
-    // downloaded, and then downloads the postings: this call separates the two phases.
-    let cpu_intensive_executor = |phase: SlowPollPhase| {
-        move |task: Box<dyn FnOnce() -> std::io::Result<()> + Send>| {
-            phase.enter_second_phase();
-            async move {
-                crate::search_thread_pool()
-                    .run_cpu_intensive_with_extra_tags(
-                        task,
-                        "automaton_warmup",
-                        cost_class.as_label(),
-                    )
-                    .await
-                    .map_err(|_| std::io::Error::other("task panicked"))?
-            }
+    let cpu_intensive_executor = |caller: &'static str| {
+        move |task: Box<dyn FnOnce() -> std::io::Result<()> + Send>| async move {
+            crate::search_thread_pool()
+                .run_cpu_intensive_with_extra_tags(task, caller, cost_class.as_label())
+                .await
+                .map_err(|_| std::io::Error::other("task panicked"))?
         }
     };
-    const SELECT_BLOCKS: &str = "leaf_single_split:warm_up_automatons_select_blocks";
-    const READ_POSTINGS: &str = "leaf_single_split:warm_up_automatons_read_postings";
+    const WARM_POSTINGS: &str = "leaf_single_split:warm_up_automatons_warm_postings";
     let warm_up_futures = async {
         let mut warm_up_futures = Vec::new();
         for (field, automatons) in terms_grouped_by_field {
@@ -390,7 +380,6 @@ async fn warm_up_automatons(
                 for automaton in automatons {
                     let inv_idx_clone = inv_idx.clone();
                     warm_up_futures.push(async move {
-                        let phase = SlowPollPhase::default();
                         match automaton {
                             Automaton::Regex(path, patterns) => {
                                 let patterns = patterns.clone();
@@ -419,13 +408,12 @@ async fn warm_up_automatons(
                                                 automaton: Arc::new(regex),
                                                 prefix: path.clone().unwrap_or_default(),
                                             },
-                                            cpu_intensive_executor(phase.clone()),
+                                            cpu_intensive_executor(
+                                                "automaton_warmup_select_blocks",
+                                            ),
+                                            cpu_intensive_executor("automaton_warmup_scan_terms"),
                                         )
-                                        .detect_slow_poll_two_phases(
-                                            SELECT_BLOCKS,
-                                            READ_POSTINGS,
-                                            phase,
-                                        )
+                                        .detect_slow_poll(WARM_POSTINGS)
                                         .await
                                         .with_context(|| {
                                             format!(
@@ -440,13 +428,12 @@ async fn warm_up_automatons(
                                                 automaton: Arc::new(regexes),
                                                 prefix: path.clone().unwrap_or_default(),
                                             },
-                                            cpu_intensive_executor(phase.clone()),
+                                            cpu_intensive_executor(
+                                                "automaton_warmup_select_blocks",
+                                            ),
+                                            cpu_intensive_executor("automaton_warmup_scan_terms"),
                                         )
-                                        .detect_slow_poll_two_phases(
-                                            SELECT_BLOCKS,
-                                            READ_POSTINGS,
-                                            phase,
-                                        )
+                                        .detect_slow_poll(WARM_POSTINGS)
                                         .await
                                         .with_context(|| {
                                             format!(
@@ -460,9 +447,10 @@ async fn warm_up_automatons(
                             Automaton::TermSet(automaton) => inv_idx_clone
                                 .warm_postings_automaton(
                                     automaton.clone(),
-                                    cpu_intensive_executor(phase.clone()),
+                                    cpu_intensive_executor("automaton_warmup_select_blocks"),
+                                    cpu_intensive_executor("automaton_warmup_scan_terms"),
                                 )
-                                .detect_slow_poll_two_phases(SELECT_BLOCKS, READ_POSTINGS, phase)
+                                .detect_slow_poll(WARM_POSTINGS)
                                 .await
                                 .context("failed to warm term set"),
                         }
