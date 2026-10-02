@@ -33,6 +33,7 @@ futures = { workspace = true }
 humantime = { workspace = true }
 indicatif = { workspace = true }
 itertools = { workspace = true }
+libc = { workspace = true }
 numfmt = { workspace = true }
 once_cell = { workspace = true }
 openssl-probe = { workspace = true, optional = true }
