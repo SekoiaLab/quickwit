@@ -216,6 +216,11 @@ fn validate_request_and_build_metadata(
             // We convert the error to return a 400 to the user (and not a 500).
             .map_err(|err| SearchError::InvalidQuery(err.to_string()))?;
 
+        // Reject queries with an excessive number of regex/wildcard sub-queries
+        // before building them against each index schema below, which compiles
+        // one automaton per pattern and can take minutes for degenerate queries.
+        query_cost_classifier::check_automaton_query_count(&query_ast_resolved_for_index)?;
+
         // Validate uniqueness of resolved query AST.
         if let Some(query_ast_resolved) = &query_ast_resolved_opt {
             if query_ast_resolved != &query_ast_resolved_for_index {
