@@ -15,8 +15,6 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -123,20 +121,6 @@ pub trait DetectSlowPollExt: Sized {
     /// Nested wrappers measure inclusive durations. By convention, an instrumentation
     /// point nested inside another one is named `<outer_name>:<inner_name>`.
     fn detect_slow_poll(self, name: &'static str) -> DetectSlowPoll<Self>;
-
-    /// Like [`Self::detect_slow_poll`], but records each poll under `first_name` or
-    /// `second_name` depending on whether [`SlowPollPhase::enter_second_phase`] was called on
-    /// `phase` before that poll started.
-    ///
-    /// This splits a future we don't control at a point observable from the outside, for
-    /// instance when it calls back into a closure we provide. The poll during which the switch
-    /// happens is recorded under `first_name`.
-    fn detect_slow_poll_two_phases(
-        self,
-        first_name: &'static str,
-        second_name: &'static str,
-        phase: SlowPollPhase,
-    ) -> DetectSlowPollTwoPhases<Self>;
 }
 
 impl<F: Future> DetectSlowPollExt for F {
@@ -149,82 +133,6 @@ impl<F: Future> DetectSlowPollExt for F {
             name,
             poll_duration_histogram,
         }
-    }
-
-    fn detect_slow_poll_two_phases(
-        self,
-        first_name: &'static str,
-        second_name: &'static str,
-        phase: SlowPollPhase,
-    ) -> DetectSlowPollTwoPhases<F> {
-        DetectSlowPollTwoPhases {
-            inner: self,
-            phase,
-            first: (
-                first_name,
-                POLL_DURATION_HISTOGRAM.with_label_values([first_name]),
-            ),
-            second: (
-                second_name,
-                POLL_DURATION_HISTOGRAM.with_label_values([second_name]),
-            ),
-        }
-    }
-}
-
-/// Records one poll of an instrumented future.
-fn record_poll(name: &'static str, poll_duration_histogram: &Histogram, elapsed: Duration) {
-    poll_duration_histogram.observe(elapsed.as_secs_f64());
-    if elapsed >= *SLOW_POLL_LOG_THRESHOLD {
-        crate::rate_limited_warn!(
-            limit_per_min = 10,
-            name = name,
-            elapsed_millis = elapsed.as_millis() as u64,
-            "slow poll detected"
-        );
-    }
-}
-
-/// Phase of a future instrumented with [`DetectSlowPollExt::detect_slow_poll_two_phases`].
-/// Clones share the same phase.
-#[derive(Clone, Default)]
-pub struct SlowPollPhase(Arc<AtomicBool>);
-
-impl SlowPollPhase {
-    /// Polls starting after this call are recorded under the second name.
-    pub fn enter_second_phase(&self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-
-    fn is_second_phase(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
-/// Future returned by [`DetectSlowPollExt::detect_slow_poll_two_phases`].
-#[pin_project]
-pub struct DetectSlowPollTwoPhases<F> {
-    #[pin]
-    inner: F,
-    phase: SlowPollPhase,
-    first: (&'static str, Histogram),
-    second: (&'static str, Histogram),
-}
-
-impl<F: Future> Future for DetectSlowPollTwoPhases<F> {
-    type Output = F::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let (name, poll_duration_histogram) = if this.phase.is_second_phase() {
-            this.second
-        } else {
-            this.first
-        };
-        let start = Instant::now();
-        let poll = this.inner.poll(cx);
-        record_poll(name, poll_duration_histogram, start.elapsed());
-        poll
     }
 }
 
@@ -244,7 +152,16 @@ impl<F: Future> Future for DetectSlowPoll<F> {
         let this = self.project();
         let start = Instant::now();
         let poll = this.inner.poll(cx);
-        record_poll(this.name, this.poll_duration_histogram, start.elapsed());
+        let elapsed = start.elapsed();
+        this.poll_duration_histogram.observe(elapsed.as_secs_f64());
+        if elapsed >= *SLOW_POLL_LOG_THRESHOLD {
+            crate::rate_limited_warn!(
+                limit_per_min = 10,
+                name = this.name,
+                elapsed_millis = elapsed.as_millis() as u64,
+                "slow poll detected"
+            );
+        }
         poll
     }
 }
@@ -373,37 +290,6 @@ mod tests {
 
         assert_eq!(output, 42);
         assert_eq!(histogram.get_sample_count(), sample_count_before + 2);
-    }
-
-    #[tokio::test]
-    async fn test_detect_slow_poll_two_phases_switches_histogram() {
-        let first_histogram = POLL_DURATION_HISTOGRAM.with_label_values(["test_first_phase"]);
-        let second_histogram = POLL_DURATION_HISTOGRAM.with_label_values(["test_second_phase"]);
-        let first_count_before = first_histogram.get_sample_count();
-        let second_count_before = second_histogram.get_sample_count();
-
-        let phase = SlowPollPhase::default();
-        let phase_clone = phase.clone();
-        let mut num_polls = 0;
-        let three_poll_future = std::future::poll_fn(move |cx| {
-            num_polls += 1;
-            if num_polls == 3 {
-                return Poll::Ready(42);
-            }
-            // The switch happens during the first poll, which still counts as first phase.
-            if num_polls == 1 {
-                phase_clone.enter_second_phase();
-            }
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        });
-        let output = three_poll_future
-            .detect_slow_poll_two_phases("test_first_phase", "test_second_phase", phase)
-            .await;
-
-        assert_eq!(output, 42);
-        assert_eq!(first_histogram.get_sample_count(), first_count_before + 1);
-        assert_eq!(second_histogram.get_sample_count(), second_count_before + 2);
     }
 
     #[cfg(tokio_unstable)]
