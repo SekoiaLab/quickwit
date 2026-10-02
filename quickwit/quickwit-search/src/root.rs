@@ -50,7 +50,9 @@ use tantivy::schema::{Field, FieldEntry, FieldType, Schema};
 use tracing::{debug, info_span, instrument, record_all};
 
 use crate::cluster_client::ClusterClient;
-use crate::collector::{QuickwitAggregations, make_merge_collector};
+use crate::collector::{
+    AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES, QuickwitAggregations, make_merge_collector,
+};
 use crate::metrics_trackers::{RootSearchMetricsFuture, SearchPlanMetricsFuture};
 use crate::scroll_context::{ScrollContext, ScrollKeyAndStartOffset};
 use crate::search_job_placer::{Job, group_by, group_jobs_by_index_id};
@@ -799,25 +801,40 @@ pub(crate) async fn search_partial_hits_phase(
     let merge_collector =
         make_merge_collector(search_request, searcher_context.get_aggregation_limits())?;
 
-    // Merging is a cpu-bound task.
-    // It should be executed by Tokio's blocking threads.
+    // Merging is CPU bound, but only worth the search thread pool's hand-off and queue when there
+    // are enough aggregation results to merge.
+    let aggregation_num_bytes: usize = leaf_search_responses
+        .iter()
+        .filter_map(|leaf_search_response| {
+            leaf_search_response
+                .intermediate_aggregation_result
+                .as_ref()
+        })
+        .map(Vec::len)
+        .sum();
 
     // Wrap into result for merge_fruits
     let leaf_search_results: Vec<tantivy::Result<LeafSearchResponse>> =
         leaf_search_responses.into_iter().map(Ok).collect_vec();
     let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
     let span = info_span!("merge_fruits");
-    let mut leaf_search_response = crate::search_thread_pool()
-        .run_cpu_intensive_with_priority(
-            Priority::High,
-            move || {
-                let _span_guard = span.enter();
-                merge_collector.merge_fruits(leaf_search_results)
-            },
-            "root_merge",
-            cost_class.as_label(),
-        )
-        .await
+    let merge_fruits = move || {
+        let _span_guard = span.enter();
+        merge_collector.merge_fruits(leaf_search_results)
+    };
+    let merge_result = if aggregation_num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES {
+        crate::search_thread_pool()
+            .run_cpu_intensive_with_priority(
+                Priority::High,
+                merge_fruits,
+                "root_merge",
+                cost_class.as_label(),
+            )
+            .await
+    } else {
+        Ok(merge_fruits())
+    };
+    let mut leaf_search_response = merge_result
         .context("failed to merge leaf search responses")?
         .map_err(|error: TantivyError| crate::SearchError::Internal(error.to_string()))?;
     debug!(

@@ -24,6 +24,7 @@ use bytesize::ByteSize;
 use futures::future::try_join_all;
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::slow_poll::DetectSlowPollExt;
+use quickwit_common::thread_pool::Panicked;
 use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
 use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
@@ -1345,16 +1346,29 @@ pub async fn multi_index_leaf_search(
         incremental_merge_collector.add_result(result??)?;
     }
 
-    crate::search_thread_pool()
-        .run_cpu_intensive_with_priority(
-            Priority::High,
-            || incremental_merge_collector.finalize().map_err(Into::into),
-            "finalize",
-            cost_class.as_label(),
-        )
+    finalize_incremental_merge(incremental_merge_collector, cost_class)
         .instrument(info_span!("incremental_merge_finalize"))
         .await
         .context("failed to merge split search responses")?
+        .map_err(Into::into)
+}
+
+async fn finalize_incremental_merge(
+    incremental_merge_collector: IncrementalCollector,
+    cost_class: QueryCostClass,
+) -> Result<tantivy::Result<LeafSearchResponse>, Panicked> {
+    if incremental_merge_collector.is_finalize_cpu_intensive() {
+        crate::search_thread_pool()
+            .run_cpu_intensive_with_priority(
+                Priority::High,
+                move || incremental_merge_collector.finalize(),
+                "finalize",
+                cost_class.as_label(),
+            )
+            .await
+    } else {
+        Ok(incremental_merge_collector.finalize())
+    }
 }
 
 /// Optimizes the search_request based on CanSplitDoBetter
@@ -1529,13 +1543,7 @@ pub async fn single_doc_mapping_leaf_search(
     }
 
     let leaf_search_response_reresult: Result<Result<LeafSearchResponse, _>, _> =
-        crate::search_thread_pool()
-            .run_cpu_intensive_with_priority(
-                Priority::High,
-                || incremental_merge_collector.finalize(),
-                "finalize",
-                cost_class.as_label(),
-            )
+        finalize_incremental_merge(incremental_merge_collector, cost_class)
             .instrument(info_span!("incremental_merge_intermediate"))
             .await
             .context("failed to merge split search responses");
