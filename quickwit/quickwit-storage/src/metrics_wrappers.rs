@@ -40,7 +40,7 @@ pub enum ActionLabel {
 }
 
 impl ActionLabel {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             ActionLabel::AbortMultipartUpload => "abort_multipart_upload",
             ActionLabel::CompleteMultipartUpload => "complete_multipart_upload",

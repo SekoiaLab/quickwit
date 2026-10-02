@@ -26,6 +26,7 @@
 //!
 //! The `BundleStorage` bundles together multiple files into a single file.
 mod cache;
+mod community_metrics;
 mod debouncer;
 mod file_descriptor_cache;
 mod metrics;
