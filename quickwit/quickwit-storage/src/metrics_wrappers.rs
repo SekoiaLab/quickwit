@@ -18,6 +18,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
+use aws_smithy_types::byte_stream::ByteStream;
+use bytes::{Bytes, BytesMut};
 use pin_project::{pin_project, pinned_drop};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
@@ -276,6 +278,81 @@ pub enum DownloadStatus {
     Failed(&'static str),
 }
 
+/// Whether a download covers a whole object or just a byte range of it.
+///
+/// The two have size distributions that differ by orders of magnitude (a slice is
+/// typically a few kilobytes, a whole split is megabytes), so they are recorded
+/// under distinct label values. Aggregated together, the downloaded volume per
+/// request describes neither.
+#[derive(Clone, Copy, Debug)]
+pub enum DownloadKind {
+    /// The whole object, as fetched by `get_all` and `copy_to`.
+    Object,
+    /// A byte range of the object, as fetched by `get_slice`.
+    Slice,
+}
+
+impl DownloadKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DownloadKind::Object => "object",
+            DownloadKind::Slice => "slice",
+        }
+    }
+}
+
+/// Records the volume and the outcome of a single download when dropped.
+///
+/// Recording on drop (rather than on completion) is what makes a download that
+/// fails or is cancelled midway still report the bytes that did transit, which is
+/// the whole point of tracking downloads separately: unlike other requests, they
+/// can fail long after a successful response header.
+pub struct DownloadMetricsGuard {
+    downloaded_bytes: u64,
+    kind: DownloadKind,
+    status: DownloadStatus,
+}
+
+impl DownloadMetricsGuard {
+    pub fn new(kind: DownloadKind) -> DownloadMetricsGuard {
+        DownloadMetricsGuard {
+            downloaded_bytes: 0,
+            kind,
+            status: DownloadStatus::InProgress,
+        }
+    }
+
+    pub fn record_bytes(&mut self, num_bytes: u64) {
+        self.downloaded_bytes += num_bytes;
+    }
+
+    pub fn set_status(&mut self, status: DownloadStatus) {
+        self.status = status;
+    }
+}
+
+impl Drop for DownloadMetricsGuard {
+    fn drop(&mut self) {
+        let error_opt = match &self.status {
+            DownloadStatus::InProgress => Some("cancelled"),
+            DownloadStatus::Failed(e) => Some(*e),
+            DownloadStatus::Done => None,
+        };
+
+        STORAGE_METRICS
+            .object_storage_download_num_bytes
+            .with_label_values([error_opt.unwrap_or("success"), self.kind.as_str()])
+            .inc_by(self.downloaded_bytes);
+
+        if let Some(error) = error_opt {
+            STORAGE_METRICS
+                .object_storage_download_errors
+                .with_label_values([error, self.kind.as_str()])
+                .inc();
+        }
+    }
+}
+
 /// Track io errors during downloads.
 ///
 /// Downloads are a bit different from other requests because the request might
@@ -289,7 +366,7 @@ where
 {
     #[pin]
     tracked: copy_buf::CopyBuf<'a, R, W>,
-    status: DownloadStatus,
+    metrics_guard: DownloadMetricsGuard,
 }
 
 #[pinned_drop]
@@ -299,23 +376,11 @@ where
     W: AsyncWrite + Unpin + ?Sized,
 {
     fn drop(self: Pin<&mut Self>) {
-        let error_opt = match &self.status {
-            DownloadStatus::InProgress => Some("cancelled"),
-            DownloadStatus::Failed(e) => Some(*e),
-            DownloadStatus::Done => None,
-        };
-
-        STORAGE_METRICS
-            .object_storage_download_num_bytes
-            .with_label_values([error_opt.unwrap_or("success")])
-            .inc_by(self.tracked.amt);
-
-        if let Some(error) = error_opt {
-            STORAGE_METRICS
-                .object_storage_download_errors
-                .with_label_values([error])
-                .inc();
-        }
+        // The guard is dropped right after this returns, and that is what actually
+        // records the metrics. Here we only hand it the byte count, which lives in
+        // the copy itself.
+        let this = self.project();
+        this.metrics_guard.downloaded_bytes = this.tracked.amt;
     }
 }
 
@@ -329,7 +394,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let response = ready!(this.tracked.poll(cx));
-        *this.status = match &response {
+        this.metrics_guard.status = match &response {
             Ok(_) => DownloadStatus::Done,
             Err(e) => DownloadStatus::Failed(io_error_as_label(e.kind())),
         };
@@ -340,6 +405,7 @@ where
 pub async fn copy_with_download_metrics<'a, R, W>(
     reader: &'a mut R,
     writer: &'a mut W,
+    kind: DownloadKind,
 ) -> io::Result<u64>
 where
     R: AsyncBufRead + Unpin + ?Sized,
@@ -351,9 +417,58 @@ where
             writer,
             amt: 0,
         },
-        status: DownloadStatus::InProgress,
+        metrics_guard: DownloadMetricsGuard::new(kind),
     }
     .await
+}
+
+/// Downloads a response body into memory, recording the same metrics as
+/// [`copy_with_download_metrics`].
+///
+/// The body segments are kept as they arrive and only coalesced at the very end.
+/// When the whole body arrived as a single segment -- the common case for the small
+/// byte ranges fetched during warmup -- the payload is handed over without ever
+/// being copied. Going through an intermediate writer instead would copy every byte
+/// into a freshly allocated buffer, which is expensive well beyond the copy itself:
+/// the pages of that buffer are touched for the first time, so each one costs a
+/// minor page fault and a kernel page zeroing.
+pub async fn collect_with_download_metrics(
+    mut byte_stream: ByteStream,
+    kind: DownloadKind,
+) -> io::Result<Bytes> {
+    // Dropping this future before the body is exhausted drops the guard, which
+    // records the partial download as cancelled.
+    let mut metrics_guard = DownloadMetricsGuard::new(kind);
+    let mut segments: Vec<Bytes> = Vec::new();
+    let mut total_num_bytes: usize = 0;
+    while let Some(segment_res) = byte_stream.next().await {
+        let segment = segment_res.map_err(|error| {
+            let error = io::Error::other(error);
+            metrics_guard.set_status(DownloadStatus::Failed(io_error_as_label(error.kind())));
+            error
+        })?;
+        metrics_guard.record_bytes(segment.len() as u64);
+        total_num_bytes += segment.len();
+        segments.push(segment);
+    }
+    metrics_guard.set_status(DownloadStatus::Done);
+    Ok(coalesce_segments(segments, total_num_bytes))
+}
+
+/// Returns a single [`Bytes`] covering `segments`. Zero-copy when there is at most one segment;
+/// otherwise a single allocation concatenates them.
+pub(crate) fn coalesce_segments(mut segments: Vec<Bytes>, total_num_bytes: usize) -> Bytes {
+    match segments.len() {
+        0 => Bytes::new(),
+        1 => segments.remove(0),
+        _ => {
+            let mut out = BytesMut::with_capacity(total_num_bytes);
+            for segment in segments {
+                out.extend_from_slice(&segment);
+            }
+            out.freeze()
+        }
+    }
 }
 
 /// This is a fork of `tokio::io::copy_buf` that enables tracking the number of
@@ -473,10 +588,10 @@ pub mod opendal_helpers {
     }
 
     /// Records an download volume for this action with unknown status.
-    pub fn record_download(bytes: u64) {
+    pub fn record_download(bytes: u64, kind: DownloadKind) {
         STORAGE_METRICS
             .object_storage_download_num_bytes
-            .with_label_values(["unknown"])
+            .with_label_values(["unknown", kind.as_str()])
             .inc_by(bytes);
     }
 
@@ -487,5 +602,37 @@ pub mod opendal_helpers {
             .object_storage_request_duration
             .with_label_values([action.as_str(), "unknown"])
             .start_timer()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_coalesce_segments_does_not_copy_a_single_segment() {
+        let segment = Bytes::from_static(b"warmup payload");
+        let segment_ptr = segment.as_ptr();
+        let coalesced = coalesce_segments(vec![segment], 14);
+        assert_eq!(&coalesced[..], b"warmup payload");
+        // This is the whole point of `coalesce_segments`: a body that arrived as a
+        // single segment is handed over as is, rather than copied into a buffer that
+        // was just allocated.
+        assert_eq!(coalesced.as_ptr(), segment_ptr);
+    }
+
+    #[test]
+    fn test_coalesce_segments_concatenates_several_segments() {
+        let segments = vec![
+            Bytes::from_static(b"war"),
+            Bytes::from_static(b"mup "),
+            Bytes::from_static(b"payload"),
+        ];
+        assert_eq!(&coalesce_segments(segments, 14)[..], b"warmup payload");
+    }
+
+    #[test]
+    fn test_coalesce_segments_empty_body() {
+        assert!(coalesce_segments(Vec::new(), 0).is_empty());
     }
 }

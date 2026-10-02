@@ -13,12 +13,17 @@
 // limitations under the License.
 
 use std::fmt::Formatter;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
+use std::time::Instant;
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
+use pin_project::{pin_project, pinned_drop};
 use quickwit_common::tower::BoxFutureInfaillible;
 use quickwit_config::{disable_ingest_v1, enable_ingest_v2};
 use quickwit_search::SearchService;
@@ -26,12 +31,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::either::Either;
-use tower::ServiceBuilder;
+use tower::{Layer, Service, ServiceBuilder};
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info};
-use warp::filters::log::Info;
 use warp::hyper::http::HeaderValue;
 use warp::hyper::{Method, StatusCode, http};
 use warp::{Filter, Rejection, Reply, redirect};
@@ -43,7 +47,7 @@ use crate::developer_api::developer_api_routes;
 use crate::elasticsearch_api::elastic_api_handlers;
 use crate::health_check_api::health_check_handlers;
 use crate::index_api::index_management_handlers;
-use crate::indexing_api::indexing_get_handler;
+use crate::indexing_api::{indexing_get_handler, swap_pipelines_handler};
 use crate::ingest_api::ingest_api_handlers;
 use crate::jaeger_api::jaeger_api_handlers;
 use crate::metrics_api::metrics_handler;
@@ -53,6 +57,7 @@ use crate::rest_api_response::{RestApiError, RestApiResponse};
 use crate::search_api::{
     search_get_handler, search_plan_get_handler, search_plan_post_handler, search_post_handler,
 };
+use crate::soft_delete_api::soft_delete_api_handlers;
 use crate::template_api::index_template_api_handlers;
 use crate::ui_handler::ui_handler;
 use crate::{BodyFormat, BuildInfo, QuickwitServices, RuntimeInfo};
@@ -75,6 +80,111 @@ impl warp::reject::Reject for TooManyRequests {}
 impl std::fmt::Display for TooManyRequests {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "too many requests")
+    }
+}
+
+/// Tower layer that records HTTP request metrics for every request, including
+/// cancelled ones.
+#[derive(Clone)]
+struct HttpMetricsLayer;
+
+impl<S> Layer<S> for HttpMetricsLayer {
+    type Service = HttpMetricsService<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        HttpMetricsService { inner }
+    }
+}
+
+#[derive(Clone)]
+struct HttpMetricsService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for HttpMetricsService<S>
+where S: Service<
+            http::Request<ReqBody>,
+            Response = http::Response<ResBody>,
+            Error = std::convert::Infallible,
+        >
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = HttpMetricsFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+        let method = req.method().to_string();
+        let path = req.uri().path().to_string();
+        let user_agent = req
+            .headers()
+            .get(http::header::USER_AGENT)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        HttpMetricsFuture {
+            inner: self.inner.call(req),
+            start: Instant::now(),
+            method,
+            status: None,
+            path,
+            user_agent,
+        }
+    }
+}
+
+#[pin_project(PinnedDrop)]
+struct HttpMetricsFuture<F> {
+    #[pin]
+    inner: F,
+    start: Instant,
+    method: String,
+    path: String,
+    user_agent: String,
+    /// `None` while in-flight (including if dropped before completion).
+    /// `Some(status)` once the response future resolves.
+    status: Option<String>,
+}
+
+#[pinned_drop]
+impl<F> PinnedDrop for HttpMetricsFuture<F> {
+    fn drop(self: Pin<&mut Self>) {
+        let status = self.status.as_deref().unwrap_or("cancelled");
+        let duration = self.start.elapsed();
+        info!(
+            method = self.method,
+            path = self.path,
+            status = status,
+            elapsed_ms = duration.as_millis(),
+            ua = self.user_agent,
+            "request finished"
+        );
+        crate::SERVE_METRICS
+            .http_requests_total
+            .with_label_values([status])
+            .inc();
+        crate::SERVE_METRICS
+            .request_duration_secs
+            .with_label_values([status])
+            .observe(duration.as_secs_f64());
+    }
+}
+
+impl<F, B> Future for HttpMetricsFuture<F>
+where F: Future<Output = Result<http::Response<B>, std::convert::Infallible>>
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let result = ready!(this.inner.poll(cx));
+        *this.status = Some(match &result {
+            Ok(response) => response.status().as_str().to_owned(),
+            Err(infallible) => match *infallible {},
+        });
+        Poll::Ready(result)
     }
 }
 
@@ -132,19 +242,6 @@ pub(crate) async fn start_rest_server(
     readiness_trigger: BoxFutureInfaillible<()>,
     shutdown_signal: BoxFutureInfaillible<()>,
 ) -> anyhow::Result<()> {
-    let request_counter = warp::log::custom(|info: Info| {
-        let elapsed = info.elapsed();
-        let status = info.status();
-        let label_values: [&str; 2] = [info.method().as_str(), status.as_str()];
-        crate::SERVE_METRICS
-            .request_duration_secs
-            .with_label_values(label_values)
-            .observe(elapsed.as_secs_f64());
-        crate::SERVE_METRICS
-            .http_requests_total
-            .with_label_values(label_values)
-            .inc();
-    });
     // Docs routes
     let api_doc = warp::path("openapi.json")
         .and(warp::get())
@@ -199,7 +296,6 @@ pub(crate) async fn start_rest_server(
         .or(health_check_routes)
         .or(metrics_routes)
         .or(developer_routes)
-        .with(request_counter)
         .recover(recover_fn_final)
         .with(extra_headers)
         .boxed();
@@ -209,6 +305,7 @@ pub(crate) async fn start_rest_server(
     let cors = build_cors(&quickwit_services.node_config.rest_config.cors_allow_origins);
 
     let service = ServiceBuilder::new()
+        .layer(HttpMetricsLayer)
         .layer(
             CompressionLayer::new()
                 .zstd(true)
@@ -303,7 +400,10 @@ fn api_v1_routes(
             !disable_ingest_v1(),
             enable_ingest_v2(),
         )
-        .or(cluster_handler(quickwit_services.cluster.clone()))
+        .or(cluster_handler(
+            quickwit_services.cluster.clone(),
+            quickwit_services.control_plane_client.clone(),
+        ))
         .boxed()
         .or(node_info_handler(
             BuildInfo::get(),
@@ -313,6 +413,10 @@ fn api_v1_routes(
         .boxed()
         .or(indexing_get_handler(
             quickwit_services.indexing_service_opt.clone(),
+        ))
+        .boxed()
+        .or(swap_pipelines_handler(
+            quickwit_services.control_plane_client.clone(),
         ))
         .boxed()
         .or(search_routes(quickwit_services.search_service.clone()))
@@ -336,6 +440,11 @@ fn api_v1_routes(
         ))
         .boxed()
         .or(delete_task_api_handlers(
+            quickwit_services.metastore_client.clone(),
+        ))
+        .boxed()
+        .or(soft_delete_api_handlers(
+            quickwit_services.search_service.clone(),
             quickwit_services.metastore_client.clone(),
         ))
         .boxed()

@@ -14,6 +14,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::vec;
 
 use assert_json_diff::{assert_json_eq, assert_json_include};
 use quickwit_config::SearcherConfig;
@@ -22,8 +23,8 @@ use quickwit_doc_mapper::tag_pruning::extract_tags_from_query;
 use quickwit_indexing::TestSandbox;
 use quickwit_opentelemetry::otlp::TraceId;
 use quickwit_proto::search::{
-    LeafListTermsResponse, ListTermsRequest, SearchRequest, SortByValue, SortField, SortOrder,
-    SortValue,
+    CountHits, LeafListTermsResponse, ListTermsRequest, PartialHit, SearchRequest, SortByValue,
+    SortDatetimeFormat, SortField, SortOrder, SortValue,
 };
 use quickwit_query::query_ast::{
     QueryAst, qast_helper, qast_json_helper, query_ast_from_user_text,
@@ -37,6 +38,7 @@ use self::leaf::single_doc_mapping_leaf_search;
 use super::*;
 use crate::find_trace_ids_collector::Span;
 use crate::list_terms::leaf_list_terms;
+use crate::query_cost_classifier::QueryCostClass;
 use crate::service::SearcherContext;
 use crate::single_node_search;
 
@@ -179,7 +181,8 @@ async fn test_single_search_with_snippet() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn slop_search_and_check(
+/// Search with "body" as default field and assert expected number of matches.
+async fn search_and_check(
     test_sandbox: &TestSandbox,
     index_id: &str,
     query: &str,
@@ -234,30 +237,95 @@ async fn test_slop_queries() {
     ];
     test_sandbox.add_documents(docs.clone()).await.unwrap();
 
-    slop_search_and_check(&test_sandbox, index_id, "\"small bird\"~2", 0)
+    search_and_check(&test_sandbox, index_id, "\"small bird\"~2", 0)
         .await
         .unwrap();
-    slop_search_and_check(&test_sandbox, index_id, "\"red bike\"~2", 1)
+    search_and_check(&test_sandbox, index_id, "\"red bike\"~2", 1)
         .await
         .unwrap();
-    slop_search_and_check(&test_sandbox, index_id, "\"small blue bike\"~3", 1)
+    search_and_check(&test_sandbox, index_id, "\"small blue bike\"~3", 1)
         .await
         .unwrap();
-    slop_search_and_check(&test_sandbox, index_id, "\"small bike\"", 1)
+    search_and_check(&test_sandbox, index_id, "\"small bike\"", 1)
         .await
         .unwrap();
-    slop_search_and_check(&test_sandbox, index_id, "\"small bike\"~1", 2)
+    search_and_check(&test_sandbox, index_id, "\"small bike\"~1", 2)
         .await
         .unwrap();
-    slop_search_and_check(&test_sandbox, index_id, "\"small bike\"~2", 2)
+    search_and_check(&test_sandbox, index_id, "\"small bike\"~2", 2)
         .await
         .unwrap();
-    slop_search_and_check(&test_sandbox, index_id, "\"small bike\"~3", 3)
+    search_and_check(&test_sandbox, index_id, "\"small bike\"~3", 3)
         .await
         .unwrap();
-    slop_search_and_check(&test_sandbox, index_id, "\"tiny shelter\"~3", 1)
+    search_and_check(&test_sandbox, index_id, "\"tiny shelter\"~3", 1)
         .await
         .unwrap();
+    test_sandbox.assert_quit().await;
+}
+
+#[tokio::test]
+async fn test_multi_term_queries() {
+    let index_id = "multi-term-query";
+    let doc_mapping_yaml = r#"
+            field_mappings:
+              - name: title
+                type: text
+              - name: body
+                type: text
+                record: position
+        "#;
+
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"])
+        .await
+        .unwrap();
+    let docs = vec![
+        json!({"title": "one", "body": "a red bike"}),
+        json!({"title": "two", "body": "a small blue bike"}),
+        json!({"title": "three", "body": "a small, rusty, and yellow bike"}),
+        json!({"title": "four", "body": "fred's small bike"}),
+        json!({"title": "five", "body": "a tiny shelter"}),
+    ];
+    test_sandbox.add_documents(docs.clone()).await.unwrap();
+
+    search_and_check(
+        &test_sandbox,
+        index_id,
+        "IN [red blue green yellow pink black]",
+        3,
+    )
+    .await
+    .unwrap();
+
+    search_and_check(&test_sandbox, index_id, "IN [aaaa]", 0)
+        .await
+        .unwrap();
+
+    search_and_check(&test_sandbox, index_id, "IN [red]", 1)
+        .await
+        .unwrap();
+
+    search_and_check(&test_sandbox, index_id, "IN [zzzz]", 0)
+        .await
+        .unwrap();
+
+    search_and_check(
+        &test_sandbox,
+        index_id,
+        "red OR blue OR green OR yellow OR pink OR black",
+        3,
+    )
+    .await
+    .unwrap();
+
+    search_and_check(&test_sandbox, index_id, "red AND \"small bike\"", 0)
+        .await
+        .unwrap();
+
+    search_and_check(&test_sandbox, index_id, "bike AND \"small bike\"", 1)
+        .await
+        .unwrap();
+
     test_sandbox.assert_quit().await;
 }
 
@@ -371,7 +439,8 @@ async fn test_single_node_filtering() -> anyhow::Result<()> {
         test_sandbox.metastore(),
         test_sandbox.storage_resolver(),
     )
-    .await?;
+    .await
+    .unwrap();
     assert_eq!(single_node_response.num_hits, 10);
     assert_eq!(single_node_response.hits.len(), 10);
     assert!(&single_node_response.hits[0].json.contains("t:19"));
@@ -395,7 +464,8 @@ async fn test_single_node_filtering() -> anyhow::Result<()> {
         test_sandbox.metastore(),
         test_sandbox.storage_resolver(),
     )
-    .await?;
+    .await
+    .unwrap();
     assert_eq!(single_node_response.num_hits, 19);
     assert_eq!(single_node_response.hits.len(), 19);
     assert!(&single_node_response.hits[0].json.contains("t:19"));
@@ -890,7 +960,7 @@ async fn test_sort_by_2_field() {
 }
 
 #[tokio::test]
-async fn test_single_node_invalid_sorting_with_query() {
+async fn test_sort_by_text() {
     let index_id = "single-node-invalid-sorting";
     let doc_mapping_yaml = r#"
             field_mappings:
@@ -906,7 +976,7 @@ async fn test_single_node_invalid_sorting_with_query() {
 
     let mut docs = Vec::new();
     for i in 0..30 {
-        let description = format!("city info-{}", i + 1);
+        let description = format!("city info-{:02}", i + 1);
         docs.push(json!({"description": description, "ts": i+1, "temperature": i+32}));
     }
     test_sandbox.add_documents(docs).await.unwrap();
@@ -927,13 +997,19 @@ async fn test_single_node_invalid_sorting_with_query() {
         test_sandbox.metastore(),
         test_sandbox.storage_resolver(),
     )
-    .await;
-    assert!(single_node_response.is_err());
-    let error_msg = single_node_response.unwrap_err().to_string();
-    assert_eq!(
-        error_msg,
-        "Invalid argument: sort by field on type text is currently not supported `description`"
-    );
+    .await
+    .unwrap();
+
+    assert_eq!(single_node_response.num_hits, 30);
+    assert_eq!(single_node_response.hits.len(), 15);
+    assert!(single_node_response.hits.windows(2).all(|hits| {
+        let hit0: JsonValue = serde_json::from_str(&hits[0].json).unwrap();
+        let hit1: JsonValue = serde_json::from_str(&hits[1].json).unwrap();
+        hit0["description"].as_str().unwrap() >= hit1["description"].as_str().unwrap()
+    }));
+    assert!(single_node_response.hits[0].json.contains("city info-30"));
+    assert!(single_node_response.hits[14].json.contains("city info-16"));
+
     test_sandbox.assert_quit().await;
 }
 
@@ -961,16 +1037,26 @@ async fn test_single_node_split_pruning_by_tags() -> anyhow::Result<()> {
     }
 
     let query_ast: QueryAst = qast_helper("owner:francois", &[]);
+    let tag_fields: BTreeSet<String> = [String::from("owner")].into_iter().collect();
 
     let selected_splits = list_relevant_splits(
         vec![index_uid.clone()],
         None,
         None,
-        extract_tags_from_query(query_ast),
+        extract_tags_from_query(query_ast.clone(), Some(&tag_fields)),
         &mut test_sandbox.metastore(),
     )
     .await?;
     assert!(selected_splits.is_empty());
+    let selected_splits = list_relevant_splits(
+        vec![index_uid.clone()],
+        None,
+        None,
+        extract_tags_from_query(query_ast, Some(&BTreeSet::new())),
+        &mut test_sandbox.metastore(),
+    )
+    .await?;
+    assert_eq!(selected_splits.len(), 2);
 
     let query_ast: QueryAst = qast_helper("", &[]);
 
@@ -978,7 +1064,17 @@ async fn test_single_node_split_pruning_by_tags() -> anyhow::Result<()> {
         vec![index_uid.clone()],
         None,
         None,
-        extract_tags_from_query(query_ast),
+        extract_tags_from_query(query_ast.clone(), Some(&tag_fields)),
+        &mut test_sandbox.metastore(),
+    )
+    .await?;
+    assert_eq!(selected_splits.len(), 2);
+
+    let selected_splits = list_relevant_splits(
+        vec![index_uid.clone()],
+        None,
+        None,
+        extract_tags_from_query(query_ast, Some(&BTreeSet::new())),
         &mut test_sandbox.metastore(),
     )
     .await?;
@@ -990,7 +1086,7 @@ async fn test_single_node_split_pruning_by_tags() -> anyhow::Result<()> {
         vec![index_uid.clone()],
         None,
         None,
-        extract_tags_from_query(query_ast),
+        extract_tags_from_query(query_ast, Some(&tag_fields)),
         &mut test_sandbox.metastore(),
     )
     .await?;
@@ -1030,7 +1126,7 @@ async fn test_search_util(test_sandbox: &TestSandbox, query: &str) -> Vec<u32> {
         ..Default::default()
     });
     let searcher_context: Arc<SearcherContext> =
-        Arc::new(SearcherContext::new(SearcherConfig::default(), None));
+        Arc::new(SearcherContext::new(SearcherConfig::default(), None, None));
 
     let agg_limits = searcher_context.get_aggregation_limits();
 
@@ -1041,7 +1137,7 @@ async fn test_search_util(test_sandbox: &TestSandbox, query: &str) -> Vec<u32> {
         splits_offsets,
         test_sandbox.doc_mapper(),
         agg_limits,
-        false,
+        QueryCostClass::Regular,
     )
     .await
     .unwrap();
@@ -1671,7 +1767,7 @@ async fn test_single_node_list_terms() -> anyhow::Result<()> {
         .into_iter()
         .map(|split| extract_split_and_footer_offsets(&split.split_metadata))
         .collect();
-    let searcher_context = Arc::new(SearcherContext::new(SearcherConfig::default(), None));
+    let searcher_context = Arc::new(SearcherContext::new(SearcherConfig::default(), None, None));
 
     {
         let request = ListTermsRequest {
@@ -1886,4 +1982,762 @@ fn test_global_doc_address_ser_deser() {
     let doc_address_string = doc_address.to_string();
     let doc_address_deser: GlobalDocAddress = doc_address_string.parse().unwrap();
     assert_eq!(doc_address_deser, doc_address);
+}
+
+#[tokio::test]
+async fn test_single_node_soft_delete_excludes_from_search() -> anyhow::Result<()> {
+    use quickwit_metastore::IndexMetadataResponseExt;
+    use quickwit_proto::metastore::{
+        IndexMetadataRequest, MetastoreService, SoftDeleteDocumentsRequest, SplitDocIds,
+    };
+
+    let index_id = "test-soft-delete-search";
+    let doc_mapping_yaml = r#"
+        field_mappings:
+          - name: title
+            type: text
+    "#;
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["title"]).await?;
+    let docs = vec![
+        json!({"title": "alpha"}),
+        json!({"title": "beta"}),
+        json!({"title": "gamma"}),
+    ];
+    test_sandbox.add_documents(docs).await?;
+
+    // Search all — should find 3
+    let search_request = SearchRequest {
+        index_id_patterns: vec![index_id.to_string()],
+        query_ast: qast_json_helper("*", &["title"]),
+        max_hits: 10,
+        ..Default::default()
+    };
+    let result = single_node_search(
+        search_request.clone(),
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(result.num_hits, 3);
+
+    // Search for "alpha" specifically to find its doc_id and split_id
+    let alpha_request = SearchRequest {
+        index_id_patterns: vec![index_id.to_string()],
+        query_ast: qast_json_helper("alpha", &["title"]),
+        max_hits: 10,
+        ..Default::default()
+    };
+    let alpha_result = single_node_search(
+        alpha_request,
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(alpha_result.num_hits, 1);
+    let alpha_hit = &alpha_result.hits[0];
+    let partial_hit = alpha_hit.partial_hit.as_ref().unwrap();
+    let split_id = partial_hit.split_id.clone();
+    let doc_id = partial_hit.doc_id;
+
+    // Soft-delete that document via the metastore
+    let index_uid = test_sandbox
+        .metastore()
+        .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
+        .await?
+        .deserialize_index_metadata()?
+        .index_uid;
+
+    let metastore = test_sandbox.metastore();
+    metastore
+        .soft_delete_documents(SoftDeleteDocumentsRequest {
+            index_uid: Some(index_uid),
+            split_doc_ids: vec![SplitDocIds {
+                split_id: split_id.clone(),
+                doc_ids: vec![doc_id],
+            }],
+        })
+        .await?;
+
+    // Search all again — should find only 2
+    let result = single_node_search(
+        search_request,
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(result.num_hits, 2);
+
+    // Verify that the soft-deleted document ("alpha") is not in the results
+    for hit in &result.hits {
+        let hit_json: JsonValue = serde_json::from_str(&hit.json)?;
+        assert_ne!(hit_json["title"], "alpha");
+    }
+
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_single_node_soft_delete_count_only() -> anyhow::Result<()> {
+    use quickwit_metastore::IndexMetadataResponseExt;
+    use quickwit_proto::metastore::{
+        IndexMetadataRequest, MetastoreService, SoftDeleteDocumentsRequest, SplitDocIds,
+    };
+
+    let index_id = "test-soft-delete-count-only";
+    let doc_mapping_yaml = r#"
+        field_mappings:
+          - name: title
+            type: text
+    "#;
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["title"]).await?;
+    let docs = vec![
+        json!({"title": "alpha"}),
+        json!({"title": "beta"}),
+        json!({"title": "gamma"}),
+    ];
+    test_sandbox.add_documents(docs).await?;
+
+    // Count-only search (max_hits: 0) — should find 3
+    let count_request = SearchRequest {
+        index_id_patterns: vec![index_id.to_string()],
+        query_ast: qast_json_helper("*", &["title"]),
+        max_hits: 0,
+        ..Default::default()
+    };
+    let result = single_node_search(
+        count_request.clone(),
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(result.num_hits, 3);
+    assert!(result.hits.is_empty());
+
+    // Find the doc_id for "alpha" so we can soft-delete it
+    let alpha_request = SearchRequest {
+        index_id_patterns: vec![index_id.to_string()],
+        query_ast: qast_json_helper("alpha", &["title"]),
+        max_hits: 10,
+        ..Default::default()
+    };
+    let alpha_result = single_node_search(
+        alpha_request,
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(alpha_result.num_hits, 1);
+    let partial_hit = alpha_result.hits[0].partial_hit.as_ref().unwrap();
+    let split_id = partial_hit.split_id.clone();
+    let doc_id = partial_hit.doc_id;
+
+    // Soft-delete that document via the metastore
+    let index_uid = test_sandbox
+        .metastore()
+        .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
+        .await?
+        .deserialize_index_metadata()?
+        .index_uid;
+
+    let metastore = test_sandbox.metastore();
+    metastore
+        .soft_delete_documents(SoftDeleteDocumentsRequest {
+            index_uid: Some(index_uid),
+            split_doc_ids: vec![SplitDocIds {
+                split_id,
+                doc_ids: vec![doc_id],
+            }],
+        })
+        .await?;
+
+    // Count-only search again — should find only 2
+    let result = single_node_search(
+        count_request,
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(result.num_hits, 2);
+    assert!(result.hits.is_empty());
+
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+/// Regression test: the `is_count_only` path (non-MatchAll query with max_hits=0) was calling
+/// `query.count(&searcher)` which bypasses Quickwit's soft-delete filter entirely.
+/// MatchAll + max_hits=0 goes through `is_metadata_count_request_with_ast` (already correct);
+/// this test specifically exercises the `is_count_only` branch with a real term query.
+#[tokio::test]
+async fn test_single_node_soft_delete_count_only_term_query() -> anyhow::Result<()> {
+    use quickwit_metastore::IndexMetadataResponseExt;
+    use quickwit_proto::metastore::{
+        IndexMetadataRequest, MetastoreService, SoftDeleteDocumentsRequest, SplitDocIds,
+    };
+
+    let index_id = "test-soft-delete-count-only-term-query";
+    let doc_mapping_yaml = r#"
+        field_mappings:
+          - name: title
+            type: text
+    "#;
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["title"]).await?;
+    let docs = vec![
+        json!({"title": "alpha"}),
+        json!({"title": "beta"}),
+        json!({"title": "gamma"}),
+    ];
+    test_sandbox.add_documents(docs).await?;
+
+    // Use a non-MatchAll query so that the `is_count_only` branch is taken instead of
+    // `is_metadata_count_request_with_ast`. "alpha OR beta OR gamma" matches all 3 docs
+    // but is not `QueryAst::MatchAll`.
+    let count_request = SearchRequest {
+        index_id_patterns: vec![index_id.to_string()],
+        query_ast: qast_json_helper("alpha OR beta OR gamma", &["title"]),
+        max_hits: 0,
+        ..Default::default()
+    };
+    let result = single_node_search(
+        count_request.clone(),
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(result.num_hits, 3);
+    assert!(result.hits.is_empty());
+
+    // Locate the doc_id for "alpha" so we can soft-delete it.
+    let alpha_result = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("alpha", &["title"]),
+            max_hits: 10,
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(alpha_result.num_hits, 1);
+    let partial_hit = alpha_result.hits[0].partial_hit.as_ref().unwrap();
+    let split_id = partial_hit.split_id.clone();
+    let doc_id = partial_hit.doc_id;
+
+    // Soft-delete the "alpha" document.
+    let index_uid = test_sandbox
+        .metastore()
+        .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
+        .await?
+        .deserialize_index_metadata()?
+        .index_uid;
+    test_sandbox
+        .metastore()
+        .soft_delete_documents(SoftDeleteDocumentsRequest {
+            index_uid: Some(index_uid),
+            split_doc_ids: vec![SplitDocIds {
+                split_id,
+                doc_ids: vec![doc_id],
+            }],
+        })
+        .await?;
+
+    // Count-only term query: before the fix this returned 3 (soft-deleted doc was counted);
+    // after the fix it must return 2.
+    let result = single_node_search(
+        count_request,
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(result.num_hits, 2);
+    assert!(result.hits.is_empty());
+
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+/// Tests that when sorting by a datetime field with `sort_datetime_format` set to millis:
+/// 1. The sort values returned in `partial_hit` are in milliseconds (not nanoseconds).
+/// 2. Those values can be fed back as `search_after` to retrieve the next page correctly.
+#[tokio::test]
+async fn test_sort_by_datetime_format_millis_and_search_after() -> anyhow::Result<()> {
+    let index_id = "sort-datetime-millis-search-after";
+    let doc_mapping_yaml = r#"
+            field_mappings:
+              - name: ts
+                type: datetime
+                fast: true
+              - name: body
+                type: text
+            timestamp_field: ts
+        "#;
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"]).await?;
+
+    // Index 10 documents with timestamps 100_000_000_000 .. 100_000_009_000 ms since epoch.
+    let base_secs: i64 = 100_000_000;
+    let docs: Vec<_> = (0..10)
+        .map(|i| json!({"ts": base_secs + i, "body": format!("doc {i}")}))
+        .collect();
+    test_sandbox.add_documents(docs).await?;
+
+    let sort_field = SortField {
+        field_name: "ts".to_string(),
+        sort_order: SortOrder::Desc as i32,
+        sort_datetime_format: Some(SortDatetimeFormat::UnixTimestampMillis as i32),
+    };
+
+    // Page 1: top 5 hits sorted by ts desc with millis output
+    let page1 = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("*", &["body"]),
+            max_hits: 5,
+            sort_fields: vec![sort_field.clone()],
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+
+    assert_eq!(page1.num_hits, 10);
+    assert_eq!(page1.hits.len(), 5);
+
+    // Verify sort values are in milliseconds (not nanoseconds)
+    let expected_millis: Vec<i64> = (5..10).rev().map(|i| (base_secs + i) * 1_000).collect();
+    let actual_millis: Vec<i64> = page1
+        .hits
+        .iter()
+        .map(|hit| {
+            let partial_hit = hit.partial_hit.as_ref().unwrap();
+            match &partial_hit.sort_value.as_ref().unwrap().sort_value {
+                Some(SortValue::I64(ms)) => *ms,
+                other => panic!("expected I64 sort value in millis, got {other:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(actual_millis, expected_millis);
+
+    // Page 2: use the last hit's sort value as search_after
+    let last_hit = page1.hits.last().unwrap().partial_hit.as_ref().unwrap();
+    let search_after = PartialHit {
+        sort_value: last_hit.sort_value.clone(),
+        sort_value2: None,
+        split_id: String::new(),
+        segment_ord: 0,
+        doc_id: 0,
+    };
+
+    let page2 = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("*", &["body"]),
+            max_hits: 5,
+            sort_fields: vec![sort_field],
+            search_after: Some(search_after),
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+
+    assert_eq!(page2.hits.len(), 5);
+    // Page 2 should contain docs with timestamps base_secs+4 down to base_secs+0 in millis
+    let expected_millis_page2: Vec<i64> = (0..5).rev().map(|i| (base_secs + i) * 1_000).collect();
+    let actual_millis_page2: Vec<i64> = page2
+        .hits
+        .iter()
+        .map(|hit| {
+            let partial_hit = hit.partial_hit.as_ref().unwrap();
+            match &partial_hit.sort_value.as_ref().unwrap().sort_value {
+                Some(SortValue::I64(ms)) => *ms,
+                other => panic!("expected I64 sort value in millis, got {other:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(actual_millis_page2, expected_millis_page2);
+
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sort_by_dynamic_with_datetime_page_fails() -> anyhow::Result<()> {
+    let index_id = "sort-dynamic-datetime-page-fails";
+    let doc_mapping_yaml = r#"
+            field_mappings:
+              - name: ts
+                type: datetime
+                fast: true
+            mode: dynamic
+            dynamic_mapping:
+                fast: true
+            timestamp_field: ts
+        "#;
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"]).await?;
+
+    let docs = [
+        json!({"ts": 100_000_001, "my_dynamic_field": 2024}),
+        json!({"ts": 100_000_002, "my_dynamic_field": "2024-03-30T00:00:00Z"}),
+        json!({"ts": 100_000_001, "my_dynamic_field": 2025}),
+        json!({"ts": 100_000_002, "my_dynamic_field": "2025-03-30T00:00:00Z"}),
+        json!({"ts": 100_000_001, "my_dynamic_field": 2026}),
+        json!({"ts": 100_000_002, "my_dynamic_field": "2026-03-30T00:00:00Z"}),
+    ];
+    test_sandbox.add_documents(docs).await?;
+
+    let sort_field = SortField {
+        field_name: "my_dynamic_field".to_string(),
+        sort_order: SortOrder::Desc as i32,
+        ..Default::default()
+    };
+
+    // Page 1: sort should work even on a dynamic field with a datetime column
+    // values for the first page
+    let page1 = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("*", &["body"]),
+            max_hits: 5,
+            sort_fields: vec![sort_field.clone()],
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+
+    assert_eq!(page1.num_hits, 6);
+    assert_eq!(page1.hits.len(), 5);
+
+    // Verify sort values are in milliseconds (not nanoseconds)
+    let page_1_sort_values: Vec<_> = page1
+        .hits
+        .iter()
+        .map(|hit| {
+            &hit.partial_hit
+                .as_ref()
+                .unwrap()
+                .sort_value
+                .as_ref()
+                .unwrap()
+                .sort_value
+        })
+        .collect();
+    assert_eq!(
+        page_1_sort_values,
+        vec![
+            &Some(SortValue::Datetime(1774828800000000000)),
+            &Some(SortValue::Datetime(1743292800000000000)),
+            &Some(SortValue::Datetime(1711756800000000000)),
+            &Some(SortValue::I64(2026)),
+            &Some(SortValue::I64(2025)),
+        ]
+    );
+
+    // Page 2: search after not yet supported
+    let last_hit = page1.hits.last().unwrap().partial_hit.as_ref().unwrap();
+    let search_after = PartialHit {
+        sort_value: last_hit.sort_value.clone(),
+        sort_value2: None,
+        split_id: String::new(),
+        segment_ord: 0,
+        doc_id: 0,
+    };
+
+    let page2 = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("*", &["body"]),
+            max_hits: 5,
+            sort_fields: vec![sort_field],
+            search_after: Some(search_after),
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page2.failed_splits.len(), 1);
+    assert_eq!(page2.hits.len(), 0);
+
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sort_by_two_fields_with_null() -> anyhow::Result<()> {
+    let index_id = "sort-datetime-millis-search-after";
+    let doc_mapping_yaml = r#"
+            field_mappings:
+              - name: ts
+                type: datetime
+                fast: true
+              - name: body
+                type: text
+                fast: true
+            timestamp_field: ts
+        "#;
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"]).await?;
+
+    // timestamps with 10 digits should be interpreted as secs
+    let docs: Vec<_> = vec![
+        json!({"ts": 1_000_000_001i64, "body": format!("doc 9")}),
+        json!({"ts": 1_000_000_002i64, "body": format!("doc 8")}),
+        json!({"ts": 1_000_000_003i64, "body": format!("doc 7")}),
+        json!({"ts": 1_000_000_004i64}),
+        json!({"ts": 1_000_000_005i64}),
+        json!({"ts": 1_000_000_006i64}),
+    ];
+    test_sandbox.add_documents(docs).await?;
+
+    let sort_fields = vec![
+        SortField {
+            field_name: "body".to_string(),
+            sort_order: SortOrder::Asc as i32,
+            ..Default::default()
+        },
+        SortField {
+            field_name: "ts".to_string(),
+            sort_order: SortOrder::Asc as i32,
+            sort_datetime_format: Some(SortDatetimeFormat::UnixTimestampMillis as i32),
+        },
+    ];
+
+    let page1 = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("*", &["body"]),
+            max_hits: 5,
+            sort_fields: sort_fields.clone(),
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+
+    assert_eq!(page1.num_hits, 6);
+    assert_eq!(page1.hits.len(), 5);
+    let page_1_hits = page1
+        .hits
+        .iter()
+        .map(|hit| hit.partial_hit.clone().unwrap())
+        .collect::<Vec<_>>();
+    let split_id = page_1_hits[0].split_id.clone();
+    // for the timestamp field we convert to sort_datetime_format repr as I64
+    assert_eq!(
+        page_1_hits,
+        vec![
+            PartialHit {
+                sort_value: Some(SortValue::Str("doc 7".to_string()).into()),
+                sort_value2: Some(SortValue::I64(1_000_000_003_000).into()),
+                split_id: split_id.clone(),
+                segment_ord: 0,
+                doc_id: 2,
+            },
+            PartialHit {
+                sort_value: Some(SortValue::Str("doc 8".to_string()).into()),
+                sort_value2: Some(SortValue::I64(1_000_000_002_000).into()),
+                split_id: split_id.clone(),
+                segment_ord: 0,
+                doc_id: 1,
+            },
+            PartialHit {
+                sort_value: Some(SortValue::Str("doc 9".to_string()).into()),
+                sort_value2: Some(SortValue::I64(1_000_000_001_000).into()),
+                split_id: split_id.clone(),
+                segment_ord: 0,
+                doc_id: 0,
+            },
+            PartialHit {
+                sort_value: Some(SortByValue { sort_value: None }),
+                sort_value2: Some(SortValue::I64(1_000_000_004_000).into()),
+                split_id: split_id.clone(),
+                segment_ord: 0,
+                doc_id: 3,
+            },
+            PartialHit {
+                sort_value: Some(SortByValue { sort_value: None }),
+                sort_value2: Some(SortValue::I64(1_000_000_005_000).into()),
+                split_id: split_id.clone(),
+                segment_ord: 0,
+                doc_id: 4,
+            },
+        ]
+    );
+
+    let page2 = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("*", &["body"]),
+            max_hits: 5,
+            sort_fields: sort_fields.clone(),
+            search_after: Some(page_1_hits[4].clone()),
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page2.num_hits, 6);
+    assert_eq!(page2.hits.len(), 1);
+    let page_2_hits = page2
+        .hits
+        .iter()
+        .map(|hit| hit.partial_hit.clone().unwrap())
+        .collect::<Vec<_>>();
+    let split_id = page_2_hits[0].split_id.clone();
+    // for the timestamp field we convert to sort_datetime_format repr as I64
+    assert_eq!(
+        page_2_hits,
+        vec![PartialHit {
+            sort_value: Some(SortByValue { sort_value: None }),
+            sort_value2: Some(SortValue::I64(1_000_000_006_000).into()),
+            split_id: split_id.clone(),
+            segment_ord: 0,
+            doc_id: 5,
+        },]
+    );
+
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_single_node_splits_by_outcome() -> anyhow::Result<()> {
+    let index_id = "test-splits-by-outcome";
+    let doc_mapping_yaml = r#"
+            field_mappings:
+              - name: body
+                type: text
+              - name: ts
+                type: datetime
+                input_formats:
+                    - "rfc3339"
+                    - "unix_timestamp"
+                fast: true
+            timestamp_field: ts
+            mode: lenient
+        "#;
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"]).await?;
+
+    // Three splits with non-overlapping timestamp ranges
+    let base_ts = OffsetDateTime::now_utc().unix_timestamp();
+    test_sandbox
+        .add_documents(vec![
+            json!({"body": "old doc 1", "ts": base_ts - 2_000_000}),
+            json!({"body": "old doc 2", "ts": base_ts - 1_999_999}),
+        ])
+        .await?;
+    test_sandbox
+        .add_documents(vec![
+            json!({"body": "mid doc 1", "ts": base_ts - 1_000_000}),
+            json!({"body": "mid doc 2", "ts": base_ts - 999_999}),
+        ])
+        .await?;
+    test_sandbox
+        .add_documents(vec![
+            json!({"body": "new doc 1", "ts": base_ts}),
+            json!({"body": "new doc 2", "ts": base_ts + 1}),
+        ])
+        .await?;
+
+    // All 3 splits should be processed for an unrestricted search.
+    let response = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper("doc", &["body"]),
+            max_hits: 10,
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(response.num_hits, 6);
+    let outcomes = response.splits_by_outcome.unwrap();
+    assert_eq!(outcomes.processed, 3, "all 3 splits should be processed");
+    assert_eq!(outcomes.pruned_before_warmup, 0);
+    assert_eq!(outcomes.cancel_before_warmup, 0);
+    assert_eq!(outcomes.cancel_warmup, 0);
+    assert_eq!(outcomes.cancel_cpu_queue, 0);
+    assert_eq!(outcomes.cancel_cpu, 0);
+
+    // With MatchAll, we expect an early optimization that prevents the
+    // processing of older splits.
+    let response = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: serde_json::to_string(&QueryAst::MatchAll).unwrap(),
+            max_hits: 1,
+            count_hits: CountHits::Underestimate as i32,
+            sort_fields: vec![SortField {
+                field_name: "ts".to_string(),
+                sort_order: SortOrder::Desc as i32,
+                sort_datetime_format: None,
+            }],
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(response.num_hits, 2);
+    let outcomes = response.splits_by_outcome.unwrap();
+    assert_eq!(outcomes.processed, 1);
+    assert_eq!(outcomes.pruned_before_warmup, 2);
+
+    // MatchAll + max_hits=0 + CountAll triggers the metadata-count fast path: the split's
+    // stored num_docs is used directly without opening the tantivy index.
+    let response = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: serde_json::to_string(&QueryAst::MatchAll).unwrap(),
+            max_hits: 0,
+            count_hits: CountHits::CountAll as i32,
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(response.num_hits, 6);
+    let outcomes = response.splits_by_outcome.unwrap();
+    assert_eq!(outcomes.processed_from_metadata, 3);
+    assert_eq!(outcomes.processed, 0);
+    assert_eq!(outcomes.pruned_before_warmup, 0);
+
+    // MatchAll with a time range that fully covers 1 split but only partially
+    // overlaps the 2 others
+    let response = single_node_search(
+        SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: serde_json::to_string(&QueryAst::MatchAll).unwrap(),
+            max_hits: 0,
+            count_hits: CountHits::CountAll as i32,
+            start_timestamp: Some(base_ts - 1_999_999),
+            end_timestamp: Some(base_ts + 1),
+            ..Default::default()
+        },
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    // split 1: 1 doc (base_ts-1_999_999), split 2: 2 docs, split 3: 1 doc (base_ts)
+    assert_eq!(response.num_hits, 4);
+    let outcomes = response.splits_by_outcome.unwrap();
+    assert_eq!(outcomes.processed_from_metadata, 1);
+    assert_eq!(outcomes.processed, 2);
+    assert_eq!(outcomes.pruned_before_warmup, 0);
+
+    test_sandbox.assert_quit().await;
+    Ok(())
 }

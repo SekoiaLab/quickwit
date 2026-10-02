@@ -217,7 +217,10 @@ impl NodeConfigBuilder {
         mut self,
         env_vars: &HashMap<String, String>,
     ) -> anyhow::Result<NodeConfig> {
-        let node_id = self.node_id.resolve(env_vars).map(NodeId::new)?;
+        let node_id = self
+            .node_id
+            .resolve(env_vars)
+            .map(|s| NodeId::from_str(&s))?;
 
         let enabled_services = self
             .enabled_services
@@ -467,7 +470,7 @@ pub fn node_config_for_tests_from_ports(
     rest_listen_port: u16,
     grpc_listen_port: u16,
 ) -> NodeConfig {
-    let node_id = NodeId::new(default_node_id().unwrap());
+    let node_id = NodeId::from_str(&default_node_id().unwrap());
     let enabled_services = QuickwitService::supported_services();
     let listen_address = Host::default();
     let rest_listen_addr = listen_address
@@ -531,6 +534,7 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+    use crate::CacheConfig;
     use crate::storage_config::StorageBackendFlavor;
 
     fn get_config_filepath(config_filename: &str) -> String {
@@ -658,10 +662,11 @@ mod tests {
             SearcherConfig {
                 aggregation_memory_limit: ByteSize::gb(1),
                 aggregation_bucket_limit: 500_000,
-                fast_field_cache_capacity: ByteSize::gb(10),
-                split_footer_cache_capacity: ByteSize::gb(1),
-                partial_request_cache_capacity: ByteSize::mb(64),
-                predicate_cache_capacity: ByteSize::mb(256),
+                fast_field_cache: CacheConfig::default_with_capacity(ByteSize::gb(10)),
+                split_footer_cache: CacheConfig::default_with_capacity(ByteSize::gb(1)),
+                split_footer_disk_cache_capacity: None,
+                partial_request_cache: CacheConfig::default_with_capacity(ByteSize::mb(64)),
+                predicate_cache: CacheConfig::default_with_capacity(ByteSize::mb(256)),
                 max_num_concurrent_split_searches: 150,
                 max_splits_per_search: None,
                 _max_num_concurrent_split_streams: Some(serde::de::IgnoredAny),
@@ -674,13 +679,6 @@ mod tests {
                 }),
                 warmup_memory_budget: ByteSize::gb(100),
                 warmup_single_split_initial_allocation: ByteSize::gb(1),
-
-                secondary_max_num_concurrent_split_searches: 50,
-                secondary_warmup_memory_budget: ByteSize::gb(50),
-                // Splits per leaf search above which the secondary queue is used. If not set, the
-                // secondary queue is never used.
-                secondary_targeted_split_count_threshold: None,
-                secondary_request_timeout_secs: NonZeroU64::new(30).unwrap(),
             }
         );
         assert_eq!(
@@ -744,7 +742,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(config.cluster_id, DEFAULT_CLUSTER_ID);
-        assert_eq!(config.node_id, get_short_hostname().unwrap());
+        assert_eq!(
+            config.node_id.as_str(),
+            get_short_hostname().unwrap().as_str()
+        );
         assert_eq!(
             config.enabled_services,
             QuickwitService::supported_services()

@@ -23,6 +23,9 @@ use quickwit_common::metrics::{
     linear_buckets, new_counter, new_counter_vec, new_gauge, new_gauge_vec, new_histogram,
     new_histogram_vec,
 };
+use quickwit_proto::search::SplitsByOutcome;
+
+use crate::query_cost_classifier::QueryCostClass;
 
 fn print_if_not_null(
     field_name: &'static str,
@@ -36,27 +39,32 @@ fn print_if_not_null(
     Ok(())
 }
 
+/// Counters to track the outcome of leaf search splits.
+///
+/// Cancellation counters cover two scenarios: errors in splits and timeouts.
 pub struct SplitSearchOutcomeCounters {
     pub cancel_before_warmup: IntCounter,
     pub cache_hit: IntCounter,
+    pub processed_from_metadata: IntCounter,
     pub pruned_before_warmup: IntCounter,
     pub cancel_warmup: IntCounter,
     pub pruned_after_warmup: IntCounter,
     pub cancel_cpu_queue: IntCounter,
     pub cancel_cpu: IntCounter,
-    pub success: IntCounter,
+    pub processed: IntCounter,
 }
 
 impl fmt::Display for SplitSearchOutcomeCounters {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         print_if_not_null("cancel_before_warmup", &self.cancel_before_warmup, f)?;
         print_if_not_null("cache_hit", &self.cache_hit, f)?;
+        print_if_not_null("processed_from_metadata", &self.processed_from_metadata, f)?;
         print_if_not_null("pruned_before_warmup", &self.pruned_before_warmup, f)?;
         print_if_not_null("cancel_warmup", &self.cancel_warmup, f)?;
         print_if_not_null("pruned_after_warmup", &self.pruned_after_warmup, f)?;
         print_if_not_null("cancel_cpu_queue", &self.cancel_cpu_queue, f)?;
         print_if_not_null("cancel_cpu", &self.cancel_cpu, f)?;
-        print_if_not_null("success", &self.success, f)?;
+        print_if_not_null("processed", &self.processed, f)?;
         Ok(())
     }
 }
@@ -92,6 +100,8 @@ impl SplitSearchOutcomeCounters {
             cancel_before_warmup: search_split_outcome_vec
                 .with_label_values(["cancel_before_warmup"]),
             cache_hit: search_split_outcome_vec.with_label_values(["cache_hit"]),
+            processed_from_metadata: search_split_outcome_vec
+                .with_label_values(["processed_from_metadata"]),
             pruned_before_warmup: search_split_outcome_vec
                 .with_label_values(["pruned_before_warmup"]),
             cancel_warmup: search_split_outcome_vec.with_label_values(["cancel_warmup"]),
@@ -99,31 +109,75 @@ impl SplitSearchOutcomeCounters {
                 .with_label_values(["pruned_after_warmup"]),
             cancel_cpu_queue: search_split_outcome_vec.with_label_values(["cancel_cpu_queue"]),
             cancel_cpu: search_split_outcome_vec.with_label_values(["cancel_cpu"]),
-            success: search_split_outcome_vec.with_label_values(["success"]),
+            processed: search_split_outcome_vec.with_label_values(["processed"]),
+        }
+    }
+
+    pub fn split_by_outcome(&self) -> SplitsByOutcome {
+        // Destructure to make sure we don't forget to update this if we add a
+        // new state.
+        let Self {
+            pruned_before_warmup,
+            pruned_after_warmup,
+            cancel_before_warmup,
+            cancel_warmup,
+            cancel_cpu_queue,
+            cancel_cpu,
+            processed,
+            processed_from_metadata,
+            cache_hit,
+        } = &self;
+        SplitsByOutcome {
+            pruned_before_warmup: pruned_before_warmup.get(),
+            pruned_after_warmup: pruned_after_warmup.get(),
+            cancel_before_warmup: cancel_before_warmup.get(),
+            cancel_warmup: cancel_warmup.get(),
+            cancel_cpu_queue: cancel_cpu_queue.get(),
+            cancel_cpu: cancel_cpu.get(),
+            processed: processed.get(),
+            processed_from_metadata: processed_from_metadata.get(),
+            cache_hit: cache_hit.get(),
         }
     }
 }
 
 pub struct SearchMetrics {
-    pub root_search_requests_total: IntCounterVec<1>,
-    pub root_search_request_duration_seconds: HistogramVec<1>,
-    pub root_search_targeted_splits: HistogramVec<1>,
+    pub root_search_requests_total: IntCounterVec<2>,
+    pub root_search_request_duration_seconds: HistogramVec<2>,
+    pub root_search_targeted_splits: HistogramVec<2>,
     pub leaf_search_requests_total: IntCounterVec<2>,
     pub leaf_search_request_duration_seconds: HistogramVec<2>,
     pub leaf_search_targeted_splits: HistogramVec<2>,
     pub leaf_list_terms_splits_total: IntCounter,
     pub split_search_outcome_total: SplitSearchOutcomeCounters,
-    pub leaf_search_split_duration_secs: HistogramVec<1>,
+    pub leaf_search_split_duration_secs: Histogram,
+    pub leaf_search_permit_wait_duration_secs: Histogram,
     pub job_assigned_total: IntCounterVec<1>,
-    pub leaf_search_single_split_tasks_pending: IntGauge,
-    pub leaf_search_single_split_tasks_ongoing: IntGauge,
-    pub leaf_search_single_split_secondary_tasks_pending: IntGauge,
-    pub leaf_search_single_split_secondary_tasks_ongoing: IntGauge,
+    pub leaf_search_single_split_tasks_pending: CostClassGauges,
+    pub leaf_search_single_split_tasks_ongoing: CostClassGauges,
     pub leaf_search_single_split_warmup_num_bytes: Histogram,
     pub searcher_local_kv_store_size_bytes: IntGauge,
 }
 
-/// From 0.008s to 131.072s
+/// A pair of gauges (or other cheap metric handle), one per [`QueryCostClass`].
+///
+/// Used to label the leaf search single split task pool / search permits
+/// gauges by the cost class of the query they are serving.
+pub struct CostClassGauges {
+    pub regular: IntGauge,
+    pub costly: IntGauge,
+}
+
+impl CostClassGauges {
+    pub fn get(&self, cost_class: QueryCostClass) -> &IntGauge {
+        match cost_class {
+            QueryCostClass::Regular => &self.regular,
+            QueryCostClass::Costly => &self.costly,
+        }
+    }
+}
+
+/// From 0.064s to 1048s
 fn duration_buckets() -> Vec<f64> {
     exponential_buckets(0.064, 2.0, 15).unwrap()
 }
@@ -155,12 +209,12 @@ impl Default for SearchMetrics {
 
         let leaf_search_single_split_tasks = new_gauge_vec::<2>(
             "leaf_search_single_split_tasks",
-            "Number of single split search tasks pending or ongoing",
+            "Number of single split search tasks pending or ongoing, by query cost class",
             "search",
             &[],
             [
                 "status", // "ongoing" or "pending"
-                "queue",  // "primary" or "secondary"
+                "cost_class",
             ],
         );
 
@@ -170,14 +224,14 @@ impl Default for SearchMetrics {
                 "Total number of root search gRPC requests processed.",
                 "search",
                 &[("kind", "server")],
-                ["status"],
+                ["user_agent", "status"],
             ),
             root_search_request_duration_seconds: new_histogram_vec(
                 "root_search_request_duration_seconds",
                 "Duration of root search gRPC requests in seconds.",
                 "search",
                 &[("kind", "server")],
-                ["status"],
+                ["user_agent", "status"],
                 duration_buckets(),
             ),
             root_search_targeted_splits: new_histogram_vec(
@@ -185,7 +239,7 @@ impl Default for SearchMetrics {
                 "Number of splits targeted per root search GRPC request.",
                 "search",
                 &[],
-                ["status"],
+                ["user_agent", "status"],
                 targeted_splits_buckets.clone(),
             ),
             leaf_search_requests_total: new_counter_vec(
@@ -193,14 +247,14 @@ impl Default for SearchMetrics {
                 "Total number of leaf search gRPC requests processed.",
                 "search",
                 &[("kind", "server")],
-                ["status", "queue"],
+                ["status", "cost_class"],
             ),
             leaf_search_request_duration_seconds: new_histogram_vec(
                 "leaf_search_request_duration_seconds",
                 "Duration of leaf search gRPC requests in seconds.",
                 "search",
                 &[("kind", "server")],
-                ["status", "queue"],
+                ["status", "cost_class"],
                 duration_buckets(),
             ),
             leaf_search_targeted_splits: new_histogram_vec(
@@ -208,7 +262,7 @@ impl Default for SearchMetrics {
                 "Number of splits targeted per leaf search GRPC request.",
                 "search",
                 &[],
-                ["status", "queue"],
+                ["status", "cost_class"],
                 targeted_splits_buckets,
             ),
 
@@ -219,24 +273,35 @@ impl Default for SearchMetrics {
                 &[],
             ),
             split_search_outcome_total: SplitSearchOutcomeCounters::new_registered(),
-            leaf_search_split_duration_secs: new_histogram_vec(
+            leaf_search_split_duration_secs: new_histogram(
                 "leaf_search_split_duration_secs",
                 "Number of seconds required to run a leaf search over a single split. The timer \
                  starts after the semaphore is obtained.",
                 "search",
-                &[],
-                ["queue"],
                 duration_buckets(),
             ),
+            leaf_search_permit_wait_duration_secs: new_histogram(
+                "leaf_search_permit_wait_duration_secs",
+                "Number of seconds a single split leaf search waited for a search permit, whether \
+                 it ended up acquiring it or gave up because the leaf request was cancelled or \
+                 timed out.",
+                "search",
+                // max resolution is 66s
+                exponential_buckets(0.001, 2.0, 17).unwrap(),
+            ),
             // we need to expose the gauges here to provide a static ref to for the gauge guards
-            leaf_search_single_split_tasks_ongoing: leaf_search_single_split_tasks
-                .with_label_values(["ongoing", "primary"]),
-            leaf_search_single_split_tasks_pending: leaf_search_single_split_tasks
-                .with_label_values(["pending", "primary"]),
-            leaf_search_single_split_secondary_tasks_ongoing: leaf_search_single_split_tasks
-                .with_label_values(["ongoing", "secondary"]),
-            leaf_search_single_split_secondary_tasks_pending: leaf_search_single_split_tasks
-                .with_label_values(["pending", "secondary"]),
+            leaf_search_single_split_tasks_ongoing: CostClassGauges {
+                regular: leaf_search_single_split_tasks
+                    .with_label_values(["ongoing", QueryCostClass::Regular.as_label()]),
+                costly: leaf_search_single_split_tasks
+                    .with_label_values(["ongoing", QueryCostClass::Costly.as_label()]),
+            },
+            leaf_search_single_split_tasks_pending: CostClassGauges {
+                regular: leaf_search_single_split_tasks
+                    .with_label_values(["pending", QueryCostClass::Regular.as_label()]),
+                costly: leaf_search_single_split_tasks
+                    .with_label_values(["pending", QueryCostClass::Costly.as_label()]),
+            },
             leaf_search_single_split_warmup_num_bytes: new_histogram(
                 "leaf_search_single_split_warmup_num_bytes",
                 "Size of the short lived cache for a single split once the warmup is done.",
@@ -261,19 +326,11 @@ impl Default for SearchMetrics {
     }
 }
 
-pub fn queue_label(is_broad_search: bool) -> &'static str {
-    if is_broad_search {
-        "secondary"
-    } else {
-        "primary"
-    }
-}
-
-/// Metrics for the various instances of permit providers.
+/// Metrics for the permit provider.
 #[derive(Clone)]
 pub struct SearchTaskMetrics {
-    pub ongoing_tasks: &'static IntGauge,
-    pub pending_tasks: &'static IntGauge,
+    pub ongoing_tasks: &'static CostClassGauges,
+    pub pending_tasks: &'static CostClassGauges,
 }
 
 impl SearchMetrics {
@@ -281,13 +338,6 @@ impl SearchMetrics {
         SearchTaskMetrics {
             ongoing_tasks: &self.leaf_search_single_split_tasks_ongoing,
             pending_tasks: &self.leaf_search_single_split_tasks_pending,
-        }
-    }
-
-    pub fn secondary_search_task_metrics(&'static self) -> SearchTaskMetrics {
-        SearchTaskMetrics {
-            ongoing_tasks: &self.leaf_search_single_split_secondary_tasks_ongoing,
-            pending_tasks: &self.leaf_search_single_split_secondary_tasks_pending,
         }
     }
 }

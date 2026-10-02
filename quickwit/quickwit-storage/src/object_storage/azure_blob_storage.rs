@@ -45,7 +45,11 @@ use tracing::{instrument, warn};
 
 use crate::debouncer::DebouncedStorage;
 use crate::metrics::object_storage_get_slice_in_flight_guards;
-use crate::metrics_wrappers::{ActionLabel, RequestMetricsWrapperExt, copy_with_download_metrics};
+use crate::metrics_wrappers::{
+    ActionLabel, DownloadKind, DownloadMetricsGuard, DownloadStatus, RequestMetricsWrapperExt,
+    coalesce_segments, copy_with_download_metrics,
+};
+use crate::stable_deref_bytes::into_owned_bytes;
 use crate::storage::SendableAsync;
 use crate::{
     BulkDeleteError, DeleteFailure, MultiPartPolicy, PutPayload, Storage, StorageError,
@@ -205,14 +209,19 @@ impl AzureBlobStorage {
         key_path.to_string_lossy().to_string()
     }
 
-    /// Downloads a blob as vector of bytes.
-    async fn get_to_vec(
+    /// Downloads a blob as `Bytes` — zero-copy when the blob arrives as a single segment.
+    async fn get_to_bytes(
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
-    ) -> StorageResult<Vec<u8>> {
+    ) -> StorageResult<Bytes> {
         let name = self.blob_name(path);
         let capacity = range_opt.as_ref().map(Range::len).unwrap_or(0);
+        let download_kind = if range_opt.is_some() {
+            DownloadKind::Slice
+        } else {
+            DownloadKind::Object
+        };
         retry(&self.retry_params, || async {
             let (mut response_stream, _in_flight_guards) = if let Some(range) = range_opt.as_ref() {
                 let stream = self
@@ -228,10 +237,8 @@ impl AzureBlobStorage {
                 let stream = self.container_client.blob_client(&name).get().into_stream();
                 (stream, None)
             };
-            let mut buf: Vec<u8> = Vec::with_capacity(capacity);
-            download_all(&mut response_stream, &mut buf).await?;
-
-            Result::<_, AzureErrorWrapper>::Ok(buf)
+            let bytes = download_all(&mut response_stream, download_kind).await?;
+            Result::<_, AzureErrorWrapper>::Ok(bytes)
         })
         .await
         .map_err(StorageError::from)
@@ -380,7 +387,8 @@ impl Storage for AzureBlobStorage {
                 .into_async_read()
                 .compat();
             let mut body_stream_reader = BufReader::new(chunk_response_body_stream);
-            copy_with_download_metrics(&mut body_stream_reader, output).await?;
+            copy_with_download_metrics(&mut body_stream_reader, output, DownloadKind::Object)
+                .await?;
         }
         output.flush().await?;
         Ok(())
@@ -444,9 +452,9 @@ impl Storage for AzureBlobStorage {
 
     #[instrument(level = "debug", skip(self, range), fields(range.start = range.start, range.end = range.end))]
     async fn get_slice(&self, path: &Path, range: Range<usize>) -> StorageResult<OwnedBytes> {
-        self.get_to_vec(path, Some(range.clone()))
+        self.get_to_bytes(path, Some(range.clone()))
             .await
-            .map(OwnedBytes::new)
+            .map(into_owned_bytes)
             .map_err(|err| {
                 err.add_context(format!(
                     "failed to fetch slice {:?} for object: {}/{}",
@@ -495,9 +503,9 @@ impl Storage for AzureBlobStorage {
     #[instrument(level = "debug", skip(self), fields(fetched_bytes_len))]
     async fn get_all(&self, path: &Path) -> StorageResult<OwnedBytes> {
         let data = self
-            .get_to_vec(path, None)
+            .get_to_bytes(path, None)
             .await
-            .map(OwnedBytes::new)
+            .map(into_owned_bytes)
             .map_err(|err| {
                 err.add_context(format!(
                     "failed to fetch object: {}/{}",
@@ -564,29 +572,55 @@ pub fn parse_azure_uri(uri: &Uri) -> Option<(String, PathBuf)> {
     Some((container, prefix))
 }
 
-/// Collect a download stream into an output buffer.
+/// The Azure SDK reports a failure while draining a response body as its own error
+/// type rather than an [`io::Error`], so those failures are all recorded under a
+/// single label instead of an io error kind.
+const AZURE_STREAM_ERROR: &str = "stream";
+
+/// Collect a download stream into a single [`Bytes`].
+///
+/// The `Bytes` segments yielded by the SDK are kept as they arrive, so that a body
+/// received as a single segment is handed over without being copied at all. Several
+/// segments are concatenated exactly once, into a single allocation.
 async fn download_all(
     chunk_stream: &mut Pageable<GetBlobResponse, AzureError>,
-    output: &mut Vec<u8>,
-) -> Result<(), AzureErrorWrapper> {
-    output.clear();
+    download_kind: DownloadKind,
+) -> Result<Bytes, AzureErrorWrapper> {
+    // The guard only comes into existence once a response has arrived: a
+    // failure or a cancellation before that is a request failure, recorded as
+    // such and not as a download error. Past that point, dropping this future
+    // drops the guard, which records the partial download as cancelled.
+    let mut metrics_guard_opt: Option<DownloadMetricsGuard> = None;
+    let mut segments: Vec<Bytes> = Vec::new();
+    let mut total_num_bytes: usize = 0;
     while let Some(chunk_result) = chunk_stream
         .next()
         .with_count_metric(ActionLabel::GetObject)
         .await
     {
-        let chunk_response = chunk_result?;
-        let chunk_response_body_stream = chunk_response
-            .data
-            .map_err(FutureError::other)
-            .into_async_read()
-            .compat();
-        let mut body_stream_reader = BufReader::new(chunk_response_body_stream);
-        copy_with_download_metrics(&mut body_stream_reader, output).await?;
+        let chunk_response = chunk_result.map_err(|error| {
+            if let Some(metrics_guard) = &mut metrics_guard_opt {
+                metrics_guard.set_status(DownloadStatus::Failed(AZURE_STREAM_ERROR));
+            }
+            AzureErrorWrapper::from(error)
+        })?;
+        let metrics_guard =
+            metrics_guard_opt.get_or_insert_with(|| DownloadMetricsGuard::new(download_kind));
+        let mut segment_stream = chunk_response.data;
+        while let Some(segment_res) = segment_stream.next().await {
+            let segment = segment_res.map_err(|error| {
+                metrics_guard.set_status(DownloadStatus::Failed(AZURE_STREAM_ERROR));
+                AzureErrorWrapper::from(error)
+            })?;
+            metrics_guard.record_bytes(segment.len() as u64);
+            total_num_bytes += segment.len();
+            segments.push(segment);
+        }
     }
-    // When calling `get_all`, the Vec capacity is not properly set.
-    output.shrink_to_fit();
-    Ok(())
+    if let Some(mut metrics_guard) = metrics_guard_opt {
+        metrics_guard.set_status(DownloadStatus::Done);
+    }
+    Ok(coalesce_segments(segments, total_num_bytes))
 }
 
 #[derive(Error, Debug)]
