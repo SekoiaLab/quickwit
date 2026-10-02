@@ -37,6 +37,7 @@ use futures::{StreamExt, stream};
 use once_cell::sync::{Lazy, OnceCell};
 use quickwit_aws::retry::{AwsRetryable, aws_retry};
 use quickwit_aws::{aws_behavior_version, get_aws_config};
+use quickwit_common::metrics::GaugeGuard;
 use quickwit_common::retry::{Retry, RetryParams};
 use quickwit_common::uri::Uri;
 use quickwit_common::{chunk_range, into_u64_range};
@@ -46,7 +47,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::Semaphore;
 use tracing::{info, instrument, warn};
 
-use crate::metrics::object_storage_get_slice_in_flight_guards;
+use crate::metrics::{STORAGE_METRICS, object_storage_get_slice_in_flight_guards};
 use crate::metrics_wrappers::{
     ActionLabel, DownloadKind, RequestMetricsWrapperExt, collect_with_download_metrics,
     copy_with_download_metrics,
@@ -67,11 +68,46 @@ static REQUEST_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| {
     Semaphore::new(num_permits)
 });
 
-/// Wrap the async read handle together with a permit to keep the permit alive
+/// Semaphore limiting the number of GetObject requests in flight at any time.
+static GET_OBJECT_CONNECTION_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| {
+    let num_permits: usize = quickwit_common::get_from_env(
+        "QW_S3_MAX_GET_OBJECT_CONNECTIONS",
+        Semaphore::MAX_PERMITS,
+        false,
+    );
+    Semaphore::new(num_permits)
+});
+
+/// A permit from `GET_OBJECT_CONNECTION_SEMAPHORE`. It must outlive the response body.
+struct GetObjectConnectionPermit {
+    _permit: tokio::sync::SemaphorePermit<'static>,
+    _in_use_guard: GaugeGuard<'static>,
+}
+
+async fn acquire_get_object_connection_permit() -> GetObjectConnectionPermit {
+    let mut waiting_guard =
+        GaugeGuard::from_gauge(&STORAGE_METRICS.object_storage_get_object_connections_waiting);
+    waiting_guard.add(1);
+    let permit = GET_OBJECT_CONNECTION_SEMAPHORE
+        .acquire()
+        .await
+        .expect("the semaphore should never be closed");
+    drop(waiting_guard);
+    let mut in_use_guard =
+        GaugeGuard::from_gauge(&STORAGE_METRICS.object_storage_get_object_connections_in_use);
+    in_use_guard.add(1);
+    GetObjectConnectionPermit {
+        _permit: permit,
+        _in_use_guard: in_use_guard,
+    }
+}
+
+/// Wrap the async read handle together with permits to keep them alive
 /// until the handle is dropped
 struct S3AsyncRead<T: AsyncRead + Send + Unpin> {
     pub read: T,
     pub _permit: Result<tokio::sync::SemaphorePermit<'static>, tokio::sync::AcquireError>,
+    pub _connection_permit: GetObjectConnectionPermit,
 }
 
 impl<T: AsyncRead + Send + Unpin> AsyncRead for S3AsyncRead<T> {
@@ -603,11 +639,13 @@ impl S3CompatibleObjectStorage {
         Ok(())
     }
 
+    /// Sends a single GetObject request. The returned permit must be kept alive until the body
+    /// has been consumed.
     async fn get_object(
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
-    ) -> Result<GetObjectOutput, SdkError<GetObjectError>> {
+    ) -> Result<(GetObjectOutput, GetObjectConnectionPermit), SdkError<GetObjectError>> {
         let key = self.key(path);
         let range_str = range_opt.map(|range| format!("bytes={}-{}", range.start, range.end - 1));
 
@@ -630,11 +668,12 @@ impl S3CompatibleObjectStorage {
             }
             None => {}
         }
+        let connection_permit = acquire_get_object_connection_permit().await;
         let get_object_output = req_builder
             .send()
             .with_count_and_duration_metrics(ActionLabel::GetObject)
             .await?;
-        Ok(get_object_output)
+        Ok((get_object_output, connection_permit))
     }
 
     async fn get_to_bytes(
@@ -647,7 +686,7 @@ impl S3CompatibleObjectStorage {
         } else {
             DownloadKind::Object
         };
-        let get_object_output = aws_retry(&self.retry_params, || {
+        let (get_object_output, _connection_permit) = aws_retry(&self.retry_params, || {
             self.get_object(path, range_opt.clone())
         })
         .await?;
@@ -827,7 +866,7 @@ impl Storage for S3CompatibleObjectStorage {
 
     async fn copy_to(&self, path: &Path, output: &mut dyn SendableAsync) -> StorageResult<()> {
         let _permit = REQUEST_SEMAPHORE.acquire().await;
-        let get_object_output =
+        let (get_object_output, _connection_permit) =
             aws_retry(&self.retry_params, || self.get_object(path, None)).await?;
         let mut body_read = BufReader::new(get_object_output.body.into_async_read());
         copy_with_download_metrics(&mut body_read, output, DownloadKind::Object).await?;
@@ -888,13 +927,14 @@ impl Storage for S3CompatibleObjectStorage {
         range: Range<usize>,
     ) -> crate::StorageResult<Box<dyn AsyncRead + Send + Unpin>> {
         let permit = REQUEST_SEMAPHORE.acquire().await;
-        let get_object_output = aws_retry(&self.retry_params, || {
+        let (get_object_output, connection_permit) = aws_retry(&self.retry_params, || {
             self.get_object(path, Some(range.clone()))
         })
         .await?;
         Ok(Box::new(S3AsyncRead {
             read: get_object_output.body.into_async_read(),
             _permit: permit,
+            _connection_permit: connection_permit,
         }))
     }
 
