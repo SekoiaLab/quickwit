@@ -24,6 +24,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_common::split_file;
 use quickwit_common::uri::Uri;
 use quickwit_config::SplitCacheLimits;
@@ -265,13 +266,19 @@ impl SplitScopedStorageCache {
 #[async_trait]
 impl StorageCache for SplitScopedStorageCache {
     async fn get(&self, path: &Path, byte_range: Range<usize>) -> Option<OwnedBytes> {
-        let result = self.get_impl(path, byte_range).await;
+        let result = self
+            .get_impl(path, byte_range)
+            .detect_slow_poll("split_cache:get")
+            .await;
         self.record_hit_metrics(result.as_ref());
         result
     }
 
     async fn get_all(&self, path: &Path) -> Option<OwnedBytes> {
-        let result = self.get_all_impl(path).await;
+        let result = self
+            .get_all_impl(path)
+            .detect_slow_poll("split_cache:get")
+            .await;
         self.record_hit_metrics(result.as_ref());
         result
     }
