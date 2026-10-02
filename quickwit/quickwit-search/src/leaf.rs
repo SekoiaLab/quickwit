@@ -368,7 +368,7 @@ async fn warm_up_automatons(
                                         tantivy_fst::Regex::from_patterns(&patterns)
                                             .map_err(anyhow::Error::from)
                                     },
-                                    "automaton_warmup",
+                                    "automaton_warmup_build",
                                     cost_class.as_label(),
                                 )
                                 .await
