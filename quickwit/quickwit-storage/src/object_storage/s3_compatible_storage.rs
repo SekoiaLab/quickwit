@@ -56,7 +56,7 @@ use crate::stable_deref_bytes::into_owned_bytes;
 use crate::storage::SendableAsync;
 use crate::{
     BulkDeleteError, DeleteFailure, OwnedBytes, Storage, StorageError, StorageErrorKind,
-    StorageResolverError, StorageResult,
+    StorageResolverError, StorageResult, community_metrics,
 };
 
 /// Semaphore to limit the number of concurrent requests to the object store. Some object stores
@@ -328,6 +328,8 @@ impl S3CompatibleObjectStorage {
             }) => {}
             None => {}
         }
+        community_metrics::record_request(key, ActionLabel::PutObject);
+        community_metrics::record_bytes(key, "upload", len);
         req_builder
             .send()
             .with_count_and_upload_metrics(ActionLabel::PutObject, len)
@@ -360,6 +362,7 @@ impl S3CompatibleObjectStorage {
 
     async fn create_multipart_upload(&self, key: &str) -> StorageResult<MultipartUploadId> {
         let upload_id = aws_retry(&self.retry_params, || async {
+            community_metrics::record_request(key, ActionLabel::CreateMultipartUpload);
             let mut req_builder = self
                 .s3_client
                 .create_multipart_upload()
@@ -499,6 +502,8 @@ impl S3CompatibleObjectStorage {
             }) => {}
             None => {}
         }
+        community_metrics::record_request(key, ActionLabel::UploadPart);
+        community_metrics::record_bytes(key, "upload", part.len());
         let upload_part_output = req_builder
             .send()
             .with_count_and_upload_metrics(ActionLabel::UploadPart, part.len())
@@ -574,6 +579,7 @@ impl S3CompatibleObjectStorage {
             .set_parts(Some(completed_parts))
             .build();
         aws_retry(&self.retry_params, || async {
+            community_metrics::record_request(key, ActionLabel::CompleteMultipartUpload);
             self.s3_client
                 .complete_multipart_upload()
                 .bucket(self.bucket.clone())
@@ -590,6 +596,7 @@ impl S3CompatibleObjectStorage {
 
     async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> StorageResult<()> {
         aws_retry(&self.retry_params, || async {
+            community_metrics::record_request(key, ActionLabel::AbortMultipartUpload);
             self.s3_client
                 .abort_multipart_upload()
                 .bucket(self.bucket.clone())
@@ -615,7 +622,7 @@ impl S3CompatibleObjectStorage {
             .s3_client
             .get_object()
             .bucket(self.bucket.clone())
-            .key(key)
+            .key(&key)
             .set_range(range_str);
         match &self.encryption {
             Some(S3EncryptionConfig::SseC {
@@ -630,10 +637,13 @@ impl S3CompatibleObjectStorage {
             }
             None => {}
         }
+        community_metrics::record_request(&key, ActionLabel::GetObject);
         let get_object_output = req_builder
             .send()
             .with_count_and_duration_metrics(ActionLabel::GetObject)
             .await?;
+        let content_length = get_object_output.content_length().unwrap_or(0).max(0) as u64;
+        community_metrics::record_bytes(&key, "download", content_length);
         Ok(get_object_output)
     }
 
@@ -840,6 +850,7 @@ impl Storage for S3CompatibleObjectStorage {
         let bucket = self.bucket.clone();
         let key = self.key(path);
         let delete_res = aws_retry(&self.retry_params, || async {
+            community_metrics::record_request(&key, ActionLabel::DeleteObject);
             self.s3_client
                 .delete_object()
                 .bucket(&bucket)
@@ -921,6 +932,7 @@ impl Storage for S3CompatibleObjectStorage {
         let bucket = self.bucket.clone();
         let key = self.key(path);
         let head_object_output = aws_retry(&self.retry_params, || async {
+            community_metrics::record_request(&key, ActionLabel::HeadObject);
             let mut req_builder = self.s3_client.head_object().bucket(&bucket).key(&key);
             match &self.encryption {
                 Some(S3EncryptionConfig::SseC {
