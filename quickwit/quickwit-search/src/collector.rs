@@ -15,6 +15,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use itertools::{Either, Itertools};
 use quickwit_common::binary_heap::{SortKeyMapper, TopK};
@@ -1449,6 +1450,16 @@ pub(crate) struct IncrementalCollector {
     splits_by_outcome: Option<SplitsByOutcome>,
 }
 
+/// Merging intermediate aggregation results totalling fewer bytes than this is cheap enough to run
+/// on the calling task, without going through the search thread pool.
+pub static AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    quickwit_common::get_from_env(
+        "QW_AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES",
+        128 * 1024,
+        false,
+    )
+});
+
 impl IncrementalCollector {
     /// Create a new incremental collector
     pub(crate) fn new(collector: QuickwitCollector) -> Self {
@@ -1524,6 +1535,20 @@ impl IncrementalCollector {
     }
 
     /// Finalize the merge, creating a LeafSearchResponse.
+    /// Returns whether [`Self::finalize`] is likely CPU intensive enough to run on the search
+    /// thread pool. Finalizing is cheap unless it has aggregation results to merge.
+    pub(crate) fn is_finalize_cpu_intensive(&self) -> bool {
+        match &self.incremental_aggregation {
+            QuickwitIncrementalAggregations::TantivyAggregations(_, state) => {
+                let num_bytes: usize = state.iter().map(Vec::len).sum();
+                num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES
+            }
+            // These are only merged when there is more than one partial result.
+            QuickwitIncrementalAggregations::FindTraceIdsAggregation(_, state) => state.len() > 1,
+            QuickwitIncrementalAggregations::NoAggregation => false,
+        }
+    }
+
     pub(crate) fn finalize(self) -> tantivy::Result<LeafSearchResponse> {
         let intermediate_aggregation_result = self.incremental_aggregation.finalize()?;
         let mut partial_hits = self.top_k_hits.finalize();
@@ -2572,5 +2597,49 @@ mod tests {
                 .unwrap();
         let _merged: IntermediateAggregationResults = postcard::from_bytes(&serialized).unwrap();
         // Hopefully `_merged` is empty but the API does not allow us to assert that.
+    }
+
+    #[test]
+    fn test_is_finalize_cpu_intensive_depends_on_aggregation_size() {
+        let request_without_aggregation = SearchRequest {
+            max_hits: 10,
+            ..Default::default()
+        };
+        let collector =
+            make_merge_collector(&request_without_aggregation, Default::default()).unwrap();
+        let mut incremental_collector = IncrementalCollector::new(collector);
+        incremental_collector
+            .add_result(LeafSearchResponse::default())
+            .unwrap();
+        assert!(!incremental_collector.is_finalize_cpu_intensive());
+
+        let request_with_aggregation = SearchRequest {
+            max_hits: 10,
+            aggregation_request: Some(
+                r#"{"count_by_field": {"terms": {"field": "field"}}}"#.to_string(),
+            ),
+            ..Default::default()
+        };
+        let collector =
+            make_merge_collector(&request_with_aggregation, Default::default()).unwrap();
+        let mut incremental_collector = IncrementalCollector::new(collector);
+        // Intermediate aggregation results are only parsed when finalizing.
+        incremental_collector
+            .add_result(LeafSearchResponse {
+                intermediate_aggregation_result: Some(vec![0; 16]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!incremental_collector.is_finalize_cpu_intensive());
+        incremental_collector
+            .add_result(LeafSearchResponse {
+                intermediate_aggregation_result: Some(vec![
+                    0;
+                    *super::AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES
+                ]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(incremental_collector.is_finalize_cpu_intensive());
     }
 }

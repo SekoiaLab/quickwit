@@ -141,6 +141,7 @@ indexmap = { version = "2.12", features = ["serde"] }
 indicatif = "0.18"
 itertools = "0.14"
 json_comments = "0.2"
+libc = "0.2"
 libz-sys = "1.1"
 lru = "0.16"
 matches = "0.1"
@@ -358,7 +359,8 @@ quickwit-serve = { path = "quickwit-serve" }
 quickwit-storage = { path = "quickwit-storage" }
 
 
-tantivy = { git = "https://github.com/SekoiaLab/tantivy.git", tag = "v0.26.1_20260901", default-features = false, features = [
+# tantivy = { git = "https://github.com/SekoiaLab/tantivy.git", tag = "v0.26.1_20260901", default-features = false, features = [
+tantivy = { git = "https://github.com/SekoiaLab/tantivy.git", rev = "573de9bfce59c972285d2a1a909e96e812e80868", default-features = false, features = [
   "lz4-compression",
   "mmap",
   "quickwit",

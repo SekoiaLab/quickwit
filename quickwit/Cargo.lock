@@ -5381,7 +5381,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 [[package]]
 name = "ownedbytes"
 version = "0.9.0"
-source = "git+https://github.com/SekoiaLab/tantivy.git?tag=v0.26.1_20260901#ac5bea5e3506258c779602c0aa5756f4474dfe6c"
+source = "git+https://github.com/SekoiaLab/tantivy.git?rev=573de9bfce59c972285d2a1a909e96e812e80868#573de9bfce59c972285d2a1a909e96e812e80868"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -6474,6 +6474,7 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "futures",
  "mini-moka",
  "once_cell",
@@ -6498,6 +6499,7 @@ dependencies = [
  "humantime",
  "indicatif",
  "itertools 0.14.0",
+ "libc",
  "numfmt",
  "once_cell",
  "openssl-probe 0.1.6",
@@ -9274,7 +9276,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 [[package]]
 name = "tantivy"
 version = "0.26.1"
-source = "git+https://github.com/SekoiaLab/tantivy.git?tag=v0.26.1_20260901#ac5bea5e3506258c779602c0aa5756f4474dfe6c"
+source = "git+https://github.com/SekoiaLab/tantivy.git?rev=573de9bfce59c972285d2a1a909e96e812e80868#573de9bfce59c972285d2a1a909e96e812e80868"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -9329,7 +9331,7 @@ dependencies = [
 [[package]]
 name = "tantivy-bitpacker"
 version = "0.10.0"
-source = "git+https://github.com/SekoiaLab/tantivy.git?tag=v0.26.1_20260901#ac5bea5e3506258c779602c0aa5756f4474dfe6c"
+source = "git+https://github.com/SekoiaLab/tantivy.git?rev=573de9bfce59c972285d2a1a909e96e812e80868#573de9bfce59c972285d2a1a909e96e812e80868"
 dependencies = [
  "bitpacking",
 ]
@@ -9337,7 +9339,7 @@ dependencies = [
 [[package]]
 name = "tantivy-columnar"
 version = "0.7.0"
-source = "git+https://github.com/SekoiaLab/tantivy.git?tag=v0.26.1_20260901#ac5bea5e3506258c779602c0aa5756f4474dfe6c"
+source = "git+https://github.com/SekoiaLab/tantivy.git?rev=573de9bfce59c972285d2a1a909e96e812e80868#573de9bfce59c972285d2a1a909e96e812e80868"
 dependencies = [
  "downcast-rs",
  "fastdivide",
@@ -9352,7 +9354,7 @@ dependencies = [
 [[package]]
 name = "tantivy-common"
 version = "0.11.0"
-source = "git+https://github.com/SekoiaLab/tantivy.git?tag=v0.26.1_20260901#ac5bea5e3506258c779602c0aa5756f4474dfe6c"
+source = "git+https://github.com/SekoiaLab/tantivy.git?rev=573de9bfce59c972285d2a1a909e96e812e80868#573de9bfce59c972285d2a1a909e96e812e80868"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -9374,7 +9376,7 @@ dependencies = [
 [[package]]
 name = "tantivy-query-grammar"
 version = "0.26.0"
-source = "git+https://github.com/SekoiaLab/tantivy.git?tag=v0.26.1_20260901#ac5bea5e3506258c779602c0aa5756f4474dfe6c"
+source = "git+https://github.com/SekoiaLab/tantivy.git?rev=573de9bfce59c972285d2a1a909e96e812e80868#573de9bfce59c972285d2a1a909e96e812e80868"
 dependencies = [
  "fnv",
  "nom 7.1.3",
@@ -9386,7 +9388,7 @@ dependencies = [
 [[package]]
 name = "tantivy-sstable"
 version = "0.7.0"
-source = "git+https://github.com/SekoiaLab/tantivy.git?tag=v0.26.1_20260901#ac5bea5e3506258c779602c0aa5756f4474dfe6c"
+source = "git+https://github.com/SekoiaLab/tantivy.git?rev=573de9bfce59c972285d2a1a909e96e812e80868#573de9bfce59c972285d2a1a909e96e812e80868"
 dependencies = [
  "futures-util",
  "itertools 0.14.0",
@@ -9399,7 +9401,7 @@ dependencies = [
 [[package]]
 name = "tantivy-stacker"
 version = "0.7.0"
-source = "git+https://github.com/SekoiaLab/tantivy.git?tag=v0.26.1_20260901#ac5bea5e3506258c779602c0aa5756f4474dfe6c"
+source = "git+https://github.com/SekoiaLab/tantivy.git?rev=573de9bfce59c972285d2a1a909e96e812e80868#573de9bfce59c972285d2a1a909e96e812e80868"
 dependencies = [
  "murmurhash32",
  "tantivy-common",
@@ -9408,7 +9410,7 @@ dependencies = [
 [[package]]
 name = "tantivy-tokenizer-api"
 version = "0.7.0"
-source = "git+https://github.com/SekoiaLab/tantivy.git?tag=v0.26.1_20260901#ac5bea5e3506258c779602c0aa5756f4474dfe6c"
+source = "git+https://github.com/SekoiaLab/tantivy.git?rev=573de9bfce59c972285d2a1a909e96e812e80868#573de9bfce59c972285d2a1a909e96e812e80868"
 dependencies = [
  "serde",
 ]

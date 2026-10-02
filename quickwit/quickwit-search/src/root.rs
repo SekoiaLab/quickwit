@@ -22,6 +22,7 @@ use futures::future::try_join_all;
 use itertools::Itertools;
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::shared_consts;
+use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_common::uri::Uri;
 use quickwit_config::build_doc_mapper;
 use quickwit_doc_mapper::DYNAMIC_FIELD_NAME;
@@ -48,7 +49,9 @@ use tantivy::schema::{Field, FieldEntry, FieldType, Schema};
 use tracing::{debug, info_span, instrument, record_all};
 
 use crate::cluster_client::ClusterClient;
-use crate::collector::{QuickwitAggregations, make_merge_collector};
+use crate::collector::{
+    AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES, QuickwitAggregations, make_merge_collector,
+};
 use crate::metrics_trackers::{RootSearchMetricsFuture, SearchPlanMetricsFuture};
 use crate::scroll_context::{ScrollContext, ScrollKeyAndStartOffset};
 use crate::search_job_placer::{Job, group_by, group_jobs_by_index_id};
@@ -214,6 +217,11 @@ fn validate_request_and_build_metadata(
             .parse_user_query(doc_mapper.default_search_fields())
             // We convert the error to return a 400 to the user (and not a 500).
             .map_err(|err| SearchError::InvalidQuery(err.to_string()))?;
+
+        // Reject queries with an excessive number of regex/wildcard sub-queries
+        // before building them against each index schema below, which compiles
+        // one automaton per pattern and can take minutes for degenerate queries.
+        query_cost_classifier::check_automaton_query_count(&query_ast_resolved_for_index)?;
 
         // Validate uniqueness of resolved query AST.
         if let Some(query_ast_resolved) = &query_ast_resolved_opt {
@@ -792,24 +800,35 @@ pub(crate) async fn search_partial_hits_phase(
     let merge_collector =
         make_merge_collector(search_request, searcher_context.get_aggregation_limits())?;
 
-    // Merging is a cpu-bound task.
-    // It should be executed by Tokio's blocking threads.
+    // Merging is CPU bound, but only worth the search thread pool's hand-off and queue when there
+    // are enough aggregation results to merge.
+    let aggregation_num_bytes: usize = leaf_search_responses
+        .iter()
+        .filter_map(|leaf_search_response| {
+            leaf_search_response
+                .intermediate_aggregation_result
+                .as_ref()
+        })
+        .map(Vec::len)
+        .sum();
 
     // Wrap into result for merge_fruits
     let leaf_search_results: Vec<tantivy::Result<LeafSearchResponse>> =
         leaf_search_responses.into_iter().map(Ok).collect_vec();
     let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
     let span = info_span!("merge_fruits");
-    let mut leaf_search_response = crate::search_thread_pool()
-        .run_cpu_intensive_with_extra_tags(
-            move || {
-                let _span_guard = span.enter();
-                merge_collector.merge_fruits(leaf_search_results)
-            },
-            "root_merge",
-            cost_class.as_label(),
-        )
-        .await
+    let merge_fruits = move || {
+        let _span_guard = span.enter();
+        merge_collector.merge_fruits(leaf_search_results)
+    };
+    let merge_result = if aggregation_num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES {
+        crate::search_thread_pool()
+            .run_cpu_intensive_with_extra_tags(merge_fruits, "root_merge", cost_class.as_label())
+            .await
+    } else {
+        Ok(merge_fruits())
+    };
+    let mut leaf_search_response = merge_result
         .context("failed to merge leaf search responses")?
         .map_err(|error: TantivyError| crate::SearchError::Internal(error.to_string()))?;
     debug!(
@@ -1024,6 +1043,7 @@ async fn root_search_aux(
         &split_metadatas[..],
         cluster_client,
     )
+    .detect_slow_poll("root_search:partial_hits_phase")
     .await?;
 
     let hits = fetch_docs_phase(
@@ -1033,6 +1053,7 @@ async fn root_search_aux(
         &search_request,
         cluster_client,
     )
+    .detect_slow_poll("root_search:fetch_docs_phase")
     .await?;
 
     let mut aggregation_result_postcard_opt = finalize_aggregation_if_any(
@@ -1327,7 +1348,8 @@ pub async fn root_search(
             &mut search_request,
             &mut metastore,
             searcher_context.searcher_config.max_splits_per_search,
-        ),
+        )
+        .detect_slow_poll("root_search:plan_splits"),
         status: None,
         req_span: req_span.clone(),
     }

@@ -23,6 +23,8 @@ use anyhow::Context;
 use bytesize::ByteSize;
 use futures::future::try_join_all;
 use quickwit_common::pretty::PrettySample;
+use quickwit_common::slow_poll::DetectSlowPollExt;
+use quickwit_common::thread_pool::Panicked;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
 use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
 use quickwit_proto::search::{
@@ -259,10 +261,12 @@ async fn warm_up_fastfield(
 ) -> anyhow::Result<()> {
     let mut columns = fast_field_reader
         .list_dynamic_column_handles(&fast_field.name)
+        .detect_slow_poll("leaf_single_split:warm_up_fastfields_list_columns")
         .await?;
     if fast_field.with_subfields {
         let subpath_columns = fast_field_reader
             .list_subpath_dynamic_column_handles(&fast_field.name)
+            .detect_slow_poll("leaf_single_split:warm_up_fastfields_list_columns")
             .await?;
         columns.extend(subpath_columns);
     }
@@ -271,6 +275,7 @@ async fn warm_up_fastfield(
             .into_iter()
             .map(|col| async move { col.file_slice().read_bytes_async().await }),
     )
+    .detect_slow_poll("leaf_single_split:warm_up_fastfields_read_columns")
     .await?;
     Ok(())
 }
@@ -297,18 +302,30 @@ async fn warm_up_terms(
     searcher: &Searcher,
     terms_grouped_by_field: &HashMap<Field, HashMap<Term, bool>>,
 ) -> anyhow::Result<()> {
-    let mut warm_up_futures = Vec::new();
-    for (field, terms) in terms_grouped_by_field {
-        for segment_reader in searcher.segment_readers() {
-            let inv_idx = segment_reader.inverted_index(*field)?;
-            for (term, position_needed) in terms.iter() {
-                let inv_idx_clone = inv_idx.clone();
-                warm_up_futures
-                    .push(async move { inv_idx_clone.warm_postings(term, *position_needed).await });
+    // An async block without await points completes in a single poll, so wrapping it measures the
+    // synchronous setup: opening each field's inverted index and building the per-term futures.
+    let warm_up_futures = async {
+        let mut warm_up_futures = Vec::new();
+        for (field, terms) in terms_grouped_by_field {
+            for segment_reader in searcher.segment_readers() {
+                let inv_idx = segment_reader.inverted_index(*field)?;
+                for (term, position_needed) in terms.iter() {
+                    let inv_idx_clone = inv_idx.clone();
+                    warm_up_futures.push(async move {
+                        inv_idx_clone.warm_postings(term, *position_needed).await
+                    });
+                }
             }
         }
+        anyhow::Ok(warm_up_futures)
     }
-    try_join_all(warm_up_futures).await?;
+    .detect_slow_poll("leaf_single_split:warm_up_terms_open_inverted_index")
+    .await?;
+    // Covers the term dictionary lookup and the postings (and positions) reads: tantivy's
+    // `warm_postings` does both, and doesn't expose the lookup on its own.
+    try_join_all(warm_up_futures)
+        .detect_slow_poll("leaf_single_split:warm_up_terms_warm_postings")
+        .await?;
     Ok(())
 }
 
@@ -316,22 +333,29 @@ async fn warm_up_term_ranges(
     searcher: &Searcher,
     terms_grouped_by_field: &HashMap<Field, HashMap<TermRange, bool>>,
 ) -> anyhow::Result<()> {
-    let mut warm_up_futures = Vec::new();
-    for (field, terms) in terms_grouped_by_field {
-        for segment_reader in searcher.segment_readers() {
-            let inv_idx = segment_reader.inverted_index(*field)?;
-            for (term_range, position_needed) in terms.iter() {
-                let inv_idx_clone = inv_idx.clone();
-                let range = (term_range.start.as_ref(), term_range.end.as_ref());
-                warm_up_futures.push(async move {
-                    inv_idx_clone
-                        .warm_postings_range(range, term_range.limit, *position_needed)
-                        .await
-                });
+    let warm_up_futures = async {
+        let mut warm_up_futures = Vec::new();
+        for (field, terms) in terms_grouped_by_field {
+            for segment_reader in searcher.segment_readers() {
+                let inv_idx = segment_reader.inverted_index(*field)?;
+                for (term_range, position_needed) in terms.iter() {
+                    let inv_idx_clone = inv_idx.clone();
+                    let range = (term_range.start.as_ref(), term_range.end.as_ref());
+                    warm_up_futures.push(async move {
+                        inv_idx_clone
+                            .warm_postings_range(range, term_range.limit, *position_needed)
+                            .await
+                    });
+                }
             }
         }
+        anyhow::Ok(warm_up_futures)
     }
-    try_join_all(warm_up_futures).await?;
+    .detect_slow_poll("leaf_single_split:warm_up_term_ranges_open_inverted_index")
+    .await?;
+    try_join_all(warm_up_futures)
+        .detect_slow_poll("leaf_single_split:warm_up_term_ranges_warm_postings_range")
+        .await?;
     Ok(())
 }
 
@@ -340,73 +364,105 @@ async fn warm_up_automatons(
     terms_grouped_by_field: &HashMap<Field, HashSet<Automaton>>,
     cost_class: QueryCostClass,
 ) -> anyhow::Result<()> {
-    let mut warm_up_futures = Vec::new();
-    let cpu_intensive_executor = |task| async {
-        crate::search_thread_pool()
-            .run_cpu_intensive_with_extra_tags(task, "automaton_warmup", cost_class.as_label())
-            .await
-            .map_err(|_| std::io::Error::other("task panicked"))?
+    let cpu_intensive_executor = |caller: &'static str| {
+        move |task: Box<dyn FnOnce() -> std::io::Result<()> + Send>| async move {
+            crate::search_thread_pool()
+                .run_cpu_intensive_with_extra_tags(task, caller, cost_class.as_label())
+                .await
+                .map_err(|_| std::io::Error::other("task panicked"))?
+        }
     };
-    for (field, automatons) in terms_grouped_by_field {
-        for segment_reader in searcher.segment_readers() {
-            let inv_idx = segment_reader.inverted_index(*field)?;
-            for automaton in automatons {
-                let inv_idx_clone = inv_idx.clone();
-                warm_up_futures.push(async move {
-                    match automaton {
-                        Automaton::Regex(path, patterns) => {
-                            let regex =
-                                tantivy_fst::Regex::from_patterns(patterns).with_context(|| {
-                                    format!(
-                                        "failed to build regex during warmup for field `{}`",
-                                        full_path(*field, path, searcher.schema()),
+    const WARM_POSTINGS: &str = "leaf_single_split:warm_up_automatons_warm_postings";
+    let warm_up_futures = async {
+        let mut warm_up_futures = Vec::new();
+        for (field, automatons) in terms_grouped_by_field {
+            for segment_reader in searcher.segment_readers() {
+                let inv_idx = segment_reader.inverted_index(*field)?;
+                for automaton in automatons {
+                    let inv_idx_clone = inv_idx.clone();
+                    warm_up_futures.push(async move {
+                        match automaton {
+                            Automaton::Regex(path, patterns) => {
+                                let patterns = patterns.clone();
+                                let regex = crate::search_thread_pool()
+                                    .run_cpu_intensive_with_extra_tags(
+                                        move || {
+                                            tantivy_fst::Regex::from_patterns(&patterns)
+                                                .map_err(anyhow::Error::from)
+                                        },
+                                        "automaton_warmup_build",
+                                        cost_class.as_label(),
                                     )
-                                })?;
+                                    .await
+                                    .context("regex build panicked during warmup")?
+                                    .with_context(|| {
+                                        format!(
+                                            "failed to build regex during warmup for field `{}`",
+                                            full_path(*field, path, searcher.schema()),
+                                        )
+                                    })?;
 
-                            match regex {
-                                DisjunctionRegex::Single(regex) => inv_idx_clone
-                                    .warm_postings_automaton(
-                                        quickwit_query::query_ast::JsonPathPrefix {
-                                            automaton: Arc::new(regex),
-                                            prefix: path.clone().unwrap_or_default(),
-                                        },
-                                        cpu_intensive_executor,
-                                    )
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "failed to warm postings from automaton for field \
-                                             `{}` (type=single)",
-                                            full_path(*field, path, searcher.schema()),
+                                match regex {
+                                    DisjunctionRegex::Single(regex) => inv_idx_clone
+                                        .warm_postings_automaton(
+                                            quickwit_query::query_ast::JsonPathPrefix {
+                                                automaton: Arc::new(regex),
+                                                prefix: path.clone().unwrap_or_default(),
+                                            },
+                                            cpu_intensive_executor(
+                                                "automaton_warmup_select_blocks",
+                                            ),
+                                            cpu_intensive_executor("automaton_warmup_scan_terms"),
                                         )
-                                    }),
-                                DisjunctionRegex::Multi(regexes) => inv_idx_clone
-                                    .warm_postings_automaton(
-                                        quickwit_query::query_ast::JsonPathPrefix {
-                                            automaton: Arc::new(regexes),
-                                            prefix: path.clone().unwrap_or_default(),
-                                        },
-                                        cpu_intensive_executor,
-                                    )
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "failed to warm postings from automaton for field \
-                                             `{}` (type=multi)",
-                                            full_path(*field, path, searcher.schema()),
+                                        .detect_slow_poll(WARM_POSTINGS)
+                                        .await
+                                        .with_context(|| {
+                                            format!(
+                                                "failed to warm postings from automaton for field \
+                                                 `{}` (type=single)",
+                                                full_path(*field, path, searcher.schema()),
+                                            )
+                                        }),
+                                    DisjunctionRegex::Multi(regexes) => inv_idx_clone
+                                        .warm_postings_automaton(
+                                            quickwit_query::query_ast::JsonPathPrefix {
+                                                automaton: Arc::new(regexes),
+                                                prefix: path.clone().unwrap_or_default(),
+                                            },
+                                            cpu_intensive_executor(
+                                                "automaton_warmup_select_blocks",
+                                            ),
+                                            cpu_intensive_executor("automaton_warmup_scan_terms"),
                                         )
-                                    }),
+                                        .detect_slow_poll(WARM_POSTINGS)
+                                        .await
+                                        .with_context(|| {
+                                            format!(
+                                                "failed to warm postings from automaton for field \
+                                                 `{}` (type=multi)",
+                                                full_path(*field, path, searcher.schema()),
+                                            )
+                                        }),
+                                }
                             }
+                            Automaton::TermSet(automaton) => inv_idx_clone
+                                .warm_postings_automaton(
+                                    automaton.clone(),
+                                    cpu_intensive_executor("automaton_warmup_select_blocks"),
+                                    cpu_intensive_executor("automaton_warmup_scan_terms"),
+                                )
+                                .detect_slow_poll(WARM_POSTINGS)
+                                .await
+                                .context("failed to warm term set"),
                         }
-                        Automaton::TermSet(automaton) => inv_idx_clone
-                            .warm_postings_automaton(automaton.clone(), cpu_intensive_executor)
-                            .await
-                            .context("failed to warm term set"),
-                    }
-                });
+                    });
+                }
             }
         }
+        anyhow::Ok(warm_up_futures)
     }
+    .detect_slow_poll("leaf_single_split:warm_up_automatons_open_inverted_index")
+    .await?;
     try_join_all(warm_up_futures).await?;
     Ok(())
 }
@@ -415,17 +471,24 @@ async fn warm_up_fieldnorms(searcher: &Searcher, requires_scoring: bool) -> anyh
     if !requires_scoring {
         return Ok(());
     }
-    let mut warm_up_futures = Vec::new();
-    for field in searcher.schema().fields() {
-        for segment_reader in searcher.segment_readers() {
-            let fieldnorm_readers = segment_reader.fieldnorms_readers();
-            let file_handle_opt = fieldnorm_readers.get_inner_file().open_read(field.0);
-            if let Some(file_handle) = file_handle_opt {
-                warm_up_futures.push(async move { file_handle.read_bytes_async().await })
+    let warm_up_futures = async {
+        let mut warm_up_futures = Vec::new();
+        for field in searcher.schema().fields() {
+            for segment_reader in searcher.segment_readers() {
+                let fieldnorm_readers = segment_reader.fieldnorms_readers();
+                let file_handle_opt = fieldnorm_readers.get_inner_file().open_read(field.0);
+                if let Some(file_handle) = file_handle_opt {
+                    warm_up_futures.push(async move { file_handle.read_bytes_async().await })
+                }
             }
         }
+        warm_up_futures
     }
-    try_join_all(warm_up_futures).await?;
+    .detect_slow_poll("leaf_single_split:warm_up_fieldnorms_open")
+    .await;
+    try_join_all(warm_up_futures)
+        .detect_slow_poll("leaf_single_split:warm_up_fieldnorms_read")
+        .await?;
     Ok(())
 }
 
@@ -1304,9 +1367,10 @@ pub async fn multi_index_leaf_search(
                     aggregation_limits,
                     cost_class,
                 )
-                .in_current_span()
                 .await
             }
+            .detect_slow_poll("leaf_single_index")
+            .in_current_span()
         });
     }
 
@@ -1316,15 +1380,28 @@ pub async fn multi_index_leaf_search(
         incremental_merge_collector.add_result(result??)?;
     }
 
-    crate::search_thread_pool()
-        .run_cpu_intensive_with_extra_tags(
-            || incremental_merge_collector.finalize().map_err(Into::into),
-            "finalize",
-            cost_class.as_label(),
-        )
+    finalize_incremental_merge(incremental_merge_collector, cost_class)
         .instrument(info_span!("incremental_merge_finalize"))
         .await
         .context("failed to merge split search responses")?
+        .map_err(Into::into)
+}
+
+async fn finalize_incremental_merge(
+    incremental_merge_collector: IncrementalCollector,
+    cost_class: QueryCostClass,
+) -> Result<tantivy::Result<LeafSearchResponse>, Panicked> {
+    if incremental_merge_collector.is_finalize_cpu_intensive() {
+        crate::search_thread_pool()
+            .run_cpu_intensive_with_extra_tags(
+                move || incremental_merge_collector.finalize(),
+                "finalize",
+                cost_class.as_label(),
+            )
+            .await
+    } else {
+        Ok(incremental_merge_collector.finalize())
+    }
 }
 
 /// Optimizes the search_request based on CanSplitDoBetter
@@ -1453,6 +1530,7 @@ pub async fn single_doc_mapping_leaf_search(
                 leaf_split_search_permit,
                 aggregations_limits.clone(),
             )
+            .detect_slow_poll("leaf_single_split")
             .in_current_span(),
         );
         split_with_task_id.push((split_id, handle.id()));
@@ -1498,12 +1576,7 @@ pub async fn single_doc_mapping_leaf_search(
     }
 
     let leaf_search_response_reresult: Result<Result<LeafSearchResponse, _>, _> =
-        crate::search_thread_pool()
-            .run_cpu_intensive_with_extra_tags(
-                || incremental_merge_collector.finalize(),
-                "finalize",
-                cost_class.as_label(),
-            )
+        finalize_incremental_merge(incremental_merge_collector, cost_class)
             .instrument(info_span!("incremental_merge_intermediate"))
             .await
             .context("failed to merge split search responses");

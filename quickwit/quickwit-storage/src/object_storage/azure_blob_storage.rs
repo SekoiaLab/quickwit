@@ -620,7 +620,7 @@ async fn download_all(
     if let Some(mut metrics_guard) = metrics_guard_opt {
         metrics_guard.set_status(DownloadStatus::Done);
     }
-    Ok(coalesce_segments(segments, total_num_bytes))
+    Ok(coalesce_segments(segments, total_num_bytes, None).await?)
 }
 
 #[derive(Error, Debug)]

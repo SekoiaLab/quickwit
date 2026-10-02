@@ -138,6 +138,8 @@ fn spawn_refresh_dns(dns_entry: Arc<DnsEntry>, host: String) {
 
 impl ResolveDns for CachingDnsResolver {
     fn resolve_dns<'a>(&'a self, host: &'a str) -> DnsFuture<'a> {
+        // Hyper's `HttpConnector` resolves the host on every new connection, and only then.
+        DNS_METRICS.connection_attempts_total.inc();
         let cache = self.cache.clone();
         let host = host.to_string();
         let dns_entry_opt: Option<Arc<DnsEntry>> = cache.get(&host);

@@ -39,6 +39,7 @@ pub mod rendezvous_hasher;
 pub mod retry;
 pub mod runtimes;
 pub mod shared_consts;
+pub mod slow_poll;
 pub mod sorted_iter;
 pub mod stream_utils;
 pub mod temp_dir;

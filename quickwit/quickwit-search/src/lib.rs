@@ -132,7 +132,11 @@ fn compute_search_thread_pool_num_threads() -> Option<usize> {
     Some(threads)
 }
 
-fn search_thread_pool() -> &'static ThreadPool {
+/// Returns the process-wide thread pool on which CPU-intensive search work runs.
+///
+/// Besides the search crate, searcher-only nodes hand it to the storage layer so that large
+/// object storage downloads are assembled on it rather than on the tokio runtime.
+pub fn search_thread_pool() -> &'static ThreadPool {
     static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
     SEARCH_THREAD_POOL
