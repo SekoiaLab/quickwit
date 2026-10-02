@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::hash::Hash;
 use std::ops::{Bound, RangeBounds};
+use std::sync::LazyLock;
 
 use prost::Message;
 use quickwit_config::CacheConfig;
@@ -21,7 +23,20 @@ use quickwit_proto::search::{
 };
 use quickwit_proto::types::SplitId;
 use quickwit_storage::{MemorySizedCache, OwnedBytes};
+use siphasher::sip128::{Hasher128, SipHasher13};
 use tantivy::index::SegmentId;
+
+/// Keys of the 128-bit hash used to identify cached requests, drawn once per
+/// process so that colliding requests cannot be crafted ahead of time.
+static REQUEST_HASH_KEYS: LazyLock<(u64, u64)> = LazyLock::new(rand::random);
+
+/// Returns a 128-bit hash of `value`, used in place of the value itself in cache keys.
+fn hash_128(value: &impl Hash) -> u128 {
+    let (key0, key1) = *REQUEST_HASH_KEYS;
+    let mut hasher = SipHasher13::new_with_keys(key0, key1);
+    value.hash(&mut hasher);
+    hasher.finish128().as_u128()
+}
 
 /// A cache to memoize `leaf_search_single_split` results.
 pub struct LeafSearchCache {
@@ -81,8 +96,8 @@ impl LeafSearchCache {
 struct CacheKey {
     /// The split this entry refers to
     split_id: SplitId,
-    /// The request this matches. The timerange of the request was removed.
-    request: SearchRequest,
+    /// 128-bit hash of the request this matches, with its timerange removed.
+    request_hash: u128,
     /// The effective time range of the request, that is, the intersection of the timerange
     /// requested, and the timerange covered by the split.
     merged_time_range: HalfOpenRange,
@@ -108,7 +123,7 @@ impl CacheKey {
 
         CacheKey {
             split_id: split_info.split_id,
-            request: search_request,
+            request_hash: hash_128(&search_request),
             merged_time_range,
             soft_deleted_docs_len: split_info.soft_deleted_doc_ids.len(),
         }
@@ -194,7 +209,8 @@ impl RangeBounds<i64> for HalfOpenRange {
 }
 
 pub struct PredicateCacheImpl {
-    content: MemorySizedCache<(SplitId, String)>,
+    /// Keyed by split id and 128-bit hash of the query AST JSON.
+    content: MemorySizedCache<(SplitId, u128)>,
 }
 
 impl PredicateCacheImpl {
@@ -214,7 +230,7 @@ impl quickwit_query::query_ast::PredicateCache for PredicateCacheImpl {
         split_id: SplitId,
         query_ast_json: String,
     ) -> Option<(SegmentId, quickwit_query::query_ast::HitSet)> {
-        let encoded_result = self.content.get(&(split_id, query_ast_json))?;
+        let encoded_result = self.content.get(&(split_id, hash_128(&query_ast_json)))?;
         let (segment_id_bytes, hits_buffer) = encoded_result.split(32);
         let segment_id =
             SegmentId::from_uuid_string(str::from_utf8(&segment_id_bytes).ok()?).ok()?;
@@ -233,8 +249,10 @@ impl quickwit_query::query_ast::PredicateCache for PredicateCacheImpl {
         let mut buffer = Vec::with_capacity(32 + hits_buffer.len());
         buffer.extend_from_slice(segment.uuid_string().as_bytes());
         buffer.extend_from_slice(&hits_buffer);
-        self.content
-            .put((split_id, query_ast_json), OwnedBytes::new(buffer));
+        self.content.put(
+            (split_id, hash_128(&query_ast_json)),
+            OwnedBytes::new(buffer),
+        );
     }
 }
 
@@ -242,11 +260,102 @@ impl quickwit_query::query_ast::PredicateCache for PredicateCacheImpl {
 mod tests {
     use bytesize::ByteSize;
     use quickwit_proto::search::{
-        LeafSearchResponse, PartialHit, ResourceStats, SearchRequest, SortValue,
+        CountHits, LeafSearchResponse, PartialHit, ResourceStats, SearchRequest, SortValue,
         SplitIdAndFooterOffsets,
     };
 
-    use super::LeafSearchCache;
+    use super::{CacheKey, LeafSearchCache};
+
+    #[test]
+    fn test_cache_key_request_hash_matches_request_equality() {
+        let split = SplitIdAndFooterOffsets {
+            split_id: "split_1".to_string(),
+            ..Default::default()
+        };
+        let base = SearchRequest {
+            index_id_patterns: vec!["test-idx".to_string()],
+            query_ast: "test".to_string(),
+            max_hits: 10,
+            ..Default::default()
+        };
+        let search_after = |sort_value: SortValue| PartialHit {
+            sort_value: Some(sort_value.into()),
+            split_id: "split_1".to_string(),
+            ..Default::default()
+        };
+        let variants = [
+            base.clone(),
+            SearchRequest {
+                max_hits: 20,
+                ..base.clone()
+            },
+            // removed from the key, so equal to `base`
+            SearchRequest {
+                count_hits: CountHits::Underestimate.into(),
+                ..base.clone()
+            },
+            SearchRequest {
+                start_timestamp: Some(10),
+                end_timestamp: Some(20),
+                ..base.clone()
+            },
+            // the same number with different types is a distinct request
+            SearchRequest {
+                search_after: Some(search_after(SortValue::U64(5))),
+                ..base.clone()
+            },
+            SearchRequest {
+                search_after: Some(search_after(SortValue::I64(5))),
+                ..base.clone()
+            },
+            SearchRequest {
+                search_after: Some(search_after(SortValue::F64(5.0))),
+                ..base.clone()
+            },
+            // `0.0 == -0.0` while their bit representations differ
+            SearchRequest {
+                search_after: Some(search_after(SortValue::F64(0.0))),
+                ..base.clone()
+            },
+            SearchRequest {
+                search_after: Some(search_after(SortValue::F64(-0.0))),
+                ..base.clone()
+            },
+            // optional fields set to their default value are not equal to unset ones
+            SearchRequest {
+                aggregation_request: Some(String::new()),
+                ..base.clone()
+            },
+            SearchRequest {
+                user_agent: Some("agent".to_string()),
+                ..base.clone()
+            },
+            SearchRequest {
+                index_id_patterns: vec!["test".to_string(), "-idx".to_string()],
+                ..base.clone()
+            },
+        ];
+        let normalize = |mut request: SearchRequest| {
+            request.start_timestamp = None;
+            request.end_timestamp = None;
+            request.count_hits = CountHits::CountAll.into();
+            request
+        };
+        for left in &variants {
+            for right in &variants {
+                let left_hash =
+                    CacheKey::from_split_meta_and_request(split.clone(), left.clone()).request_hash;
+                let right_hash =
+                    CacheKey::from_split_meta_and_request(split.clone(), right.clone())
+                        .request_hash;
+                assert_eq!(
+                    left_hash == right_hash,
+                    normalize(left.clone()) == normalize(right.clone()),
+                    "left: {left:?}, right: {right:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_leaf_search_cache_no_timestamp() {

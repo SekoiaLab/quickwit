@@ -17,8 +17,7 @@ use std::fmt;
 use std::io::{self, Read};
 
 use prost::Message;
-use quickwit_common::numeric_types::num_proj::ProjectedNumber;
-use quickwit_common::numeric_types::{num_cmp, num_proj};
+use quickwit_common::numeric_types::num_cmp;
 pub use sort_by_value::SortValue;
 
 include!("../codegen/quickwit/quickwit.search.rs");
@@ -164,9 +163,8 @@ impl PartialOrd for SortValue {
 
 impl std::hash::Hash for SortValue {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let this = self.normalize();
-        std::mem::discriminant(&this).hash(state);
-        match &this {
+        std::mem::discriminant(self).hash(state);
+        match self {
             SortValue::U64(number) => {
                 number.hash(state);
             }
@@ -174,6 +172,9 @@ impl std::hash::Hash for SortValue {
                 number.hash(state);
             }
             SortValue::F64(number) => {
+                // `0.0 == -0.0`, so they must hash alike, while their bit
+                // representations differ.
+                let number = if *number == 0.0 { 0.0f64 } else { *number };
                 number.to_bits().hash(state);
             }
             SortValue::Boolean(b) => {
@@ -190,33 +191,6 @@ impl std::hash::Hash for SortValue {
 }
 
 impl SortValue {
-    /// Where multiple variant could represent the same logical value, convert to a canonical form.
-    ///
-    /// For number, we prefer to represent them, in order, as i64, then as u64 and finally as f64.
-    pub fn normalize(&self) -> Self {
-        match self {
-            SortValue::I64(_) => self.clone(),
-            SortValue::Boolean(_) => self.clone(),
-            SortValue::Str(_) => self.clone(),
-            SortValue::U64(number) => match num_proj::u64_to_i64(*number) {
-                ProjectedNumber::Exact(number) => SortValue::I64(number),
-                _ => self.clone(),
-            },
-            SortValue::F64(float) => match num_proj::f64_to_i64(*float) {
-                ProjectedNumber::Exact(number) => SortValue::I64(number),
-                ProjectedNumber::AfterLast => {
-                    if let ProjectedNumber::Exact(number) = num_proj::f64_to_u64(*float) {
-                        SortValue::U64(number)
-                    } else {
-                        self.clone()
-                    }
-                }
-                _ => self.clone(),
-            },
-            SortValue::Datetime(_) => self.clone(),
-        }
-    }
-
     pub fn type_sort_key(&self) -> TypeSortKey {
         match self {
             SortValue::U64(_) => TypeSortKey::Numeric,
