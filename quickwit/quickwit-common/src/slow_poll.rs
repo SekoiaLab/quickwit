@@ -46,7 +46,7 @@ static POLL_DURATION_HISTOGRAM: Lazy<HistogramVec<1>> = Lazy::new(|| {
         "runtime",
         &[],
         ["name"],
-        vec![0.001, 0.004, 0.016, 0.064, 0.256, 1.024, 4.096],
+        vec![0.001, 0.016, 0.256, 4.096],
     )
 });
 
