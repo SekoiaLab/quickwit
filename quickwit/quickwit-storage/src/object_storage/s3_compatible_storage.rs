@@ -35,6 +35,7 @@ use base64::prelude::{BASE64_STANDARD, Engine};
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use once_cell::sync::{Lazy, OnceCell};
+use quickwit_aws::http_client::s3_http_client;
 use quickwit_aws::retry::{AwsRetryable, aws_retry};
 use quickwit_aws::{aws_behavior_version, get_aws_config};
 use quickwit_common::retry::{Retry, RetryParams};
@@ -147,7 +148,9 @@ pub async fn create_s3_client(s3_storage_config: &S3StorageConfig) -> S3Client {
     }
     s3_config.set_credentials_provider(credentials_provider);
     s3_config.set_force_path_style(s3_storage_config.force_path_style_access());
-    s3_config.set_http_client(aws_config.http_client());
+    // Records the S3 connection pool's background tasks (socket reads, TLS, HTTP parsing) as
+    // `s3` rather than attributing them to whichever caller opened each connection.
+    s3_config.set_http_client(aws_config.http_client().map(s3_http_client));
     s3_config.set_retry_config(aws_config.retry_config().cloned());
     s3_config.set_sleep_impl(aws_config.sleep_impl());
     s3_config.set_stalled_stream_protection(aws_config.stalled_stream_protection());

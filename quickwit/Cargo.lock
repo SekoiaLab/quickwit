@@ -6474,6 +6474,7 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "futures",
  "mini-moka",
  "once_cell",
