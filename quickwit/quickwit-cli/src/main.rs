@@ -25,6 +25,7 @@ use quickwit_cli::jemalloc::start_jemalloc_metrics_loop;
 use quickwit_cli::logger::setup_logging_and_tracing;
 use quickwit_cli::{busy_detector, install_default_crypto_ring_provider};
 use quickwit_common::runtimes::{configure_poll_time_histogram, scrape_tokio_runtime_metrics};
+use quickwit_common::slow_poll::configure_task_poll_attribution;
 use quickwit_serve::BuildInfo;
 use tracing::error;
 
@@ -43,6 +44,7 @@ fn main() -> anyhow::Result<()> {
     let main_runtime_num_threads: usize = get_main_runtime_num_threads();
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     configure_poll_time_histogram(&mut runtime_builder);
+    configure_task_poll_attribution(&mut runtime_builder);
     let rt = runtime_builder
         .enable_all()
         .on_thread_unpark(busy_detector::thread_unpark)
