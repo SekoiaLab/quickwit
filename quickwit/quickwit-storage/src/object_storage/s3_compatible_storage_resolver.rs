@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
 use quickwit_config::{S3StorageConfig, StorageBackend};
 use tokio::sync::OnceCell;
@@ -34,6 +35,8 @@ pub struct S3CompatibleObjectStorageFactory {
     // end up being used, or if something like azure, gcs, or even local files, will be used
     // instead.
     s3_client: OnceCell<S3Client>,
+    /// See [`S3CompatibleObjectStorage::with_assembly_thread_pool`].
+    assembly_thread_pool: Option<ThreadPoolWithPriority>,
 }
 
 impl S3CompatibleObjectStorageFactory {
@@ -42,6 +45,16 @@ impl S3CompatibleObjectStorageFactory {
         Self {
             storage_config,
             s3_client: OnceCell::new(),
+            assembly_thread_pool: None,
+        }
+    }
+
+    /// Every storage resolved by this factory assembles large multi-segment response bodies on
+    /// `thread_pool`. See [`S3CompatibleObjectStorage::with_assembly_thread_pool`].
+    pub fn with_assembly_thread_pool(self, thread_pool: ThreadPoolWithPriority) -> Self {
+        Self {
+            assembly_thread_pool: Some(thread_pool),
+            ..self
         }
     }
 }
@@ -58,9 +71,12 @@ impl StorageFactory for S3CompatibleObjectStorageFactory {
             .get_or_init(|| create_s3_client(&self.storage_config))
             .await
             .clone();
-        let storage =
+        let mut storage =
             S3CompatibleObjectStorage::from_uri_and_client(&self.storage_config, uri, s3_client)
                 .await?;
+        if let Some(thread_pool) = &self.assembly_thread_pool {
+            storage = storage.with_assembly_thread_pool(thread_pool.clone());
+        }
         Ok(Arc::new(DebouncedStorage::new(storage)))
     }
 }

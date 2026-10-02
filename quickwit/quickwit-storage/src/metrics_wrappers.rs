@@ -20,7 +20,9 @@ use std::time::Instant;
 
 use aws_smithy_types::byte_stream::ByteStream;
 use bytes::{Bytes, BytesMut};
+use once_cell::sync::Lazy;
 use pin_project::{pin_project, pinned_drop};
+use quickwit_common::thread_pool::with_priority::{Priority, ThreadPoolWithPriority};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::STORAGE_METRICS;
@@ -432,9 +434,16 @@ where
 /// into a freshly allocated buffer, which is expensive well beyond the copy itself:
 /// the pages of that buffer are touched for the first time, so each one costs a
 /// minor page fault and a kernel page zeroing.
+///
+/// When `assembly_thread_pool_opt` is set, assembling a body that arrived in several
+/// segments and reaches [`ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES`] runs on that pool instead
+/// of the tokio worker that polls this future. Copying several megabytes and faulting in
+/// the pages of the destination buffer takes milliseconds, which is too long to hold a
+/// tokio worker on a node whose runtime is also serving other queries.
 pub async fn collect_with_download_metrics(
     mut byte_stream: ByteStream,
     kind: DownloadKind,
+    assembly_thread_pool_opt: Option<&ThreadPoolWithPriority>,
 ) -> io::Result<Bytes> {
     // Dropping this future before the body is exhausted drops the guard, which
     // records the partial download as cancelled.
@@ -452,23 +461,60 @@ pub async fn collect_with_download_metrics(
         segments.push(segment);
     }
     metrics_guard.set_status(DownloadStatus::Done);
-    Ok(coalesce_segments(segments, total_num_bytes))
+    coalesce_segments(segments, total_num_bytes, assembly_thread_pool_opt).await
 }
+
+/// Bodies at least this large that need an actual copy are assembled on the assembly thread pool
+/// when one is configured. Below it, the copy is short enough to run inline.
+///
+/// Configured with `QW_S3_ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES` (default: 5MiB).
+pub(crate) static ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES: Lazy<usize> = Lazy::new(|| {
+    quickwit_common::get_from_env(
+        "QW_S3_ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES",
+        5 * 1024 * 1024,
+        false,
+    )
+});
 
 /// Returns a single [`Bytes`] covering `segments`. Zero-copy when there is at most one segment;
 /// otherwise a single allocation concatenates them.
-pub(crate) fn coalesce_segments(mut segments: Vec<Bytes>, total_num_bytes: usize) -> Bytes {
+///
+/// The copy runs on `thread_pool_opt` when one is given and the body is at least
+/// [`ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES`]; otherwise it runs inline. It is scheduled with a high
+/// priority: the copy is short and the download it completes is awaited by an ongoing request.
+/// Dropping the returned future while the copy is still queued cancels it.
+pub(crate) async fn coalesce_segments(
+    mut segments: Vec<Bytes>,
+    total_num_bytes: usize,
+    thread_pool_opt: Option<&ThreadPoolWithPriority>,
+) -> io::Result<Bytes> {
     match segments.len() {
-        0 => Bytes::new(),
-        1 => segments.remove(0),
-        _ => {
-            let mut out = BytesMut::with_capacity(total_num_bytes);
-            for segment in segments {
-                out.extend_from_slice(&segment);
-            }
-            out.freeze()
-        }
+        0 => return Ok(Bytes::new()),
+        1 => return Ok(segments.remove(0)),
+        _ => {}
     }
+    match thread_pool_opt {
+        Some(thread_pool) if total_num_bytes >= *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES => {
+            thread_pool
+                .run_cpu_intensive_with_priority(
+                    Priority::High,
+                    move || concat_segments(segments, total_num_bytes),
+                    "storage_assembly",
+                    "NA",
+                )
+                .await
+                .map_err(io::Error::other)
+        }
+        _ => Ok(concat_segments(segments, total_num_bytes)),
+    }
+}
+
+fn concat_segments(segments: Vec<Bytes>, total_num_bytes: usize) -> Bytes {
+    let mut out = BytesMut::with_capacity(total_num_bytes);
+    for segment in segments {
+        out.extend_from_slice(&segment);
+    }
+    out.freeze()
 }
 
 /// This is a fork of `tokio::io::copy_buf` that enables tracking the number of
@@ -609,30 +655,79 @@ pub mod opendal_helpers {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_coalesce_segments_does_not_copy_a_single_segment() {
+    #[tokio::test]
+    async fn test_coalesce_segments_does_not_copy_a_single_segment() {
         let segment = Bytes::from_static(b"warmup payload");
         let segment_ptr = segment.as_ptr();
-        let coalesced = coalesce_segments(vec![segment], 14);
+        let coalesced = coalesce_segments(vec![segment], 14, None).await.unwrap();
         assert_eq!(&coalesced[..], b"warmup payload");
         // This is the whole point of `coalesce_segments`: a body that arrived as a
-        // single segment is handed over as is, rather than copied into a buffer that
-        // was just allocated.
+        // single segment is handed over without copying.
         assert_eq!(coalesced.as_ptr(), segment_ptr);
     }
 
-    #[test]
-    fn test_coalesce_segments_concatenates_several_segments() {
+    #[tokio::test]
+    async fn test_coalesce_segments_concatenates_several_segments() {
         let segments = vec![
-            Bytes::from_static(b"war"),
-            Bytes::from_static(b"mup "),
+            Bytes::from_static(b"warmup"),
+            Bytes::from_static(b" "),
             Bytes::from_static(b"payload"),
         ];
-        assert_eq!(&coalesce_segments(segments, 14)[..], b"warmup payload");
+        let coalesced = coalesce_segments(segments, 14, None).await.unwrap();
+        assert_eq!(&coalesced[..], b"warmup payload");
     }
 
-    #[test]
-    fn test_coalesce_segments_empty_body() {
-        assert!(coalesce_segments(Vec::new(), 0).is_empty());
+    #[tokio::test]
+    async fn test_coalesce_segments_empty_body() {
+        assert!(
+            coalesce_segments(Vec::new(), 0, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_segments_large_body_uses_thread_pool() {
+        let threshold = *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES;
+        let thread_pool = ThreadPoolWithPriority::new("assembly_test", Some(1));
+        let segment_len = threshold / 2 + 1;
+        let segments = vec![
+            Bytes::from(vec![1u8; segment_len]),
+            Bytes::from(vec![2u8; segment_len]),
+        ];
+        let total_num_bytes = 2 * segment_len;
+        let coalesced = coalesce_segments(segments, total_num_bytes, Some(&thread_pool))
+            .await
+            .unwrap();
+        assert_eq!(coalesced.len(), total_num_bytes);
+        assert!(coalesced[..segment_len].iter().all(|&byte| byte == 1));
+        assert!(coalesced[segment_len..].iter().all(|&byte| byte == 2));
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_segments_single_large_segment_is_zero_copy() {
+        let threshold = *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES;
+        let thread_pool = ThreadPoolWithPriority::new("assembly_test", Some(1));
+        let segment = Bytes::from(vec![7u8; threshold + 1]);
+        let segment_ptr = segment.as_ptr();
+        let coalesced = coalesce_segments(vec![segment], threshold + 1, Some(&thread_pool))
+            .await
+            .unwrap();
+        assert_eq!(coalesced.as_ptr(), segment_ptr);
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_segments_large_body_without_thread_pool() {
+        let threshold = *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES;
+        let segments = vec![
+            Bytes::from(vec![1u8; threshold]),
+            Bytes::from_static(b"tail"),
+        ];
+        let coalesced = coalesce_segments(segments, threshold + 4, None)
+            .await
+            .unwrap();
+        assert_eq!(coalesced.len(), threshold + 4);
+        assert_eq!(&coalesced[threshold..], b"tail");
     }
 }

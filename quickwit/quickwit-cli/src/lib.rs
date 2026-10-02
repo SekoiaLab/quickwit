@@ -23,6 +23,7 @@ use clap::{Arg, ArgMatches, arg};
 use dialoguer::Confirm;
 use dialoguer::theme::ColorfulTheme;
 use quickwit_common::runtimes::RuntimesConfig;
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
 use quickwit_config::service::QuickwitService;
 use quickwit_config::{
@@ -246,22 +247,54 @@ async fn load_node_config(config_uri: &Uri) -> anyhow::Result<NodeConfig> {
     Ok(config)
 }
 
+/// Builds the storage and metastore resolvers.
+///
+/// When `s3_assembly_thread_pool_opt` is set, S3 storages assemble large downloads on that pool
+/// instead of the tokio runtime. Only searcher-only nodes set it (see
+/// [`s3_assembly_thread_pool_for_services`]).
 fn get_resolvers(
     storage_configs: &StorageConfigs,
     metastore_configs: &MetastoreConfigs,
+    s3_assembly_thread_pool_opt: Option<ThreadPoolWithPriority>,
 ) -> (StorageResolver, MetastoreResolver) {
     // The CLI tests rely on the unconfigured singleton resolvers, so it's better to return them if
     // the storage and metastore configs are not set.
-    if storage_configs.is_empty() && metastore_configs.is_empty() {
+    if storage_configs.is_empty()
+        && metastore_configs.is_empty()
+        && s3_assembly_thread_pool_opt.is_none()
+    {
         return (
             StorageResolver::unconfigured(),
             MetastoreResolver::unconfigured(),
         );
     }
-    let storage_resolver = StorageResolver::configured(storage_configs);
+    let storage_resolver = match s3_assembly_thread_pool_opt {
+        Some(thread_pool) => {
+            StorageResolver::configured_with_s3_assembly_thread_pool(storage_configs, thread_pool)
+        }
+        None => StorageResolver::configured(storage_configs),
+    };
     let metastore_resolver =
         MetastoreResolver::configured(storage_resolver.clone(), metastore_configs);
     (storage_resolver, metastore_resolver)
+}
+
+/// Returns the thread pool on which S3 storages should assemble large downloads, if any.
+///
+/// Only nodes that run the searcher service alone get one: the search thread pool. On such nodes
+/// the tokio runtime only drives searches, so keeping multi-megabyte copies off it is what
+/// bounds the latency of the other queries in flight. Nodes running other services keep the
+/// default inline assembly, as the search thread pool is not sized for their workloads.
+fn s3_assembly_thread_pool_for_services(
+    enabled_services: &HashSet<QuickwitService>,
+) -> Option<ThreadPoolWithPriority> {
+    let is_searcher_only =
+        enabled_services.len() == 1 && enabled_services.contains(&QuickwitService::Searcher);
+    if !is_searcher_only {
+        return None;
+    }
+    info!("searcher-only node: S3 downloads are assembled on the search thread pool");
+    Some(quickwit_search::search_thread_pool().clone())
 }
 
 /// Runs connectivity checks for a given `metastore_uri` and `index_id`.
@@ -521,6 +554,6 @@ mod tests {
         let storage_configs = StorageConfigs::new(vec![s3_storage_config.into()]);
         let metastore_configs = MetastoreConfigs::default();
         let (_storage_resolver, _metastore_resolver) =
-            get_resolvers(&storage_configs, &metastore_configs);
+            get_resolvers(&storage_configs, &metastore_configs, None);
     }
 }
