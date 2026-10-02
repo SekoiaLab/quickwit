@@ -6498,6 +6498,7 @@ dependencies = [
  "humantime",
  "indicatif",
  "itertools 0.14.0",
+ "libc",
  "numfmt",
  "once_cell",
  "openssl-probe 0.1.6",
