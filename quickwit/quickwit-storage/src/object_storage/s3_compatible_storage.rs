@@ -40,7 +40,7 @@ use quickwit_aws::retry::{AwsRetryable, aws_retry};
 use quickwit_aws::{aws_behavior_version, get_aws_config};
 use quickwit_common::metrics::GaugeGuard;
 use quickwit_common::retry::{Retry, RetryParams};
-use quickwit_common::thread_pool::ThreadPool;
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
 use quickwit_common::{chunk_range, into_u64_range};
 use quickwit_config::{S3EncryptionConfig, S3StorageConfig};
@@ -138,7 +138,7 @@ pub struct S3CompatibleObjectStorage {
     /// buffer. `None` assembles them inline on the tokio worker. This is not part of the storage
     /// config: it is set by the node that builds the storage (see
     /// [`Self::with_assembly_thread_pool`]).
-    assembly_thread_pool: Option<ThreadPool>,
+    assembly_thread_pool: Option<ThreadPoolWithPriority>,
 }
 
 impl fmt::Debug for S3CompatibleObjectStorage {
@@ -260,7 +260,7 @@ impl S3CompatibleObjectStorage {
     /// Assembles large multi-segment response bodies on `thread_pool` instead of the tokio
     /// worker polling the download. See
     /// [`crate::metrics_wrappers::collect_with_download_metrics`] for the threshold.
-    pub fn with_assembly_thread_pool(self, thread_pool: ThreadPool) -> Self {
+    pub fn with_assembly_thread_pool(self, thread_pool: ThreadPoolWithPriority) -> Self {
         Self {
             assembly_thread_pool: Some(thread_pool),
             ..self

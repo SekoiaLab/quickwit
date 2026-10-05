@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
-use quickwit_common::thread_pool::ThreadPool;
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
 use quickwit_config::{S3StorageConfig, StorageBackend};
 use tokio::sync::OnceCell;
@@ -36,7 +36,7 @@ pub struct S3CompatibleObjectStorageFactory {
     // instead.
     s3_client: OnceCell<S3Client>,
     /// See [`S3CompatibleObjectStorage::with_assembly_thread_pool`].
-    assembly_thread_pool: Option<ThreadPool>,
+    assembly_thread_pool: Option<ThreadPoolWithPriority>,
 }
 
 impl S3CompatibleObjectStorageFactory {
@@ -51,7 +51,7 @@ impl S3CompatibleObjectStorageFactory {
 
     /// Every storage resolved by this factory assembles large multi-segment response bodies on
     /// `thread_pool`. See [`S3CompatibleObjectStorage::with_assembly_thread_pool`].
-    pub fn with_assembly_thread_pool(self, thread_pool: ThreadPool) -> Self {
+    pub fn with_assembly_thread_pool(self, thread_pool: ThreadPoolWithPriority) -> Self {
         Self {
             assembly_thread_pool: Some(thread_pool),
             ..self

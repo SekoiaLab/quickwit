@@ -22,7 +22,7 @@ use aws_smithy_types::byte_stream::ByteStream;
 use bytes::{Bytes, BytesMut};
 use once_cell::sync::Lazy;
 use pin_project::{pin_project, pinned_drop};
-use quickwit_common::thread_pool::ThreadPool;
+use quickwit_common::thread_pool::with_priority::{Priority, ThreadPoolWithPriority};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::STORAGE_METRICS;
@@ -443,7 +443,7 @@ where
 pub async fn collect_with_download_metrics(
     mut byte_stream: ByteStream,
     kind: DownloadKind,
-    assembly_thread_pool_opt: Option<&ThreadPool>,
+    assembly_thread_pool_opt: Option<&ThreadPoolWithPriority>,
 ) -> io::Result<Bytes> {
     // Dropping this future before the body is exhausted drops the guard, which
     // records the partial download as cancelled.
@@ -480,12 +480,13 @@ pub(crate) static ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES: Lazy<usize> = Lazy::new(
 /// otherwise a single allocation concatenates them.
 ///
 /// The copy runs on `thread_pool_opt` when one is given and the body is at least
-/// [`ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES`]; otherwise it runs inline. Dropping the returned
-/// future while the copy is still queued cancels it.
+/// [`ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES`]; otherwise it runs inline. It is scheduled with a high
+/// priority: the copy is short and the download it completes is awaited by an ongoing request.
+/// Dropping the returned future while the copy is still queued cancels it.
 pub(crate) async fn coalesce_segments(
     mut segments: Vec<Bytes>,
     total_num_bytes: usize,
-    thread_pool_opt: Option<&ThreadPool>,
+    thread_pool_opt: Option<&ThreadPoolWithPriority>,
 ) -> io::Result<Bytes> {
     match segments.len() {
         0 => return Ok(Bytes::new()),
@@ -495,7 +496,8 @@ pub(crate) async fn coalesce_segments(
     match thread_pool_opt {
         Some(thread_pool) if total_num_bytes >= *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES => {
             thread_pool
-                .run_cpu_intensive_with_extra_tags(
+                .run_cpu_intensive_with_priority(
+                    Priority::High,
                     move || concat_segments(segments, total_num_bytes),
                     "storage_assembly",
                     "NA",
@@ -688,7 +690,7 @@ mod tests {
     #[tokio::test]
     async fn test_coalesce_segments_large_body_uses_thread_pool() {
         let threshold = *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES;
-        let thread_pool = ThreadPool::new("assembly_test", Some(1));
+        let thread_pool = ThreadPoolWithPriority::new("assembly_test", Some(1));
         let segment_len = threshold / 2 + 1;
         let segments = vec![
             Bytes::from(vec![1u8; segment_len]),
@@ -706,7 +708,7 @@ mod tests {
     #[tokio::test]
     async fn test_coalesce_segments_single_large_segment_is_zero_copy() {
         let threshold = *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES;
-        let thread_pool = ThreadPool::new("assembly_test", Some(1));
+        let thread_pool = ThreadPoolWithPriority::new("assembly_test", Some(1));
         let segment = Bytes::from(vec![7u8; threshold + 1]);
         let segment_ptr = segment.as_ptr();
         let coalesced = coalesce_segments(vec![segment], threshold + 1, Some(&thread_pool))

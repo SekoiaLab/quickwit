@@ -23,6 +23,7 @@ use itertools::Itertools;
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::shared_consts;
 use quickwit_common::slow_poll::DetectSlowPollExt;
+use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_common::uri::Uri;
 use quickwit_config::build_doc_mapper;
 use quickwit_doc_mapper::DYNAMIC_FIELD_NAME;
@@ -823,7 +824,12 @@ pub(crate) async fn search_partial_hits_phase(
     };
     let merge_result = if aggregation_num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES {
         crate::search_thread_pool()
-            .run_cpu_intensive_with_extra_tags(merge_fruits, "root_merge", cost_class.as_label())
+            .run_cpu_intensive_with_priority(
+                Priority::High,
+                merge_fruits,
+                "root_merge",
+                cost_class.as_label(),
+            )
             .await
     } else {
         Ok(merge_fruits())

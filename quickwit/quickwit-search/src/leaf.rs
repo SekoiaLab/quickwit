@@ -25,6 +25,7 @@ use futures::future::try_join_all;
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_common::thread_pool::Panicked;
+use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
 use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
 use quickwit_proto::search::{
@@ -1393,7 +1394,8 @@ async fn finalize_incremental_merge(
 ) -> Result<tantivy::Result<LeafSearchResponse>, Panicked> {
     if incremental_merge_collector.is_finalize_cpu_intensive() {
         crate::search_thread_pool()
-            .run_cpu_intensive_with_extra_tags(
+            .run_cpu_intensive_with_priority(
+                Priority::High,
                 move || incremental_merge_collector.finalize(),
                 "finalize",
                 cost_class.as_label(),

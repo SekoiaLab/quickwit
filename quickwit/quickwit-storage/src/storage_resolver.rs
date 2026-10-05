@@ -17,7 +17,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use once_cell::sync::Lazy;
-use quickwit_common::thread_pool::ThreadPool;
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::{Protocol, Uri};
 use quickwit_config::{StorageBackend, StorageConfigs};
 
@@ -96,14 +96,14 @@ impl StorageResolver {
     /// over their search thread pool.
     pub fn configured_with_s3_assembly_thread_pool(
         storage_configs: &StorageConfigs,
-        s3_assembly_thread_pool: ThreadPool,
+        s3_assembly_thread_pool: ThreadPoolWithPriority,
     ) -> Self {
         Self::configured_with_options(storage_configs, Some(s3_assembly_thread_pool))
     }
 
     fn configured_with_options(
         storage_configs: &StorageConfigs,
-        s3_assembly_thread_pool_opt: Option<ThreadPool>,
+        s3_assembly_thread_pool_opt: Option<ThreadPoolWithPriority>,
     ) -> Self {
         let mut s3_storage_factory = S3CompatibleObjectStorageFactory::new(
             storage_configs.find_s3().cloned().unwrap_or_default(),

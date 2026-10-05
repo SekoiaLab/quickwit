@@ -23,7 +23,7 @@ use clap::{Arg, ArgMatches, arg};
 use dialoguer::Confirm;
 use dialoguer::theme::ColorfulTheme;
 use quickwit_common::runtimes::RuntimesConfig;
-use quickwit_common::thread_pool::ThreadPool;
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
 use quickwit_config::service::QuickwitService;
 use quickwit_config::{
@@ -255,7 +255,7 @@ async fn load_node_config(config_uri: &Uri) -> anyhow::Result<NodeConfig> {
 fn get_resolvers(
     storage_configs: &StorageConfigs,
     metastore_configs: &MetastoreConfigs,
-    s3_assembly_thread_pool_opt: Option<ThreadPool>,
+    s3_assembly_thread_pool_opt: Option<ThreadPoolWithPriority>,
 ) -> (StorageResolver, MetastoreResolver) {
     // The CLI tests rely on the unconfigured singleton resolvers, so it's better to return them if
     // the storage and metastore configs are not set.
@@ -287,7 +287,7 @@ fn get_resolvers(
 /// default inline assembly, as the search thread pool is not sized for their workloads.
 fn s3_assembly_thread_pool_for_services(
     enabled_services: &HashSet<QuickwitService>,
-) -> Option<ThreadPool> {
+) -> Option<ThreadPoolWithPriority> {
     let is_searcher_only =
         enabled_services.len() == 1 && enabled_services.contains(&QuickwitService::Searcher);
     if !is_searcher_only {
