@@ -33,10 +33,12 @@ use tantivy::schema::{Field, FieldType};
 use tantivy::{ReloadPolicy, Term};
 use tracing::{debug, error, info, instrument};
 
+use crate::cost::compute_split_query_cost;
 use crate::leaf::open_index_with_caches;
-use crate::query_cost_classifier::QueryCostClass;
 use crate::search_job_placer::group_jobs_by_index_id;
-use crate::search_permit_provider::compute_initial_memory_allocation;
+use crate::search_permit_provider::{
+    QueryRemainingCost, SplitSearchTaskMetadata, compute_initial_memory_allocation,
+};
 use crate::{ClusterClient, SearchError, SearchJob, SearcherContext, resolve_index_patterns};
 
 /// Performs a distributed list terms.
@@ -327,19 +329,26 @@ pub async fn leaf_list_terms(
     splits: &[SplitIdAndFooterOffsets],
 ) -> Result<LeafListTermsResponse, SearchError> {
     info!(split_offsets = ?PrettySample::new(splits, 5));
-    let permit_sizes = splits.iter().map(|split| {
-        compute_initial_memory_allocation(
-            split,
-            searcher_context
-                .searcher_config
-                .warmup_single_split_initial_allocation,
-        )
-    });
-    // List terms requests don't run a query, so there is no query AST to classify: they are
-    // always considered regular cost.
+    // List terms requests don't run a query, so the query complexity factor has no effect.
+    let split_tasks: Vec<SplitSearchTaskMetadata> = splits
+        .iter()
+        .map(|split| SplitSearchTaskMetadata {
+            memory_allocation: compute_initial_memory_allocation(
+                split,
+                searcher_context
+                    .searcher_config
+                    .warmup_single_split_initial_allocation,
+            ),
+            job_cost: compute_split_query_cost(split.num_docs, 1.0),
+        })
+        .collect();
+    let total_cost = split_tasks
+        .iter()
+        .map(|split_task| split_task.job_cost)
+        .sum();
     let permits = searcher_context
         .search_permit_provider
-        .get_permits(permit_sizes, QueryCostClass::Regular)
+        .get_permits(split_tasks, QueryRemainingCost::new(total_cost))
         .await;
     let leaf_search_single_split_futures: Vec<_> = splits
         .iter()

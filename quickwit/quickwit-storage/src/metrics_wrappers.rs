@@ -500,7 +500,6 @@ pub(crate) async fn coalesce_segments(
                     Priority::High,
                     move || concat_segments(segments, total_num_bytes),
                     "storage_assembly",
-                    "NA",
                 )
                 .await
                 .map_err(io::Error::other)

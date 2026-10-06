@@ -25,8 +25,6 @@ use quickwit_common::metrics::{
 };
 use quickwit_proto::search::SplitsByOutcome;
 
-use crate::query_cost_classifier::QueryCostClass;
-
 fn print_if_not_null(
     field_name: &'static str,
     counter: &IntCounter,
@@ -145,36 +143,18 @@ pub struct SearchMetrics {
     pub root_search_requests_total: IntCounterVec<2>,
     pub root_search_request_duration_seconds: HistogramVec<2>,
     pub root_search_targeted_splits: HistogramVec<2>,
-    pub leaf_search_requests_total: IntCounterVec<2>,
-    pub leaf_search_request_duration_seconds: HistogramVec<2>,
-    pub leaf_search_targeted_splits: HistogramVec<2>,
+    pub leaf_search_requests_total: IntCounterVec<1>,
+    pub leaf_search_request_duration_seconds: HistogramVec<1>,
+    pub leaf_search_targeted_splits: HistogramVec<1>,
     pub leaf_list_terms_splits_total: IntCounter,
     pub split_search_outcome_total: SplitSearchOutcomeCounters,
     pub leaf_search_split_duration_secs: Histogram,
     pub leaf_search_permit_wait_duration_secs: Histogram,
     pub job_assigned_total: IntCounterVec<1>,
-    pub leaf_search_single_split_tasks_pending: CostClassGauges,
-    pub leaf_search_single_split_tasks_ongoing: CostClassGauges,
+    pub leaf_search_single_split_tasks_pending: IntGauge,
+    pub leaf_search_single_split_tasks_ongoing: IntGauge,
     pub leaf_search_single_split_warmup_num_bytes: Histogram,
     pub searcher_local_kv_store_size_bytes: IntGauge,
-}
-
-/// A pair of gauges (or other cheap metric handle), one per [`QueryCostClass`].
-///
-/// Used to label the leaf search single split task pool / search permits
-/// gauges by the cost class of the query they are serving.
-pub struct CostClassGauges {
-    pub regular: IntGauge,
-    pub costly: IntGauge,
-}
-
-impl CostClassGauges {
-    pub fn get(&self, cost_class: QueryCostClass) -> &IntGauge {
-        match cost_class {
-            QueryCostClass::Regular => &self.regular,
-            QueryCostClass::Costly => &self.costly,
-        }
-    }
 }
 
 /// From 0.064s to 1048s
@@ -207,15 +187,12 @@ impl Default for SearchMetrics {
             ByteSize::gb(5).as_u64() as f64,
         ];
 
-        let leaf_search_single_split_tasks = new_gauge_vec::<2>(
+        let leaf_search_single_split_tasks = new_gauge_vec::<1>(
             "leaf_search_single_split_tasks",
-            "Number of single split search tasks pending or ongoing, by query cost class",
+            "Number of single split search tasks pending or ongoing",
             "search",
             &[],
-            [
-                "status", // "ongoing" or "pending"
-                "cost_class",
-            ],
+            ["status"], // takes values "ongoing" or "pending"
         );
 
         SearchMetrics {
@@ -247,14 +224,14 @@ impl Default for SearchMetrics {
                 "Total number of leaf search gRPC requests processed.",
                 "search",
                 &[("kind", "server")],
-                ["status", "cost_class"],
+                ["status"],
             ),
             leaf_search_request_duration_seconds: new_histogram_vec(
                 "leaf_search_request_duration_seconds",
                 "Duration of leaf search gRPC requests in seconds.",
                 "search",
                 &[("kind", "server")],
-                ["status", "cost_class"],
+                ["status"],
                 duration_buckets(),
             ),
             leaf_search_targeted_splits: new_histogram_vec(
@@ -262,7 +239,7 @@ impl Default for SearchMetrics {
                 "Number of splits targeted per leaf search GRPC request.",
                 "search",
                 &[],
-                ["status", "cost_class"],
+                ["status"],
                 targeted_splits_buckets,
             ),
 
@@ -290,18 +267,10 @@ impl Default for SearchMetrics {
                 exponential_buckets(0.001, 2.0, 17).unwrap(),
             ),
             // we need to expose the gauges here to provide a static ref to for the gauge guards
-            leaf_search_single_split_tasks_ongoing: CostClassGauges {
-                regular: leaf_search_single_split_tasks
-                    .with_label_values(["ongoing", QueryCostClass::Regular.as_label()]),
-                costly: leaf_search_single_split_tasks
-                    .with_label_values(["ongoing", QueryCostClass::Costly.as_label()]),
-            },
-            leaf_search_single_split_tasks_pending: CostClassGauges {
-                regular: leaf_search_single_split_tasks
-                    .with_label_values(["pending", QueryCostClass::Regular.as_label()]),
-                costly: leaf_search_single_split_tasks
-                    .with_label_values(["pending", QueryCostClass::Costly.as_label()]),
-            },
+            leaf_search_single_split_tasks_ongoing: leaf_search_single_split_tasks
+                .with_label_values(["ongoing"]),
+            leaf_search_single_split_tasks_pending: leaf_search_single_split_tasks
+                .with_label_values(["pending"]),
             leaf_search_single_split_warmup_num_bytes: new_histogram(
                 "leaf_search_single_split_warmup_num_bytes",
                 "Size of the short lived cache for a single split once the warmup is done.",
@@ -329,8 +298,8 @@ impl Default for SearchMetrics {
 /// Metrics for the permit provider.
 #[derive(Clone)]
 pub struct SearchTaskMetrics {
-    pub ongoing_tasks: &'static CostClassGauges,
-    pub pending_tasks: &'static CostClassGauges,
+    pub ongoing_tasks: &'static IntGauge,
+    pub pending_tasks: &'static IntGauge,
 }
 
 impl SearchMetrics {
