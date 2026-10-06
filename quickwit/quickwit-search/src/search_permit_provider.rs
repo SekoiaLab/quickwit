@@ -46,7 +46,7 @@ pub enum SearchPermitMessage {
     Request {
         permit_sender: oneshot::Sender<Vec<SearchPermitFuture>>,
         splits: Vec<SplitSearchTaskMetadata>,
-        remaining_cost: QueryRemainingCost,
+        remaining_cost: Arc<QueryRemainingCost>,
     },
     UpdateMemory {
         memory_delta: i64,
@@ -65,34 +65,58 @@ pub struct SplitSearchTaskMetadata {
     pub job_cost: usize,
 }
 
-/// Estimated cost of the splits of a leaf search request that have not been granted a permit yet.
+/// Estimated cost of the splits of a leaf search request that are not done yet, split between the
+/// splits that are still awaiting a permit and the ones in progress (granted a permit that wasn't
+/// dropped yet).
 ///
 /// It is shared by the permit requests of all the indexes targeted by the leaf search request,
 /// so that they are all served by the remaining cost of the whole request. It must therefore be
 /// initialized with the cost of all the splits of the request, before requesting any permit.
 ///
-/// Only the [`SearchPermitProvider`] decrements it, as it grants permits. Granted permits keep a
-/// handle to it, see [`SearchPermit::remaining_query_cost`].
-#[derive(Clone, Debug)]
-pub struct QueryRemainingCost(Arc<AtomicUsize>);
+/// The [`SearchPermitProvider`] moves the cost of a split from awaiting a permit to in progress
+/// as it grants its permit, and the permit removes it when dropped. Granted permits keep a handle
+/// to it, see [`SearchPermit::remaining_cost_awaiting_permit`] and
+/// [`SearchPermit::remaining_cost_in_progress`].
+#[derive(Debug)]
+pub struct QueryRemainingCost {
+    awaiting_permit: AtomicUsize,
+    in_progress: AtomicUsize,
+}
 
 impl QueryRemainingCost {
-    pub fn new(total_cost: usize) -> Self {
-        QueryRemainingCost(Arc::new(AtomicUsize::new(total_cost)))
+    pub fn new(total_cost: usize) -> Arc<Self> {
+        Arc::new(QueryRemainingCost {
+            awaiting_permit: AtomicUsize::new(total_cost),
+            in_progress: AtomicUsize::new(0),
+        })
     }
 
-    fn get(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
+    fn awaiting_permit(&self) -> usize {
+        self.awaiting_permit.load(Ordering::Relaxed)
     }
 
-    /// Subtracts `cost`, saturating at 0.
-    fn decrement(&self, cost: usize) {
-        self.0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                Some(remaining.saturating_sub(cost))
-            })
-            .expect("the update closure always returns Some");
+    fn in_progress(&self) -> usize {
+        self.in_progress.load(Ordering::Relaxed)
     }
+
+    /// Moves `cost` from awaiting a permit to in progress.
+    fn start(&self, cost: usize) {
+        saturating_sub(&self.awaiting_permit, cost);
+        self.in_progress.fetch_add(cost, Ordering::Relaxed);
+    }
+
+    /// Removes `cost` from in progress.
+    fn finish(&self, cost: usize) {
+        saturating_sub(&self.in_progress, cost);
+    }
+}
+
+fn saturating_sub(counter: &AtomicUsize, value: usize) {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(value))
+        })
+        .expect("the update closure always returns Some");
 }
 
 /// Makes very pessimistic estimate of the memory allocation required for a split search
@@ -158,7 +182,7 @@ impl SearchPermitProvider {
     pub async fn get_permits(
         &self,
         splits: impl IntoIterator<Item = SplitSearchTaskMetadata>,
-        remaining_cost: QueryRemainingCost,
+        remaining_cost: Arc<QueryRemainingCost>,
     ) -> Vec<SearchPermitFuture> {
         let splits: Vec<SplitSearchTaskMetadata> = splits.into_iter().collect();
         if splits.is_empty() {
@@ -207,7 +231,7 @@ struct LeafPermitRequest {
     /// Single split permit requests for this leaf search.
     single_split_permit_requests: std::vec::IntoIter<SingleSplitPermitRequest>,
     /// Remaining cost of the search request, possibly shared with other leaf permit requests.
-    remaining_cost: QueryRemainingCost,
+    remaining_cost: Arc<QueryRemainingCost>,
     /// Arrival order, used to break ties between requests with the same remaining cost.
     sequence: u64,
 }
@@ -215,7 +239,7 @@ struct LeafPermitRequest {
 impl LeafPermitRequest {
     fn from_estimated_costs(
         splits: Vec<SplitSearchTaskMetadata>,
-        remaining_cost: QueryRemainingCost,
+        remaining_cost: Arc<QueryRemainingCost>,
         sequence: u64,
     ) -> (Self, Vec<SearchPermitFuture>) {
         let mut permits = Vec::with_capacity(splits.len());
@@ -320,21 +344,23 @@ impl SearchPermitActor {
     /// Also returns the remaining cost of its search request.
     fn pop_next_request_if_serviceable(
         &mut self,
-    ) -> Option<(SingleSplitPermitRequest, QueryRemainingCost)> {
+    ) -> Option<(SingleSplitPermitRequest, Arc<QueryRemainingCost>)> {
         if self.num_search_slots_available == 0 {
             return None;
         }
         let available_memory = self
             .total_memory_budget
             .checked_sub(self.total_memory_allocated)?;
-        let (next_idx, _) = self
-            .permits_requests
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, leaf_req)| (leaf_req.remaining_cost.get(), leaf_req.sequence))?;
+        let (next_idx, _) =
+            self.permits_requests
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, leaf_req)| {
+                    (leaf_req.remaining_cost.awaiting_permit(), leaf_req.sequence)
+                })?;
         let leaf_req = &mut self.permits_requests[next_idx];
         let permit_request = leaf_req.pop_if_smaller_than(available_memory)?;
-        leaf_req.remaining_cost.decrement(permit_request.job_cost);
+        leaf_req.remaining_cost.start(permit_request.job_cost);
         let remaining_cost = leaf_req.remaining_cost.clone();
         if leaf_req.is_empty() {
             // the order of the remaining requests is given by their sequence, not their position
@@ -358,6 +384,7 @@ impl SearchPermitActor {
                     _ongoing_gauge_guard: ongoing_gauge_guard,
                     msg_sender: self.msg_sender.clone(),
                     memory_allocation: permit_request.permit_size,
+                    job_cost: permit_request.job_cost,
                     remaining_query_cost,
                 })
                 // if the requester dropped its receiver, we drop the newly
@@ -377,8 +404,11 @@ pub struct SearchPermit {
     _ongoing_gauge_guard: GaugeGuard<'static>,
     msg_sender: mpsc::WeakUnboundedSender<SearchPermitMessage>,
     memory_allocation: u64,
-    /// Remaining cost of the search request, still updated as other permits are granted.
-    remaining_query_cost: QueryRemainingCost,
+    /// Cost of the split this permit was granted to, counted in progress until it is dropped.
+    job_cost: usize,
+    /// Remaining cost of the search request, still updated as other permits are granted or
+    /// dropped.
+    remaining_query_cost: Arc<QueryRemainingCost>,
 }
 
 impl SearchPermit {
@@ -396,12 +426,18 @@ impl SearchPermit {
         ByteSize(self.memory_allocation)
     }
 
-    /// Current remaining cost of the search request this permit belongs to, i.e. the estimated
-    /// cost of its splits that are still waiting for a permit.
+    /// Current estimated cost of the splits of the search request this permit belongs to that
+    /// are still waiting for a permit.
     ///
     /// It decreases as permits are granted to the request, including after this one was.
-    pub fn remaining_query_cost(&self) -> usize {
-        self.remaining_query_cost.get()
+    pub fn remaining_cost_awaiting_permit(&self) -> usize {
+        self.remaining_query_cost.awaiting_permit()
+    }
+
+    /// Current estimated cost of the splits of the search request this permit belongs to that
+    /// were granted a permit that is not dropped yet, including this one.
+    pub fn remaining_cost_in_progress(&self) -> usize {
+        self.remaining_query_cost.in_progress()
     }
 
     fn send_if_still_running(&self, msg: SearchPermitMessage) {
@@ -417,6 +453,7 @@ impl SearchPermit {
 
 impl Drop for SearchPermit {
     fn drop(&mut self) {
+        self.remaining_query_cost.finish(self.job_cost);
         self.send_if_still_running(SearchPermitMessage::Drop {
             memory_size: self.memory_allocation,
         });
@@ -678,7 +715,7 @@ mod tests {
         // Only one permit is granted at a time: each one is dropped before getting the next.
         while let Some(result) = join_set.join_next().await {
             let (request, split_idx, permit) = result.unwrap();
-            execution_order.push((request, split_idx, permit.remaining_query_cost()));
+            execution_order.push((request, split_idx, permit.remaining_cost_awaiting_permit()));
         }
         assert_eq!(
             execution_order,
@@ -697,21 +734,30 @@ mod tests {
     #[tokio::test]
     async fn test_permit_remaining_query_cost_follows_later_grants() {
         let permit_provider = SearchPermitProvider::new(2, ByteSize::mb(100), test_metrics());
+        let remaining_cost = QueryRemainingCost::new(30);
         let mut permit_futures = permit_provider
-            .get_permits(splits(10, 3, 10), QueryRemainingCost::new(30))
+            .get_permits(splits(10, 3, 10), remaining_cost.clone())
             .await
             .into_iter();
         // The first two permits are granted together: both see the cost left after that batch.
         let first_permit = permit_futures.next().unwrap().await;
         let second_permit = permit_futures.next().unwrap().await;
-        assert_eq!(first_permit.remaining_query_cost(), 10);
-        assert_eq!(second_permit.remaining_query_cost(), 10);
+        assert_eq!(first_permit.remaining_cost_awaiting_permit(), 10);
+        assert_eq!(second_permit.remaining_cost_awaiting_permit(), 10);
+        assert_eq!(first_permit.remaining_cost_in_progress(), 20);
 
         // Granting the last permit is visible from the permits granted before it.
         drop(first_permit);
         let third_permit = permit_futures.next().unwrap().await;
-        assert_eq!(second_permit.remaining_query_cost(), 0);
-        assert_eq!(third_permit.remaining_query_cost(), 0);
+        assert_eq!(second_permit.remaining_cost_awaiting_permit(), 0);
+        assert_eq!(third_permit.remaining_cost_awaiting_permit(), 0);
+        assert_eq!(second_permit.remaining_cost_in_progress(), 20);
+
+        // Dropping the permits completes the request.
+        drop(second_permit);
+        drop(third_permit);
+        assert_eq!(remaining_cost.awaiting_permit(), 0);
+        assert_eq!(remaining_cost.in_progress(), 0);
     }
 
     #[tokio::test]

@@ -622,11 +622,13 @@ async fn leaf_search_single_split(
 
     let warmup_start = Instant::now();
     leaf_search_state_guard.set_state(SplitSearchState::WarmUp);
-    // The tasks of the splits whose query is closest to completion run first. The remaining cost
-    // keeps decreasing as the query's other splits get permits, so it is read right before
+    // The tasks of the splits whose query is closest to completion run first: the one with the
+    // least work awaiting a permit, then with the least work in progress. Both keep changing as
+    // the query's other splits get permits and complete, so they are read right before
     // submitting tasks.
     let warmup_priority = Priority::Normal {
-        remaining_cost_awaiting_permit: search_permit.remaining_query_cost(),
+        remaining_cost_awaiting_permit: search_permit.remaining_cost_awaiting_permit(),
+        remaining_cost_in_progress: search_permit.remaining_cost_in_progress(),
     };
     warmup(&searcher, &warmup_info, warmup_priority).await?;
     let warmup_end = Instant::now();
@@ -654,7 +656,8 @@ async fn leaf_search_single_split(
 
     leaf_search_state_guard.set_state(SplitSearchState::CpuQueue);
     let cpu_priority = Priority::Normal {
-        remaining_cost_awaiting_permit: search_permit.remaining_query_cost(),
+        remaining_cost_awaiting_permit: search_permit.remaining_cost_awaiting_permit(),
+        remaining_cost_in_progress: search_permit.remaining_cost_in_progress(),
     };
     let cpu_task = move || {
         leaf_search_state_guard.set_state(SplitSearchState::Cpu);
@@ -1495,7 +1498,7 @@ pub async fn single_doc_mapping_leaf_search(
     doc_mapper: Arc<DocMapper>,
     aggregations_limits: AggregationLimitsGuard,
     query_complexity_factor: f32,
-    remaining_cost: QueryRemainingCost,
+    remaining_cost: Arc<QueryRemainingCost>,
 ) -> Result<LeafSearchResponse, SearchError> {
     let num_docs: u64 = splits.iter().map(|split| split.num_docs).sum();
     let num_splits = splits.len();
