@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io;
+use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
@@ -24,8 +25,10 @@ use once_cell::sync::Lazy;
 use pin_project::{pin_project, pinned_drop};
 use quickwit_common::thread_pool::with_priority::{Priority, ThreadPoolWithPriority};
 use tokio::io::{AsyncBufRead, AsyncWrite};
+use tokio::task::JoinHandle;
 
 use crate::STORAGE_METRICS;
+use crate::storage::DOWNLOAD_WRITE_BUFFER_CAPACITY;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ActionLabel {
@@ -464,6 +467,97 @@ pub async fn collect_with_download_metrics(
     coalesce_segments(segments, total_num_bytes, assembly_thread_pool_opt).await
 }
 
+/// Downloads a response body into `file`, recording the same metrics as
+/// [`copy_with_download_metrics`].
+///
+/// The body segments are written straight from the buffers they arrived in. Going through a
+/// `BufWriter<tokio::fs::File>` instead would copy every byte twice more: into the `BufWriter`,
+/// and then into the file's own buffer before it is handed to the blocking pool. Instead,
+/// segments are batched up to [`DOWNLOAD_WRITE_BUFFER_CAPACITY`] bytes and each batch is written
+/// with vectored writes in a single blocking task. Like `tokio::fs::File`, at most one batch is
+/// being written while the next one is received.
+pub async fn write_with_download_metrics(
+    byte_stream: ByteStream,
+    file: std::fs::File,
+    kind: DownloadKind,
+) -> io::Result<u64> {
+    // Dropping this future before the body is exhausted drops the guard, which
+    // records the partial download as cancelled.
+    let mut metrics_guard = DownloadMetricsGuard::new(kind);
+    let result = write_segments_to_file(byte_stream, file, &mut metrics_guard).await;
+    metrics_guard.set_status(match &result {
+        Ok(_) => DownloadStatus::Done,
+        Err(error) => DownloadStatus::Failed(io_error_as_label(error.kind())),
+    });
+    result
+}
+
+async fn write_segments_to_file(
+    mut byte_stream: ByteStream,
+    file: std::fs::File,
+    metrics_guard: &mut DownloadMetricsGuard,
+) -> io::Result<u64> {
+    let file = Arc::new(file);
+    let mut pending_write_opt: Option<JoinHandle<io::Result<()>>> = None;
+    let mut batch: Vec<Bytes> = Vec::new();
+    let mut batch_num_bytes: usize = 0;
+    let mut total_num_bytes: u64 = 0;
+    loop {
+        let segment_opt = byte_stream
+            .next()
+            .await
+            .transpose()
+            .map_err(io::Error::other)?;
+        let is_last = segment_opt.is_none();
+        if let Some(segment) = segment_opt {
+            metrics_guard.record_bytes(segment.len() as u64);
+            total_num_bytes += segment.len() as u64;
+            batch_num_bytes += segment.len();
+            batch.push(segment);
+        }
+        if !is_last && batch_num_bytes < DOWNLOAD_WRITE_BUFFER_CAPACITY {
+            continue;
+        }
+        if let Some(pending_write) = pending_write_opt.take() {
+            pending_write.await??;
+        }
+        if !batch.is_empty() {
+            let segments = std::mem::take(&mut batch);
+            batch_num_bytes = 0;
+            let file = file.clone();
+            pending_write_opt = Some(tokio::task::spawn_blocking(move || {
+                write_all_segments(&file, &segments)
+            }));
+        }
+        if is_last {
+            if let Some(pending_write) = pending_write_opt.take() {
+                pending_write.await??;
+            }
+            return Ok(total_num_bytes);
+        }
+    }
+}
+
+/// Writes all `segments` with as few `writev` calls as possible.
+fn write_all_segments(mut file: &std::fs::File, segments: &[Bytes]) -> io::Result<()> {
+    let mut io_slices: Vec<IoSlice> = segments
+        .iter()
+        .map(|segment| IoSlice::new(segment))
+        .collect();
+    let mut io_slices: &mut [IoSlice] = &mut io_slices;
+    // Drops leading empty slices, so that a write of 0 bytes means the file refuses data.
+    IoSlice::advance_slices(&mut io_slices, 0);
+    while !io_slices.is_empty() {
+        match file.write_vectored(io_slices) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(num_bytes) => IoSlice::advance_slices(&mut io_slices, num_bytes),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Bodies at least this large that need an actual copy are assembled on the assembly thread pool
 /// when one is configured. Below it, the copy is short enough to run inline.
 ///
@@ -652,7 +746,61 @@ pub mod opendal_helpers {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::primitives::SdkBody;
+    use futures::StreamExt;
+    use hyper::body::Frame;
+
     use super::*;
+
+    fn byte_stream_from_segments(segments: Vec<io::Result<Bytes>>) -> ByteStream {
+        let body = futures::stream::iter(segments).map(|segment_res| segment_res.map(Frame::data));
+        ByteStream::new(SdkBody::from_body_1_x(http_body_util::StreamBody::new(
+            body,
+        )))
+    }
+
+    #[tokio::test]
+    async fn test_write_with_download_metrics_several_batches() {
+        // Spans three batches, with empty segments that must not stall the vectored writes.
+        let segment_len = DOWNLOAD_WRITE_BUFFER_CAPACITY / 3 + 7;
+        let segments: Vec<Bytes> = (0..8u8)
+            .flat_map(|i| [Bytes::new(), Bytes::from(vec![i; segment_len])])
+            .collect();
+        let expected: Vec<u8> = segments.concat();
+        let byte_stream = byte_stream_from_segments(segments.into_iter().map(Ok).collect());
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let file = temp_file.reopen().unwrap();
+        let num_bytes = write_with_download_metrics(byte_stream, file, DownloadKind::Object)
+            .await
+            .unwrap();
+        assert_eq!(num_bytes, expected.len() as u64);
+        assert_eq!(std::fs::read(temp_file.path()).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_write_with_download_metrics_empty_body() {
+        let byte_stream = byte_stream_from_segments(Vec::new());
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let file = temp_file.reopen().unwrap();
+        let num_bytes = write_with_download_metrics(byte_stream, file, DownloadKind::Object)
+            .await
+            .unwrap();
+        assert_eq!(num_bytes, 0);
+        assert!(std::fs::read(temp_file.path()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_with_download_metrics_body_error() {
+        let byte_stream = byte_stream_from_segments(vec![
+            Ok(Bytes::from_static(b"partial")),
+            Err(io::Error::other("connection reset")),
+        ]);
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let file = temp_file.reopen().unwrap();
+        write_with_download_metrics(byte_stream, file, DownloadKind::Object)
+            .await
+            .unwrap_err();
+    }
 
     #[tokio::test]
     async fn test_coalesce_segments_does_not_copy_a_single_segment() {

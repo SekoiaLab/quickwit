@@ -45,18 +45,18 @@ use quickwit_common::uri::Uri;
 use quickwit_common::{chunk_range, into_u64_range};
 use quickwit_config::{S3EncryptionConfig, S3StorageConfig};
 use regex::Regex;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::Semaphore;
 use tracing::{info, instrument, warn};
 
 use crate::metrics::{STORAGE_METRICS, object_storage_get_slice_in_flight_guards};
 use crate::metrics_wrappers::{
     ActionLabel, DownloadKind, RequestMetricsWrapperExt, collect_with_download_metrics,
-    copy_with_download_metrics,
+    copy_with_download_metrics, write_with_download_metrics,
 };
 use crate::object_storage::MultiPartPolicy;
 use crate::stable_deref_bytes::into_owned_bytes;
-use crate::storage::SendableAsync;
+use crate::storage::{DownloadTempFile, SendableAsync};
 use crate::{
     BulkDeleteError, DeleteFailure, OwnedBytes, Storage, StorageError, StorageErrorKind,
     StorageResolverError, StorageResult,
@@ -884,10 +884,24 @@ impl Storage for S3CompatibleObjectStorage {
         let _permit = REQUEST_SEMAPHORE.acquire().await;
         let (get_object_output, _connection_permit) =
             aws_retry(&self.retry_params, || self.get_object(path, None)).await?;
-        let mut body_read = BufReader::new(get_object_output.body.into_async_read());
+        // The body is already an `AsyncBufRead` handing out its segments as they arrived:
+        // wrapping it into a `BufReader` would only copy them into the reader's buffer.
+        let mut body_read = std::pin::pin!(get_object_output.body.into_async_read());
         copy_with_download_metrics(&mut body_read, output, DownloadKind::Object).await?;
         output.flush().await?;
         Ok(())
+    }
+
+    async fn copy_to_file(&self, path: &Path, output_path: &Path) -> StorageResult<u64> {
+        let (download_temp_file, file) =
+            DownloadTempFile::with_target_path(output_path.to_path_buf()).await?;
+        let file = file.into_std().await;
+        let _permit = REQUEST_SEMAPHORE.acquire().await;
+        let (get_object_output, _connection_permit) =
+            aws_retry(&self.retry_params, || self.get_object(path, None)).await?;
+        write_with_download_metrics(get_object_output.body, file, DownloadKind::Object).await?;
+        let num_bytes = download_temp_file.persist().await?;
+        Ok(num_bytes)
     }
 
     async fn delete(&self, path: &Path) -> StorageResult<()> {
@@ -1152,6 +1166,61 @@ mod tests {
         let requests = client.actual_requests().collect::<Vec<_>>();
         assert_eq!(requests.len(), 2);
         assert!(requests[0].uri().to_string().ends_with("DeleteObject"));
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_copy_to_file() {
+        let content: Vec<u8> = (0..crate::storage::DOWNLOAD_WRITE_BUFFER_CAPACITY * 2 + 12_345)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let client = StaticReplayClient::new(vec![ReplayEvent::new(
+            http::Request::builder().body(SdkBody::empty()).unwrap(),
+            http::Response::builder()
+                .body(SdkBody::from(content.clone()))
+                .unwrap(),
+        )]);
+        let credentials = Credentials::new("mock_key", "mock_secret", None, None, "mock_provider");
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_behavior_version())
+            .region(Some(Region::new("Foo")))
+            .http_client(client.clone())
+            .credentials_provider(credentials)
+            .build();
+        let s3_storage = S3CompatibleObjectStorage {
+            s3_client: S3Client::from_conf(config),
+            uri: Uri::for_test("s3://bucket/indexes"),
+            bucket: "bucket".to_string(),
+            prefix: PathBuf::new(),
+            multipart_policy: MultiPartPolicy::default(),
+            retry_params: RetryParams::for_test(),
+            disable_multi_object_delete: false,
+            disable_multipart_upload: false,
+            encryption: None,
+            assembly_thread_pool: None,
+        };
+        // Goes through the debouncer, like the split cache does.
+        let storage = crate::DebouncedStorage::new(s3_storage);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_filepath = temp_dir.path().join("split");
+        let num_bytes = storage
+            .copy_to_file(Path::new("split"), &dest_filepath)
+            .await
+            .unwrap();
+        assert_eq!(num_bytes, content.len() as u64);
+        assert_eq!(std::fs::read(&dest_filepath).unwrap(), content);
+        let filenames: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|dir_entry| dir_entry.unwrap().file_name())
+            .collect();
+        assert_eq!(filenames, ["split"]);
+        let requests = client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .uri()
+                .to_string()
+                .ends_with("/split?x-id=GetObject")
+        );
     }
 
     #[tokio::test]

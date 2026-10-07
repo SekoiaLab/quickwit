@@ -144,9 +144,13 @@ async fn default_copy_to_file<S: Storage + ?Sized>(
     path: &Path,
     output_path: &Path,
 ) -> StorageResult<u64> {
-    let mut download_temp_file =
+    let (download_temp_file, file) =
         DownloadTempFile::with_target_path(output_path.to_path_buf()).await?;
-    storage.copy_to(path, download_temp_file.as_mut()).await?;
+    let mut file = BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER_CAPACITY, file);
+    storage.copy_to(path, &mut file).await?;
+    // `copy_to` is required to flush, but `persist` reads the file size: make sure every
+    // write has landed whatever the implementation did.
+    file.flush().await?;
     let num_bytes = download_temp_file.persist().await?;
     Ok(num_bytes)
 }
@@ -154,18 +158,21 @@ async fn default_copy_to_file<S: Storage + ?Sized>(
 /// Every write to a `tokio::fs::File` is dispatched to the blocking thread pool, and downloads
 /// typically arrive in chunks of a few KiB. Buffering amortizes that dispatch over large writes.
 /// Matches the largest write `tokio::fs::File` performs per blocking call by default.
-const DOWNLOAD_WRITE_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
+pub(crate) const DOWNLOAD_WRITE_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
 
-struct DownloadTempFile {
+/// Temporary file a download is written to, moved to its target path once complete and deleted
+/// otherwise.
+pub(crate) struct DownloadTempFile {
     target_filepath: PathBuf,
     temp_filepath: PathBuf,
-    file: BufWriter<File>,
     has_attempted_deletion: bool,
 }
 
 impl DownloadTempFile {
-    /// Creates or truncate temp file.
-    pub async fn with_target_path(target_filepath: PathBuf) -> io::Result<DownloadTempFile> {
+    /// Creates or truncate temp file, returning the guard and the file to write the download to.
+    pub async fn with_target_path(
+        target_filepath: PathBuf,
+    ) -> io::Result<(DownloadTempFile, File)> {
         let Some(filename) = target_filepath.file_name() else {
             return Err(io::Error::other(
                 "Target filepath is not a directory path. Expected a filepath.",
@@ -177,17 +184,16 @@ impl DownloadTempFile {
         let mut temp_filepath = target_filepath.clone();
         temp_filepath.set_file_name(format!("{filename}.temp"));
         let file = tokio::fs::File::create(temp_filepath.clone()).await?;
-        Ok(DownloadTempFile {
+        let download_temp_file = DownloadTempFile {
             target_filepath,
             temp_filepath,
-            file: BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER_CAPACITY, file),
             has_attempted_deletion: false,
-        })
+        };
+        Ok((download_temp_file, file))
     }
 
+    /// Moves the temp file to its target path. Every write must have completed.
     pub async fn persist(mut self) -> io::Result<u64> {
-        // should be noop but flush just in case.
-        self.file.flush().await?;
         TempPath::from_path(&self.temp_filepath).persist(&self.target_filepath)?;
         self.has_attempted_deletion = true;
         let num_bytes = std::fs::metadata(&self.target_filepath)?.len();
@@ -207,12 +213,6 @@ impl Drop for DownloadTempFile {
                 error!(temp_filepath=%temp_filepath.display(), io_error=?io_error, "Failed to remove temporary file");
             }
         });
-    }
-}
-
-impl AsMut<BufWriter<File>> for DownloadTempFile {
-    fn as_mut(&mut self) -> &mut BufWriter<File> {
-        &mut self.file
     }
 }
 
@@ -266,17 +266,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_download_temp_file_persist_flushes_buffered_writes() {
+    async fn test_download_temp_file_persist() {
         let temp_dir = tempfile::tempdir().unwrap();
         let dest_filepath = temp_dir.path().join("bar");
-        let mut download_temp_file = DownloadTempFile::with_target_path(dest_filepath.clone())
-            .await
-            .unwrap();
-        download_temp_file
-            .as_mut()
-            .write_all(CONTENT)
-            .await
-            .unwrap();
+        let (download_temp_file, mut file) =
+            DownloadTempFile::with_target_path(dest_filepath.clone())
+                .await
+                .unwrap();
+        file.write_all(CONTENT).await.unwrap();
+        file.flush().await.unwrap();
         let num_bytes = download_temp_file.persist().await.unwrap();
         assert_eq!(num_bytes, CONTENT.len() as u64);
         assert_eq!(std::fs::read(&dest_filepath).unwrap(), CONTENT);

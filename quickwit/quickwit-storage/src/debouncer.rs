@@ -149,6 +149,10 @@ impl<T: Storage> Storage for DebouncedStorage<T> {
         self.underlying.copy_to(path, output).await
     }
 
+    async fn copy_to_file(&self, path: &Path, output_path: &Path) -> StorageResult<u64> {
+        self.underlying.copy_to_file(path, output_path).await
+    }
+
     async fn get_slice(&self, path: &Path, range: Range<usize>) -> StorageResult<OwnedBytes> {
         let (debouncer, underlying) = (self.slice_debouncer.clone(), self.underlying.clone());
         let key = (path.to_owned(), range);
