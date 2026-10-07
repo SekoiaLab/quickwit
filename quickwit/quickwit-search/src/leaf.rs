@@ -2357,7 +2357,7 @@ mod tests {
         ))
         .collect();
         assert!(
-            warm_up_automatons(&searcher, &valid, Priority::default(),)
+            warm_up_automatons(&searcher, &valid, Priority::default())
                 .await
                 .is_ok()
         );
@@ -2374,7 +2374,7 @@ mod tests {
         ))
         .collect();
         assert!(
-            warm_up_automatons(&searcher, &valid_json, Priority::default(),)
+            warm_up_automatons(&searcher, &valid_json, Priority::default())
                 .await
                 .is_ok()
         );

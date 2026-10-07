@@ -65,18 +65,11 @@ pub struct SplitSearchTaskMetadata {
     pub job_cost: usize,
 }
 
-/// Estimated cost of the splits of a leaf search request that are not done yet, split between the
-/// splits that are still awaiting a permit and the ones in progress (granted a permit that wasn't
-/// dropped yet).
+/// Estimated cost of the splits of a leaf search request that are not done yet.
 ///
-/// It is shared by the permit requests of all the indexes targeted by the leaf search request,
-/// so that they are all served by the remaining cost of the whole request. It must therefore be
-/// initialized with the cost of all the splits of the request, before requesting any permit.
-///
-/// The [`SearchPermitProvider`] moves the cost of a split from awaiting a permit to in progress
-/// as it grants its permit, and the permit removes it when dropped. Granted permits keep a handle
-/// to it, see [`SearchPermit::remaining_cost_awaiting_permit`] and
-/// [`SearchPermit::remaining_cost_in_progress`].
+/// It is shared by the permit requests of all the indexes targeted by the leaf
+/// search request. It helps assessing the overall remaining cost of the search
+/// request, even though the permits are requested by index.
 #[derive(Debug)]
 pub struct QueryRemainingCost {
     awaiting_permit: AtomicUsize,
@@ -212,9 +205,10 @@ struct SearchPermitActor {
     /// When it happens, new permits will not be assigned until the memory is freed.
     total_memory_budget: u64,
     total_memory_allocated: u64,
-    /// Pending requests, served by lowest remaining cost then by sequence. The remaining cost
-    /// of a request changes when permits are granted to another request sharing it, so this
-    /// is scanned rather than kept in a heap.
+    /// Pending requests, served by lowest remaining cost then by sequence. Use
+    /// a plain Vec because the cost is shared with subqueries to other indexes.
+    /// We can go back to a heap when the permit request is moved up to the
+    /// multi index query step.
     permits_requests: Vec<LeafPermitRequest>,
     next_permit_request_sequence: u64,
     #[cfg(test)]
