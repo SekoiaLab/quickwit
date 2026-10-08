@@ -15,6 +15,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use itertools::{Either, Itertools};
 use quickwit_common::binary_heap::{SortKeyMapper, TopK};
@@ -996,6 +997,13 @@ impl QuickwitCollector {
             ..WarmupInfo::default()
         }
     }
+
+    /// Returns whether merging the aggregation results of `leaf_responses` with
+    /// [`Collector::merge_fruits`] is CPU intensive enough to run on the search thread pool.
+    pub(crate) fn is_merge_cpu_intensive(&self, leaf_responses: &[LeafSearchResponse]) -> bool {
+        AggregationMergeSummary::of_leaf_responses(self.aggregation.as_ref(), leaf_responses)
+            .is_cpu_intensive()
+    }
 }
 
 impl Collector for QuickwitCollector {
@@ -1449,6 +1457,80 @@ pub(crate) struct IncrementalCollector {
     splits_by_outcome: Option<SplitsByOutcome>,
 }
 
+/// Merging intermediate aggregation results totalling fewer bytes than this is cheap enough to run
+/// on the calling task, without going through the search thread pool.
+static AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    quickwit_common::get_from_env(
+        "QW_AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES",
+        128 * 1024,
+        false,
+    )
+});
+
+/// The intermediate aggregation results about to be merged, by the leaf `finalize` or by the root
+/// merge, summarized to decide whether the merge is worth the search thread pool's hand-off and
+/// queue.
+enum AggregationMergeSummary {
+    NoAggregation,
+    FindTraceIds { num_results: usize },
+    Tantivy { num_bytes: usize },
+}
+
+impl AggregationMergeSummary {
+    /// Summarizes the results accumulated by a leaf's incremental collector.
+    fn of_incremental(incremental_aggregation: &QuickwitIncrementalAggregations) -> Self {
+        match incremental_aggregation {
+            QuickwitIncrementalAggregations::FindTraceIdsAggregation(_, state) => {
+                AggregationMergeSummary::FindTraceIds {
+                    num_results: state.len(),
+                }
+            }
+            QuickwitIncrementalAggregations::TantivyAggregations(_, state) => {
+                AggregationMergeSummary::Tantivy {
+                    num_bytes: state.iter().map(Vec::len).sum(),
+                }
+            }
+            QuickwitIncrementalAggregations::NoAggregation => {
+                AggregationMergeSummary::NoAggregation
+            }
+        }
+    }
+
+    /// Summarizes the results of the leaf responses merged by the root.
+    fn of_leaf_responses(
+        aggregation_opt: Option<&QuickwitAggregations>,
+        leaf_responses: &[LeafSearchResponse],
+    ) -> Self {
+        let intermediate_results = leaf_responses
+            .iter()
+            .filter_map(|leaf_response| leaf_response.intermediate_aggregation_result.as_ref());
+        match aggregation_opt {
+            Some(QuickwitAggregations::FindTraceIdsAggregation(_)) => {
+                AggregationMergeSummary::FindTraceIds {
+                    num_results: intermediate_results.count(),
+                }
+            }
+            Some(QuickwitAggregations::TantivyAggregations(_)) => {
+                AggregationMergeSummary::Tantivy {
+                    num_bytes: intermediate_results.map(Vec::len).sum(),
+                }
+            }
+            None => AggregationMergeSummary::NoAggregation,
+        }
+    }
+
+    fn is_cpu_intensive(&self) -> bool {
+        match self {
+            AggregationMergeSummary::NoAggregation => false,
+            // Expensive to merge whatever their size, as soon as there are several of them.
+            AggregationMergeSummary::FindTraceIds { num_results } => *num_results > 1,
+            AggregationMergeSummary::Tantivy { num_bytes } => {
+                *num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES
+            }
+        }
+    }
+}
+
 impl IncrementalCollector {
     /// Create a new incremental collector
     pub(crate) fn new(collector: QuickwitCollector) -> Self {
@@ -1524,6 +1606,12 @@ impl IncrementalCollector {
     }
 
     /// Finalize the merge, creating a LeafSearchResponse.
+    /// Returns whether [`Self::finalize`] is likely CPU intensive enough to run on the search
+    /// thread pool. Finalizing is cheap unless it has aggregation results to merge.
+    pub(crate) fn is_finalize_cpu_intensive(&self) -> bool {
+        AggregationMergeSummary::of_incremental(&self.incremental_aggregation).is_cpu_intensive()
+    }
+
     pub(crate) fn finalize(self) -> tantivy::Result<LeafSearchResponse> {
         let intermediate_aggregation_result = self.incremental_aggregation.finalize()?;
         let mut partial_hits = self.top_k_hits.finalize();
@@ -2572,5 +2660,68 @@ mod tests {
                 .unwrap();
         let _merged: IntermediateAggregationResults = postcard::from_bytes(&serialized).unwrap();
         // Hopefully `_merged` is empty but the API does not allow us to assert that.
+    }
+
+    #[test]
+    fn test_is_finalize_cpu_intensive_depends_on_aggregation_size() {
+        let request_without_aggregation = SearchRequest {
+            max_hits: 10,
+            ..Default::default()
+        };
+        let collector =
+            make_merge_collector(&request_without_aggregation, Default::default()).unwrap();
+        let mut incremental_collector = IncrementalCollector::new(collector);
+        incremental_collector
+            .add_result(LeafSearchResponse::default())
+            .unwrap();
+        assert!(!incremental_collector.is_finalize_cpu_intensive());
+
+        let request_with_aggregation = SearchRequest {
+            max_hits: 10,
+            aggregation_request: Some(
+                r#"{"count_by_field": {"terms": {"field": "field"}}}"#.to_string(),
+            ),
+            ..Default::default()
+        };
+        let collector =
+            make_merge_collector(&request_with_aggregation, Default::default()).unwrap();
+        let mut incremental_collector = IncrementalCollector::new(collector);
+        // Intermediate aggregation results are only parsed when finalizing.
+        incremental_collector
+            .add_result(LeafSearchResponse {
+                intermediate_aggregation_result: Some(vec![0; 16]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!incremental_collector.is_finalize_cpu_intensive());
+        incremental_collector
+            .add_result(LeafSearchResponse {
+                intermediate_aggregation_result: Some(vec![
+                    0;
+                    *super::AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES
+                ]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(incremental_collector.is_finalize_cpu_intensive());
+    }
+
+    #[test]
+    fn test_is_merge_cpu_intensive_offloads_several_trace_id_results() {
+        let request = SearchRequest {
+            max_hits: 10,
+            aggregation_request: Some(
+                r#"{"num_traces":20,"trace_id_field_name":"trace_id","span_timestamp_field_name":"span_start_timestamp_nanos"}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let merge_collector = make_merge_collector(&request, Default::default()).unwrap();
+        let small_result = || LeafSearchResponse {
+            intermediate_aggregation_result: Some(vec![0; 16]),
+            ..Default::default()
+        };
+        assert!(!merge_collector.is_merge_cpu_intensive(&[small_result()]));
+        assert!(merge_collector.is_merge_cpu_intensive(&[small_result(), small_result()]));
     }
 }

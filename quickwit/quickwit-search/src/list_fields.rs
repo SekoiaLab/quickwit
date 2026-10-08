@@ -34,7 +34,6 @@ use quickwit_proto::types::{IndexId, IndexUid};
 use quickwit_storage::Storage;
 
 use crate::leaf::open_split_bundle;
-use crate::query_cost_classifier::QueryCostClass;
 use crate::search_job_placer::group_jobs_by_index_id;
 use crate::service::SearcherContext;
 use crate::{
@@ -370,11 +369,7 @@ pub async fn leaf_list_fields(
         merge_leaf_list_fields(filtered_list_fields_sorted_iters)
     };
     let fields = search_thread_pool()
-        .run_cpu_intensive_with_extra_tags(
-            cpu_task,
-            "leaf_list_fields",
-            QueryCostClass::Regular.as_label(),
-        )
+        .run_cpu_intensive_with_extra_tags(cpu_task, "leaf_list_fields")
         .await
         .context("failed to merge single split list fields")??;
     Ok(ListFieldsResponse { fields })
@@ -457,7 +452,6 @@ pub async fn root_list_fields(
                 merge_leaf_list_fields(leaf_list_fields)
             },
             "root_list_fields",
-            QueryCostClass::Regular.as_label(),
         )
         .await
         .context("failed to merge leaf list fields responses")??;

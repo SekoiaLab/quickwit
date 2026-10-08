@@ -20,6 +20,7 @@
 mod client;
 mod cluster_client;
 mod collector;
+mod cost;
 mod error;
 mod fetch_docs;
 mod find_trace_ids_collector;
@@ -49,7 +50,7 @@ mod tests;
 
 pub use collector::QuickwitAggregations;
 use metrics::SEARCH_METRICS;
-use quickwit_common::thread_pool::ThreadPool;
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::tower::Pool;
 use quickwit_doc_mapper::DocMapper;
 use quickwit_proto::metastore::{
@@ -132,11 +133,16 @@ fn compute_search_thread_pool_num_threads() -> Option<usize> {
     Some(threads)
 }
 
-fn search_thread_pool() -> &'static ThreadPool {
-    static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
+/// Returns the process-wide thread pool on which CPU-intensive search work runs.
+///
+/// Besides the search crate, searcher-only nodes hand it to the storage layer so that large
+/// object storage downloads are assembled on it rather than on the tokio runtime.
+pub fn search_thread_pool() -> &'static ThreadPoolWithPriority {
+    static SEARCH_THREAD_POOL: OnceLock<ThreadPoolWithPriority> = OnceLock::new();
 
-    SEARCH_THREAD_POOL
-        .get_or_init(|| ThreadPool::new("search", compute_search_thread_pool_num_threads()))
+    SEARCH_THREAD_POOL.get_or_init(|| {
+        ThreadPoolWithPriority::new("search", compute_search_thread_pool_num_threads())
+    })
 }
 
 #[cfg(test)]

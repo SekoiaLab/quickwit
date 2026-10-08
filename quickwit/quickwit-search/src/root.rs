@@ -23,6 +23,7 @@ use itertools::Itertools;
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::shared_consts;
 use quickwit_common::slow_poll::DetectSlowPollExt;
+use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_common::uri::Uri;
 use quickwit_config::build_doc_mapper;
 use quickwit_doc_mapper::DYNAMIC_FIELD_NAME;
@@ -798,24 +799,26 @@ pub(crate) async fn search_partial_hits_phase(
     let merge_collector =
         make_merge_collector(search_request, searcher_context.get_aggregation_limits())?;
 
-    // Merging is a cpu-bound task.
-    // It should be executed by Tokio's blocking threads.
+    // Merging is CPU bound, but only worth the search thread pool's hand-off and queue when there
+    // are enough aggregation results to merge.
+    let is_merge_cpu_intensive = merge_collector.is_merge_cpu_intensive(&leaf_search_responses);
 
     // Wrap into result for merge_fruits
     let leaf_search_results: Vec<tantivy::Result<LeafSearchResponse>> =
         leaf_search_responses.into_iter().map(Ok).collect_vec();
-    let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
     let span = info_span!("merge_fruits");
-    let mut leaf_search_response = crate::search_thread_pool()
-        .run_cpu_intensive_with_extra_tags(
-            move || {
-                let _span_guard = span.enter();
-                merge_collector.merge_fruits(leaf_search_results)
-            },
-            "root_merge",
-            cost_class.as_label(),
-        )
-        .await
+    let merge_fruits = move || {
+        let _span_guard = span.enter();
+        merge_collector.merge_fruits(leaf_search_results)
+    };
+    let merge_result = if is_merge_cpu_intensive {
+        crate::search_thread_pool()
+            .run_cpu_intensive_with_priority(Priority::High, merge_fruits, "root_merge")
+            .await
+    } else {
+        Ok(merge_fruits())
+    };
+    let mut leaf_search_response = merge_result
         .context("failed to merge leaf search responses")?
         .map_err(|error: TantivyError| crate::SearchError::Internal(error.to_string()))?;
     debug!(
@@ -1299,6 +1302,7 @@ fn record_request_span(search_request: &SearchRequest) -> tracing::Span {
         elapsed_ms = tracing::field::Empty,
         targeted_splits_bytes = tracing::field::Empty,
         num_targeted_splits = tracing::field::Empty,
+        query_complexity_factor = tracing::field::Empty,
     );
     if let Some(agg) = search_request.aggregation_request.as_ref() {
         record_all!(span, agg = %agg);
@@ -1347,7 +1351,15 @@ pub async fn root_search(
         .map(|split| split.footer_offsets.end)
         .sum();
     let num_targeted_splits = split_metadatas.len();
-    record_all!(req_span, targeted_splits_bytes, num_targeted_splits);
+    // Planning resolved the query AST, which can now be scored.
+    let query_complexity_factor =
+        query_cost_classifier::query_complexity_factor_or_default(&search_request);
+    record_all!(
+        req_span,
+        targeted_splits_bytes,
+        num_targeted_splits,
+        query_complexity_factor
+    );
 
     let mut search_response_result = RootSearchMetricsFuture {
         start: start_instant,

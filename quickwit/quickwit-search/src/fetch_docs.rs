@@ -180,7 +180,9 @@ async fn fetch_docs_in_split(
     .context("open-index-for-split")?;
     // we add an executor here, we could add it in open_index_with_caches, though we should verify
     // the side-effect before
-    let tantivy_executor = crate::search_thread_pool().get_executor("fetch_docs", "unknown");
+    // Doc fetching is on the critical path of the response: it runs on the small tasks pool so it
+    // does not queue behind split searches.
+    let tantivy_executor = quickwit_common::thread_pool::small_tasks_tantivy_executor("fetch_docs");
     index.set_executor(tantivy_executor);
     let index_reader = index
         .reader_builder()

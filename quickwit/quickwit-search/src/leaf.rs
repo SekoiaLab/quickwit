@@ -24,6 +24,8 @@ use bytesize::ByteSize;
 use futures::future::try_join_all;
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::slow_poll::DetectSlowPollExt;
+use quickwit_common::thread_pool::Panicked;
+use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
 use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
 use quickwit_proto::search::{
@@ -52,10 +54,12 @@ use tracing::*;
 use ulid::Ulid;
 
 use crate::collector::{IncrementalCollector, make_collector_for_split, make_merge_collector};
+use crate::cost::compute_split_query_cost;
 use crate::metrics::SplitSearchOutcomeCounters;
-use crate::query_cost_classifier::QueryCostClass;
 use crate::root::is_metadata_count_request_with_ast;
-use crate::search_permit_provider::{SearchPermit, compute_initial_memory_allocation};
+use crate::search_permit_provider::{
+    QueryRemainingCost, SearchPermit, SplitSearchTaskMetadata, compute_initial_memory_allocation,
+};
 use crate::service::{SearcherContext, deserialize_doc_mapper};
 use crate::soft_delete_query::SoftDeleteQuery;
 use crate::{QuickwitAggregations, SearchError};
@@ -221,10 +225,12 @@ pub(crate) async fn open_index_with_caches(
 /// This is e.g. required for term aggregation, since we don't know in advance which terms are going
 /// to be hit.
 #[instrument(skip_all)]
+///
+/// `priority` schedules the CPU intensive parts of the warmup on the search thread pool.
 pub(crate) async fn warmup(
     searcher: &Searcher,
     warmup_info: &WarmupInfo,
-    cost_class: QueryCostClass,
+    priority: Priority,
 ) -> anyhow::Result<()> {
     debug!(warmup_info=?warmup_info);
     let warm_up_terms_future = warm_up_terms(searcher, &warmup_info.terms_grouped_by_field)
@@ -240,13 +246,10 @@ pub(crate) async fn warmup(
     let warm_up_fieldnorms_future = warm_up_fieldnorms(searcher, warmup_info.field_norms)
         .detect_slow_poll("leaf_single_split:warm_up_fieldnorms")
         .instrument(debug_span!("warm_up_fieldnorms"));
-    let warm_up_automatons_future = warm_up_automatons(
-        searcher,
-        &warmup_info.automatons_grouped_by_field,
-        cost_class,
-    )
-    .detect_slow_poll("leaf_single_split:warm_up_automatons")
-    .instrument(debug_span!("warm_up_automatons"));
+    let warm_up_automatons_future =
+        warm_up_automatons(searcher, &warmup_info.automatons_grouped_by_field, priority)
+            .detect_slow_poll("leaf_single_split:warm_up_automatons")
+            .instrument(debug_span!("warm_up_automatons"));
 
     tokio::try_join!(
         warm_up_terms_future,
@@ -344,14 +347,18 @@ async fn warm_up_term_ranges(
 async fn warm_up_automatons(
     searcher: &Searcher,
     terms_grouped_by_field: &HashMap<Field, HashSet<Automaton>>,
-    cost_class: QueryCostClass,
+    priority: Priority,
 ) -> anyhow::Result<()> {
     let mut warm_up_futures = Vec::new();
-    let cpu_intensive_executor = |task| async {
-        crate::search_thread_pool()
-            .run_cpu_intensive_with_extra_tags(task, "automaton_warmup", cost_class.as_label())
-            .await
-            .map_err(|_| std::io::Error::other("task panicked"))?
+    // Tantivy runs two CPU intensive steps through these executors: selecting the term dictionary
+    // blocks the automaton can match, and scanning the terms of those blocks.
+    let cpu_intensive_executor = |caller: &'static str| {
+        move |task: Box<dyn FnOnce() -> std::io::Result<()> + Send>| async move {
+            crate::search_thread_pool()
+                .run_cpu_intensive_with_priority(priority, task, caller)
+                .await
+                .map_err(|_| std::io::Error::other("task panicked"))?
+        }
     };
     for (field, automatons) in terms_grouped_by_field {
         for segment_reader in searcher.segment_readers() {
@@ -361,8 +368,19 @@ async fn warm_up_automatons(
                 warm_up_futures.push(async move {
                     match automaton {
                         Automaton::Regex(path, patterns) => {
-                            let regex =
-                                tantivy_fst::Regex::from_patterns(patterns).with_context(|| {
+                            let patterns = patterns.clone();
+                            let regex = crate::search_thread_pool()
+                                .run_cpu_intensive_with_priority(
+                                    priority,
+                                    move || {
+                                        tantivy_fst::Regex::from_patterns(&patterns)
+                                            .map_err(anyhow::Error::from)
+                                    },
+                                    "automaton_warmup_build",
+                                )
+                                .await
+                                .context("regex build panicked during warmup")?
+                                .with_context(|| {
                                     format!(
                                         "failed to build regex during warmup for field `{}`",
                                         full_path(*field, path, searcher.schema()),
@@ -376,7 +394,8 @@ async fn warm_up_automatons(
                                             automaton: Arc::new(regex),
                                             prefix: path.clone().unwrap_or_default(),
                                         },
-                                        cpu_intensive_executor,
+                                        cpu_intensive_executor("automaton_warmup_select_blocks"),
+                                        cpu_intensive_executor("automaton_warmup_scan_terms"),
                                     )
                                     .await
                                     .with_context(|| {
@@ -392,7 +411,8 @@ async fn warm_up_automatons(
                                             automaton: Arc::new(regexes),
                                             prefix: path.clone().unwrap_or_default(),
                                         },
-                                        cpu_intensive_executor,
+                                        cpu_intensive_executor("automaton_warmup_select_blocks"),
+                                        cpu_intensive_executor("automaton_warmup_scan_terms"),
                                     )
                                     .await
                                     .with_context(|| {
@@ -405,7 +425,11 @@ async fn warm_up_automatons(
                             }
                         }
                         Automaton::TermSet(automaton) => inv_idx_clone
-                            .warm_postings_automaton(automaton.clone(), cpu_intensive_executor)
+                            .warm_postings_automaton(
+                                automaton.clone(),
+                                cpu_intensive_executor("automaton_warmup_select_blocks"),
+                                cpu_intensive_executor("automaton_warmup_scan_terms"),
+                            )
                             .await
                             .context("failed to warm term set"),
                     }
@@ -563,7 +587,15 @@ async fn leaf_search_single_split(
 
     let warmup_start = Instant::now();
     leaf_search_state_guard.set_state(SplitSearchState::WarmUp);
-    warmup(&searcher, &warmup_info, ctx.cost_class).await?;
+    // The tasks of the splits whose query is closest to completion run first: the one with the
+    // least work awaiting a permit, then with the least work in progress. Both keep changing as
+    // the query's other splits get permits and complete, so they are read right before
+    // submitting tasks.
+    let warmup_priority = Priority::Normal {
+        remaining_cost_awaiting_permit: search_permit.remaining_cost_awaiting_permit(),
+        remaining_cost_in_progress: search_permit.remaining_cost_in_progress(),
+    };
+    warmup(&searcher, &warmup_info, warmup_priority).await?;
     let warmup_end = Instant::now();
     let warmup_duration: Duration = warmup_end.duration_since(warmup_start);
     let warmup_size = ByteSize(byte_range_cache.get_num_bytes());
@@ -588,6 +620,10 @@ async fn leaf_search_single_split(
     let ctx_clone = ctx.clone();
 
     leaf_search_state_guard.set_state(SplitSearchState::CpuQueue);
+    let cpu_priority = Priority::Normal {
+        remaining_cost_awaiting_permit: search_permit.remaining_cost_awaiting_permit(),
+        remaining_cost_in_progress: search_permit.remaining_cost_in_progress(),
+    };
     let cpu_task = move || {
         leaf_search_state_guard.set_state(SplitSearchState::Cpu);
         let cpu_start = Instant::now();
@@ -629,7 +665,7 @@ async fn leaf_search_single_split(
     };
     let search_request_and_result: Option<(SearchRequest, LeafSearchResponse)> =
         crate::search_thread_pool()
-            .run_cpu_intensive_with_extra_tags(cpu_task, "split_search", ctx.cost_class.as_label())
+            .run_cpu_intensive_with_priority(cpu_priority, cpu_task, "split_search")
             .await
             .map_err(|_| {
                 crate::SearchError::Internal(format!("leaf search panicked. split={split_id}"))
@@ -1246,11 +1282,13 @@ impl CanSplitDoBetter {
 /// Searches multiple splits, potentially in multiple indexes, sitting on different storages and
 /// having different doc mappings.
 #[instrument(skip_all, fields(index = ?PrettySample::new(&leaf_search_request.search_request.as_ref().unwrap().index_id_patterns, 5)))]
+/// `query_complexity_factor` is computed once from the original request, see
+/// [`crate::cost::compute_query_complexity_factor`].
 pub async fn multi_index_leaf_search(
     searcher_context: Arc<SearcherContext>,
     leaf_search_request: LeafSearchRequest,
     storage_resolver: &StorageResolver,
-    cost_class: QueryCostClass,
+    query_complexity_factor: f32,
 ) -> Result<LeafSearchResponse, SearchError> {
     let search_request: Arc<SearchRequest> = leaf_search_request
         .search_request
@@ -1264,6 +1302,15 @@ pub async fn multi_index_leaf_search(
         .collect::<crate::Result<_>>()?;
     // Creates a collector which merges responses into one
     let aggregation_limits = searcher_context.get_aggregation_limits();
+    // The remaining cost is shared by the permit requests of all the indexes, so that they are
+    // all served by the cost of the whole leaf request.
+    let total_cost: usize = leaf_search_request
+        .leaf_requests
+        .iter()
+        .flat_map(|leaf_request_ref| &leaf_request_ref.split_offsets)
+        .map(|split| compute_split_query_cost(split.num_docs, query_complexity_factor))
+        .sum();
+    let remaining_cost = QueryRemainingCost::new(total_cost);
     // TODO: to avoid lockstep, we should pull up the future creation over the list of split ids
     // and have the semaphore on this level.
     // This will lower resource consumption due to less in-flight futures and avoid contention.
@@ -1299,6 +1346,7 @@ pub async fn multi_index_leaf_search(
             let searcher_context = searcher_context.clone();
             let search_request = search_request.clone();
             let aggregation_limits = aggregation_limits.clone();
+            let remaining_cost = remaining_cost.clone();
             async move {
                 let storage = storage_resolver.resolve(&index_uri).await?;
                 single_doc_mapping_leaf_search(
@@ -1308,7 +1356,8 @@ pub async fn multi_index_leaf_search(
                     leaf_search_request_ref.split_offsets,
                     doc_mapper,
                     aggregation_limits,
-                    cost_class,
+                    query_complexity_factor,
+                    remaining_cost,
                 )
                 .await
             }
@@ -1323,15 +1372,27 @@ pub async fn multi_index_leaf_search(
         incremental_merge_collector.add_result(result??)?;
     }
 
-    crate::search_thread_pool()
-        .run_cpu_intensive_with_extra_tags(
-            || incremental_merge_collector.finalize().map_err(Into::into),
-            "finalize",
-            cost_class.as_label(),
-        )
+    finalize_incremental_merge(incremental_merge_collector)
         .instrument(info_span!("incremental_merge_finalize"))
         .await
         .context("failed to merge split search responses")?
+        .map_err(Into::into)
+}
+
+async fn finalize_incremental_merge(
+    incremental_merge_collector: IncrementalCollector,
+) -> Result<tantivy::Result<LeafSearchResponse>, Panicked> {
+    if incremental_merge_collector.is_finalize_cpu_intensive() {
+        crate::search_thread_pool()
+            .run_cpu_intensive_with_priority(
+                Priority::High,
+                move || incremental_merge_collector.finalize(),
+                "finalize",
+            )
+            .await
+    } else {
+        Ok(incremental_merge_collector.finalize())
+    }
 }
 
 /// Optimizes the search_request based on CanSplitDoBetter
@@ -1389,6 +1450,11 @@ fn disable_search_request_hits(search_request: &mut SearchRequest) {
 /// [PartialHit](quickwit_proto::search::PartialHit) candidates. The root will be in
 /// charge to consolidate, identify the actual final top hits to display, and
 /// fetch the actual documents to convert the partial hits into actual Hits.
+///
+/// `remaining_cost` must account for the cost of `splits`, computed with
+/// `query_complexity_factor`. It can be shared with the searches of other indexes of the same leaf
+/// request.
+#[allow(clippy::too_many_arguments)]
 pub async fn single_doc_mapping_leaf_search(
     searcher_context: Arc<SearcherContext>,
     request: Arc<SearchRequest>,
@@ -1396,11 +1462,18 @@ pub async fn single_doc_mapping_leaf_search(
     splits: Vec<SplitIdAndFooterOffsets>,
     doc_mapper: Arc<DocMapper>,
     aggregations_limits: AggregationLimitsGuard,
-    cost_class: QueryCostClass,
+    query_complexity_factor: f32,
+    remaining_cost: Arc<QueryRemainingCost>,
 ) -> Result<LeafSearchResponse, SearchError> {
     let num_docs: u64 = splits.iter().map(|split| split.num_docs).sum();
     let num_splits = splits.len();
-    info!(num_docs, num_splits, split_offsets = ?PrettySample::new(&splits, 5));
+    info!(
+        num_docs,
+        num_splits,
+        query_complexity_factor,
+        split_offsets = ?PrettySample::new(&splits, 5),
+        "single doc mapping leaf started"
+    );
 
     let split_filter = CanSplitDoBetter::from_request(&request, doc_mapper.timestamp_field_name());
     let split_with_req = split_filter.optimize(request.clone(), splits)?;
@@ -1413,17 +1486,20 @@ pub async fn single_doc_mapping_leaf_search(
 
     // We acquire all of the leaf search permits to make sure our single split search tasks
     // do no interleave with other leaf search requests.
-    let permit_sizes = split_with_req.iter().map(|(split, _)| {
-        compute_initial_memory_allocation(
-            split,
-            searcher_context
-                .searcher_config
-                .warmup_single_split_initial_allocation,
-        )
-    });
+    let split_tasks = split_with_req
+        .iter()
+        .map(|(split, _)| SplitSearchTaskMetadata {
+            memory_allocation: compute_initial_memory_allocation(
+                split,
+                searcher_context
+                    .searcher_config
+                    .warmup_single_split_initial_allocation,
+            ),
+            job_cost: compute_split_query_cost(split.num_docs, query_complexity_factor),
+        });
     let permit_futures = searcher_context
         .search_permit_provider
-        .get_permits(permit_sizes, cost_class)
+        .get_permits(split_tasks, remaining_cost)
         .await;
 
     let leaf_search_context = Arc::new(LeafSearchContext {
@@ -1432,7 +1508,6 @@ pub async fn single_doc_mapping_leaf_search(
         incremental_merge_collector: incremental_merge_collector.clone(),
         doc_mapper: doc_mapper.clone(),
         split_filter: split_filter.clone(),
-        cost_class,
     });
 
     let mut join_set = JoinSet::new();
@@ -1506,12 +1581,7 @@ pub async fn single_doc_mapping_leaf_search(
     }
 
     let leaf_search_response_reresult: Result<Result<LeafSearchResponse, _>, _> =
-        crate::search_thread_pool()
-            .run_cpu_intensive_with_extra_tags(
-                || incremental_merge_collector.finalize(),
-                "finalize",
-                cost_class.as_label(),
-            )
+        finalize_incremental_merge(incremental_merge_collector)
             .instrument(info_span!("incremental_merge_intermediate"))
             .await
             .context("failed to merge split search responses");
@@ -1586,7 +1656,6 @@ struct LeafSearchContext {
     incremental_merge_collector: Arc<Mutex<IncrementalCollector>>,
     doc_mapper: Arc<DocMapper>,
     split_filter: Arc<RwLock<CanSplitDoBetter>>,
-    cost_class: QueryCostClass,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2253,7 +2322,7 @@ mod tests {
         ))
         .collect();
         assert!(
-            warm_up_automatons(&searcher, &valid, QueryCostClass::Regular)
+            warm_up_automatons(&searcher, &valid, Priority::default())
                 .await
                 .is_ok()
         );
@@ -2270,7 +2339,7 @@ mod tests {
         ))
         .collect();
         assert!(
-            warm_up_automatons(&searcher, &valid_json, QueryCostClass::Regular)
+            warm_up_automatons(&searcher, &valid_json, Priority::default())
                 .await
                 .is_ok()
         );
@@ -2282,7 +2351,7 @@ mod tests {
             HashSet::from([Automaton::Regex(None, vec!["(".to_string()])]),
         ))
         .collect();
-        let error = warm_up_automatons(&searcher, &invalid, QueryCostClass::Regular)
+        let error = warm_up_automatons(&searcher, &invalid, Priority::default())
             .await
             .unwrap_err()
             .to_string();
@@ -2297,7 +2366,7 @@ mod tests {
             HashSet::from([Automaton::Regex(Some(json_path), vec!["(".to_string()])]),
         ))
         .collect();
-        let error = warm_up_automatons(&searcher, &invalid_json, QueryCostClass::Regular)
+        let error = warm_up_automatons(&searcher, &invalid_json, Priority::default())
             .await
             .unwrap_err()
             .to_string();
