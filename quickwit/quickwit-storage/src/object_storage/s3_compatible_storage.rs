@@ -126,13 +126,11 @@ async fn acquire_get_object_connection_permit() -> GetObjectConnectionPermit {
     }
 }
 
-/// Wraps a response body together with its connection permit. The permit is released as soon
-/// as the expected number of bytes has been read, at EOF, or on a read error, so that a caller
-/// holding on to the reader does not keep a permit for a finished request.
+/// Wrap the async read handle together with the connection permit to keep the permit alive
+/// until the handle is dropped
 struct S3AsyncRead<T: AsyncRead + Send + Unpin> {
     read: T,
-    num_bytes_remaining: usize,
-    connection_permit_opt: Option<GetObjectConnectionPermit>,
+    _connection_permit: GetObjectConnectionPermit,
 }
 
 impl<T: AsyncRead + Send + Unpin> AsyncRead for S3AsyncRead<T> {
@@ -142,26 +140,7 @@ impl<T: AsyncRead + Send + Unpin> AsyncRead for S3AsyncRead<T> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let self_unpin = self.get_mut();
-        let num_filled_before = buf.filled().len();
-        let poll_res = Pin::new(&mut self_unpin.read).poll_read(cx, buf);
-        match &poll_res {
-            Poll::Ready(Ok(())) => {
-                let num_bytes_read = buf.filled().len() - num_filled_before;
-                self_unpin.num_bytes_remaining = self_unpin
-                    .num_bytes_remaining
-                    .saturating_sub(num_bytes_read);
-                // Reading zero bytes into a non-empty buffer signals EOF.
-                let is_eof = num_bytes_read == 0 && buf.remaining() > 0;
-                if self_unpin.num_bytes_remaining == 0 || is_eof {
-                    self_unpin.connection_permit_opt = None;
-                }
-            }
-            Poll::Ready(Err(_)) => {
-                self_unpin.connection_permit_opt = None;
-            }
-            Poll::Pending => {}
-        }
-        poll_res
+        Pin::new(&mut self_unpin.read).poll_read(cx, buf)
     }
 }
 
@@ -973,8 +952,7 @@ impl Storage for S3CompatibleObjectStorage {
         .await?;
         Ok(Box::new(S3AsyncRead {
             read: get_object_output.body.into_async_read(),
-            num_bytes_remaining: range.len(),
-            connection_permit_opt: Some(connection_permit),
+            _connection_permit: connection_permit,
         }))
     }
 
@@ -1070,35 +1048,6 @@ mod tests {
         for invalid_value in ["0", "-1", "", "abc", "1.5", too_many_permits.as_str()] {
             parse_max_get_object_connections(Some(invalid_value)).unwrap_err();
         }
-    }
-
-    #[tokio::test]
-    async fn test_s3_async_read_releases_permit_once_range_is_read() {
-        let mut reader = S3AsyncRead {
-            read: &b"hello"[..],
-            num_bytes_remaining: 5,
-            connection_permit_opt: Some(acquire_get_object_connection_permit().await),
-        };
-        let mut buf = [0u8; 3];
-        reader.read_exact(&mut buf).await.unwrap();
-        assert!(reader.connection_permit_opt.is_some());
-        let mut buf = [0u8; 2];
-        reader.read_exact(&mut buf).await.unwrap();
-        assert!(reader.connection_permit_opt.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_s3_async_read_releases_permit_at_eof() {
-        // The body is shorter than the requested range.
-        let mut reader = S3AsyncRead {
-            read: &b"hello"[..],
-            num_bytes_remaining: 10,
-            connection_permit_opt: Some(acquire_get_object_connection_permit().await),
-        };
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"hello");
-        assert!(reader.connection_permit_opt.is_none());
     }
 
     #[test]
