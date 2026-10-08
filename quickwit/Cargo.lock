@@ -790,7 +790,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.6",
  "tower 0.5.2",
  "tracing",
 ]
@@ -3746,7 +3746,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.6",
  "tower-service",
  "webpki-roots 1.0.5",
 ]
@@ -7275,7 +7275,7 @@ dependencies = [
  "thiserror 2.0.17",
  "time",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.6",
  "tokio-stream",
  "tokio-util",
  "tonic 0.14.2",
@@ -7798,7 +7798,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.6",
  "tokio-util",
  "tower 0.5.2",
  "tower-http",
@@ -9701,9 +9701,8 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+version = "0.26.6"
+source = "git+https://github.com/rdettai-sk/tokio-rustls?rev=a50d9b3401e86b829abc74feb38e576231f84ee2#a50d9b3401e86b829abc74feb38e576231f84ee2"
 dependencies = [
  "rustls 0.23.36",
  "tokio",
@@ -9807,7 +9806,7 @@ dependencies = [
  "prost 0.13.5",
  "rustls-pemfile",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.6",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",
@@ -9840,7 +9839,7 @@ dependencies = [
  "socket2 0.6.1",
  "sync_wrapper",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.6",
  "tokio-stream",
  "tower 0.5.2",
  "tower-layer",
