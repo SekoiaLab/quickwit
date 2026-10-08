@@ -1001,19 +1001,8 @@ impl QuickwitCollector {
     /// Returns whether merging the aggregation results of `leaf_responses` with
     /// [`Collector::merge_fruits`] is CPU intensive enough to run on the search thread pool.
     pub(crate) fn is_merge_cpu_intensive(&self, leaf_responses: &[LeafSearchResponse]) -> bool {
-        let Some(aggregation) = &self.aggregation else {
-            return false;
-        };
-        let intermediate_results = leaf_responses
-            .iter()
-            .filter_map(|leaf_response| leaf_response.intermediate_aggregation_result.as_ref());
-        let num_results = intermediate_results.clone().count();
-        let num_bytes = intermediate_results.map(Vec::len).sum();
-        let is_find_trace_ids = matches!(
-            aggregation,
-            QuickwitAggregations::FindTraceIdsAggregation(_)
-        );
-        is_aggregation_merge_cpu_intensive(is_find_trace_ids, num_results, num_bytes)
+        AggregationMerge::of_leaf_responses(self.aggregation.as_ref(), leaf_responses)
+            .is_cpu_intensive()
     }
 }
 
@@ -1478,19 +1467,73 @@ static AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES: LazyLock<usize> = LazyLock
     )
 });
 
-/// Returns whether merging `num_results` intermediate aggregation results totalling `num_bytes` is
-/// worth the search thread pool's hand-off and queue. Shared by the leaf `finalize` and the root
-/// merge. Trace id aggregation results are expensive to merge whatever their size, as soon as
-/// there are several of them.
-fn is_aggregation_merge_cpu_intensive(
+/// The intermediate aggregation results about to be merged, by the leaf `finalize` or by the root
+/// merge, summarized to decide whether the merge is worth the search thread pool's hand-off and
+/// queue.
+struct AggregationMerge {
     is_find_trace_ids: bool,
     num_results: usize,
     num_bytes: usize,
-) -> bool {
-    if is_find_trace_ids {
-        num_results > 1
-    } else {
-        num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES
+}
+
+impl AggregationMerge {
+    /// The results accumulated by a leaf's incremental collector.
+    fn of_incremental(incremental_aggregation: &QuickwitIncrementalAggregations) -> Self {
+        match incremental_aggregation {
+            QuickwitIncrementalAggregations::FindTraceIdsAggregation(_, state) => {
+                AggregationMerge {
+                    is_find_trace_ids: true,
+                    num_results: state.len(),
+                    num_bytes: 0,
+                }
+            }
+            QuickwitIncrementalAggregations::TantivyAggregations(_, state) => AggregationMerge {
+                is_find_trace_ids: false,
+                num_results: state.len(),
+                num_bytes: state.iter().map(Vec::len).sum(),
+            },
+            QuickwitIncrementalAggregations::NoAggregation => AggregationMerge::empty(),
+        }
+    }
+
+    /// The results of the leaf responses merged by the root.
+    fn of_leaf_responses(
+        aggregation_opt: Option<&QuickwitAggregations>,
+        leaf_responses: &[LeafSearchResponse],
+    ) -> Self {
+        let Some(aggregation) = aggregation_opt else {
+            return AggregationMerge::empty();
+        };
+        let intermediate_results = leaf_responses
+            .iter()
+            .filter_map(|leaf_response| leaf_response.intermediate_aggregation_result.as_ref());
+        AggregationMerge {
+            is_find_trace_ids: matches!(
+                aggregation,
+                QuickwitAggregations::FindTraceIdsAggregation(_)
+            ),
+            num_results: intermediate_results.clone().count(),
+            num_bytes: intermediate_results.map(Vec::len).sum(),
+        }
+    }
+
+    fn empty() -> Self {
+        AggregationMerge {
+            is_find_trace_ids: false,
+            num_results: 0,
+            num_bytes: 0,
+        }
+    }
+
+    /// Trace id aggregation results are expensive to merge whatever their size, as soon as there
+    /// are several of them. Tantivy aggregation results are worth offloading from
+    /// `QW_AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES`.
+    fn is_cpu_intensive(&self) -> bool {
+        if self.is_find_trace_ids {
+            self.num_results > 1
+        } else {
+            self.num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES
+        }
     }
 }
 
@@ -1572,16 +1615,7 @@ impl IncrementalCollector {
     /// Returns whether [`Self::finalize`] is likely CPU intensive enough to run on the search
     /// thread pool. Finalizing is cheap unless it has aggregation results to merge.
     pub(crate) fn is_finalize_cpu_intensive(&self) -> bool {
-        match &self.incremental_aggregation {
-            QuickwitIncrementalAggregations::TantivyAggregations(_, state) => {
-                let num_bytes = state.iter().map(Vec::len).sum();
-                is_aggregation_merge_cpu_intensive(false, state.len(), num_bytes)
-            }
-            QuickwitIncrementalAggregations::FindTraceIdsAggregation(_, state) => {
-                is_aggregation_merge_cpu_intensive(true, state.len(), 0)
-            }
-            QuickwitIncrementalAggregations::NoAggregation => false,
-        }
+        AggregationMerge::of_incremental(&self.incremental_aggregation).is_cpu_intensive()
     }
 
     pub(crate) fn finalize(self) -> tantivy::Result<LeafSearchResponse> {
