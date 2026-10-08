@@ -40,13 +40,12 @@ impl SimpleThreadPool {
     /// Returns a Tantivy [`tantivy::Executor`] backed by this thread pool.
     ///
     /// Tasks that Tantivy schedules through it are tracked by metrics.
-    fn get_executor(&self, caller: &'static str, cost_class: &'static str) -> tantivy::Executor {
+    fn get_executor(&self, caller: &'static str) -> tantivy::Executor {
         tantivy::Executor::InstrumentedThreadPool(
             self.thread_pool.clone(),
             Arc::new(ThreadPoolTaskInstrumentation {
                 pool_name: self.name,
                 caller,
-                cost_class,
             }),
         )
     }
@@ -70,14 +69,13 @@ impl SimpleThreadPool {
         &self,
         cpu_intensive_fn: F,
         caller: &'static str,
-        cost_class: &'static str,
     ) -> impl Future<Output = Result<R, Panicked>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         let span = tracing::Span::current();
-        let queued_task = QueuedTask::new(self.name, caller, cost_class);
+        let queued_task = QueuedTask::new(self.name, caller);
         let (tx, rx) = oneshot::channel();
         self.thread_pool.spawn(move || {
             if tx.is_closed() {
@@ -142,19 +140,15 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    small_task_executor().run_cpu_intensive_with_extra_tags(cpu_intensive_fn, "unknown", "NA")
+    small_task_executor().run_cpu_intensive_with_extra_tags(cpu_intensive_fn, "unknown")
 }
 
 /// Returns a Tantivy [`tantivy::Executor`] backed by the small tasks thread pool used by
 /// [`run_cpu_intensive`].
 ///
-/// Tasks that Tantivy schedules through it are tracked by metrics, labeled with `caller` and
-/// `cost_class`.
-pub fn small_tasks_tantivy_executor(
-    caller: &'static str,
-    cost_class: &'static str,
-) -> tantivy::Executor {
-    small_task_executor().get_executor(caller, cost_class)
+/// Tasks that Tantivy schedules through it are tracked by metrics, labeled with `caller`.
+pub fn small_tasks_tantivy_executor(caller: &'static str) -> tantivy::Executor {
+    small_task_executor().get_executor(caller)
 }
 
 #[cfg(test)]
@@ -199,30 +193,26 @@ mod tests {
         assert!(counter.load(Ordering::SeqCst) < 100);
     }
 
-    // SAFETY: these tests may not be entirely sound if not run with nextest or
-    // --test-threads=1, as they mutate process-wide environment variables. As this is
-    // only test code, and it would be extremely inconvenient to run it another way, we are
-    // keeping it that way.
-
+    // SAFETY: this test may not be entirely sound if not run with nextest or --test-threads=1, as
+    // it mutates a process-wide environment variable. The cases are checked in a single test so
+    // that they don't race with each other on it.
     #[test]
-    fn test_compute_small_tasks_thread_pool_num_threads_from_env_var() {
+    fn test_compute_small_tasks_thread_pool_num_threads() {
+        let default_num_threads = (crate::num_cpus() / 3).max(2);
+        unsafe { std::env::remove_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS") };
+        assert_eq!(
+            compute_small_tasks_thread_pool_num_threads(),
+            default_num_threads
+        );
+
         unsafe { std::env::set_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS", "3") };
         assert_eq!(compute_small_tasks_thread_pool_num_threads(), 3);
-        unsafe { std::env::remove_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS") };
-    }
 
-    #[test]
-    fn test_compute_small_tasks_thread_pool_num_threads_ignores_zero() {
         unsafe { std::env::set_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS", "0") };
-        let expected = (crate::num_cpus() / 3).max(2);
-        assert_eq!(compute_small_tasks_thread_pool_num_threads(), expected);
+        assert_eq!(
+            compute_small_tasks_thread_pool_num_threads(),
+            default_num_threads
+        );
         unsafe { std::env::remove_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS") };
-    }
-
-    #[test]
-    fn test_compute_small_tasks_thread_pool_num_threads_default() {
-        unsafe { std::env::remove_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS") };
-        let expected = (crate::num_cpus() / 3).max(2);
-        assert_eq!(compute_small_tasks_thread_pool_num_threads(), expected);
     }
 }

@@ -182,8 +182,7 @@ async fn fetch_docs_in_split(
     // the side-effect before
     // Doc fetching is on the critical path of the response: it runs on the small tasks pool so it
     // does not queue behind split searches.
-    let tantivy_executor =
-        quickwit_common::thread_pool::small_tasks_tantivy_executor("fetch_docs", "unknown");
+    let tantivy_executor = quickwit_common::thread_pool::small_tasks_tantivy_executor("fetch_docs");
     index.set_executor(tantivy_executor);
     let index_reader = index
         .reader_builder()

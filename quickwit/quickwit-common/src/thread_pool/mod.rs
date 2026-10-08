@@ -55,8 +55,8 @@ struct QueuedTask {
 impl QueuedTask {
     /// Must be called when submitting the task, not once a worker picks it up,
     /// for the queue wait time to be measured correctly.
-    fn new(pool_name: &'static str, caller: &'static str, cost_class: &'static str) -> QueuedTask {
-        let labels = [pool_name, caller, cost_class];
+    fn new(pool_name: &'static str, caller: &'static str) -> QueuedTask {
+        let labels = [pool_name, caller];
         let mut pending_tasks_guard = OwnedGaugeGuard::from_gauge(
             THREAD_POOL_METRICS.pending_tasks.with_label_values(labels),
         );
@@ -95,16 +95,11 @@ struct RunningTaskGuard {
 struct ThreadPoolTaskInstrumentation {
     pool_name: &'static str,
     caller: &'static str,
-    cost_class: &'static str,
 }
 
 impl tantivy::TaskInstrumentation for ThreadPoolTaskInstrumentation {
     fn enqueue(&self) -> Box<dyn tantivy::EnqueuedTask> {
-        Box::new(QueuedTask::new(
-            self.pool_name,
-            self.caller,
-            self.cost_class,
-        ))
+        Box::new(QueuedTask::new(self.pool_name, self.caller))
     }
 }
 
@@ -128,10 +123,10 @@ impl fmt::Display for Panicked {
 impl std::error::Error for Panicked {}
 
 struct ThreadPoolMetrics {
-    ongoing_tasks: IntGaugeVec<3>,
-    pending_tasks: IntGaugeVec<3>,
-    queue_wait_time_secs: HistogramVec<3>,
-    run_time_secs: HistogramVec<3>,
+    ongoing_tasks: IntGaugeVec<2>,
+    pending_tasks: IntGaugeVec<2>,
+    queue_wait_time_secs: HistogramVec<2>,
+    run_time_secs: HistogramVec<2>,
 }
 
 /// From 1ms to ~32.768s
@@ -147,14 +142,14 @@ impl Default for ThreadPoolMetrics {
                 "number of tasks being currently processed by threads in the thread pool",
                 "thread_pool",
                 &[],
-                ["pool", "caller", "cost_class"],
+                ["pool", "caller"],
             ),
             pending_tasks: new_gauge_vec(
                 "pending_tasks",
                 "number of tasks waiting in the queue before being processed by the thread pool",
                 "thread_pool",
                 &[],
-                ["pool", "caller", "cost_class"],
+                ["pool", "caller"],
             ),
             queue_wait_time_secs: new_histogram_vec(
                 "queue_wait_time_secs",
@@ -162,7 +157,7 @@ impl Default for ThreadPoolMetrics {
                  the thread pool",
                 "thread_pool",
                 &[],
-                ["pool", "caller", "cost_class"],
+                ["pool", "caller"],
                 wait_and_run_time_buckets(),
             ),
             run_time_secs: new_histogram_vec(
@@ -171,7 +166,7 @@ impl Default for ThreadPoolMetrics {
                  has been picked up from the queue",
                 "thread_pool",
                 &[],
-                ["pool", "caller", "cost_class"],
+                ["pool", "caller"],
                 wait_and_run_time_buckets(),
             ),
         }

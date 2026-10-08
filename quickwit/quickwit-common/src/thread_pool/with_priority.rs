@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::VecDeque;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -51,28 +52,93 @@ struct ThreadPoolInner {
 
 #[derive(Default)]
 struct State {
+    /// High-priority tasks are served first, in FIFO order.
     high_priority_tasks: VecDeque<Box<dyn PendingTask>>,
-    normal_priority_tasks: VecDeque<Box<dyn PendingTask>>,
+    /// Normal-priority tasks are served by lowest remaining cost awaiting permit, then by lowest
+    /// remaining cost in progress, then in FIFO order.
+    normal_priority_tasks: BinaryHeap<NormalQueueEntry>,
+    /// Monotonically increasing counter stamped on each task entering
+    /// `normal_priority_tasks`; used as a tie-breaker.
+    next_arrival_sequence: u64,
 }
 
 impl State {
     fn pop_next_task(&mut self) -> Option<Box<dyn PendingTask>> {
         self.high_priority_tasks
             .pop_front()
-            .or_else(|| self.normal_priority_tasks.pop_front())
+            .or_else(|| self.normal_priority_tasks.pop().map(|entry| entry.task))
     }
 }
 
+/// A normal-priority task waiting to be scheduled on the thread pool.
+///
+/// The ordering is defined over
+/// `(remaining_cost_awaiting_permit, remaining_cost_in_progress, arrival_sequence)`.
+struct NormalQueueEntry {
+    remaining_cost_awaiting_permit: usize,
+    remaining_cost_in_progress: usize,
+    arrival_sequence: u64,
+    task: Box<dyn PendingTask>,
+}
+
+impl Ord for NormalQueueEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // `BinaryHeap` is a max-heap: the lowest costs, then the lowest sequence, is the greatest.
+        other
+            .remaining_cost_awaiting_permit
+            .cmp(&self.remaining_cost_awaiting_permit)
+            .then_with(|| {
+                other
+                    .remaining_cost_in_progress
+                    .cmp(&self.remaining_cost_in_progress)
+            })
+            .then_with(|| other.arrival_sequence.cmp(&self.arrival_sequence))
+    }
+}
+
+impl PartialOrd for NormalQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for NormalQueueEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for NormalQueueEntry {}
+
 /// The priority of a task submitted to a [`ThreadPoolWithPriority`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Priority {
-    /// The default priority.
-    #[default]
-    Normal,
+    /// The default priority. Normal-priority tasks are scheduled by lowest
+    /// `remaining_cost_awaiting_permit`, then by lowest `remaining_cost_in_progress`, then in FIFO
+    /// order.
+    Normal {
+        /// Estimated cost, in an arbitrary unit, of the work of the request the task belongs to
+        /// that is still awaiting a permit.
+        remaining_cost_awaiting_permit: usize,
+        /// Estimated cost, in the same unit, of the work of the request the task belongs to that
+        /// was granted a permit but is not done yet.
+        remaining_cost_in_progress: usize,
+    },
     /// A high-priority task is scheduled before normal-priority tasks that are still pending.
     /// This is reserved for short tasks sitting on the critical path of a request (e.g. merging
     /// partial results).
     High,
+}
+
+/// Default tasks have zero cost, so short operations not tied to a costly job run before the
+/// tasks of costly jobs.
+impl Default for Priority {
+    fn default() -> Self {
+        Priority::Normal {
+            remaining_cost_awaiting_permit: 0,
+            remaining_cost_in_progress: 0,
+        }
+    }
 }
 
 trait PendingTask: Send {
@@ -177,7 +243,7 @@ impl ThreadPoolWithPriority {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.run_cpu_intensive_with_extra_tags(cpu_intensive_fn, "unknown", "NA")
+        self.run_cpu_intensive_with_extra_tags(cpu_intensive_fn, "unknown")
     }
 
     /// Same as `run_cpu_intensive` but with a caller identifier recorded in the
@@ -186,13 +252,12 @@ impl ThreadPoolWithPriority {
         &self,
         cpu_intensive_fn: F,
         caller: &'static str,
-        cost_class: &'static str,
     ) -> impl Future<Output = Result<R, Panicked>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.run_cpu_intensive_with_priority(Priority::Normal, cpu_intensive_fn, caller, cost_class)
+        self.run_cpu_intensive_with_priority(Priority::default(), cpu_intensive_fn, caller)
     }
 
     /// Same as `run_cpu_intensive_with_extra_tags` but with an explicit priority.
@@ -201,14 +266,13 @@ impl ThreadPoolWithPriority {
         priority: Priority,
         cpu_intensive_fn: F,
         caller: &'static str,
-        cost_class: &'static str,
     ) -> impl Future<Output = Result<R, Panicked>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         let span = tracing::Span::current();
-        let queued_task = QueuedTask::new(self.inner.name, caller, cost_class);
+        let queued_task = QueuedTask::new(self.inner.name, caller);
         let (tx, rx) = oneshot::channel();
         let task = CpuIntensiveTask {
             cpu_intensive_fn,
@@ -226,7 +290,19 @@ impl ThreadPoolInner {
     fn enqueue(&self, priority: Priority, task: Box<dyn PendingTask>) {
         let mut state = self.state.lock().unwrap();
         match priority {
-            Priority::Normal => state.normal_priority_tasks.push_back(task),
+            Priority::Normal {
+                remaining_cost_awaiting_permit,
+                remaining_cost_in_progress,
+            } => {
+                let arrival_sequence = state.next_arrival_sequence;
+                state.next_arrival_sequence += 1;
+                state.normal_priority_tasks.push(NormalQueueEntry {
+                    remaining_cost_awaiting_permit,
+                    remaining_cost_in_progress,
+                    arrival_sequence,
+                    task,
+                });
+            }
             Priority::High => state.high_priority_tasks.push_back(task),
         }
     }
@@ -322,22 +398,20 @@ mod tests {
 
         let execution_order_clone = execution_order.clone();
         let normal_task_1 = thread_pool.run_cpu_intensive_with_priority(
-            Priority::Normal,
+            Priority::default(),
             move || {
                 execution_order_clone.lock().unwrap().push(1);
             },
             "test",
-            "NA",
         );
 
         let execution_order_clone = execution_order.clone();
         let normal_task_2 = thread_pool.run_cpu_intensive_with_priority(
-            Priority::Normal,
+            Priority::default(),
             move || {
                 execution_order_clone.lock().unwrap().push(2);
             },
             "test",
-            "NA",
         );
 
         let execution_order_clone = execution_order.clone();
@@ -347,7 +421,6 @@ mod tests {
                 execution_order_clone.lock().unwrap().push(0);
             },
             "test",
-            "NA",
         );
 
         release_tx.send(()).unwrap();
@@ -357,6 +430,52 @@ mod tests {
         normal_task_2.await.unwrap();
 
         assert_eq!(*execution_order.lock().unwrap(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_normal_priority_tasks_are_served_by_costs_then_fifo() {
+        let thread_pool = ThreadPoolWithPriority::new("priority_cost_order_test", Some(1));
+        let execution_order: Arc<std::sync::Mutex<Vec<usize>>> = Default::default();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let first_task = thread_pool.run_cpu_intensive(move || {
+            let _ = started_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+
+        // (remaining cost awaiting permit, remaining cost in progress)
+        let remaining_costs = [
+            (100, 0),
+            (10, 50),
+            (1000, 0),
+            (10, 5),
+            (0, 7),
+            (0, 3),
+            (10, 5),
+        ];
+        let mut pending_tasks = Vec::new();
+        for (index, (remaining_cost_awaiting_permit, remaining_cost_in_progress)) in
+            remaining_costs.into_iter().enumerate()
+        {
+            let execution_order_clone = execution_order.clone();
+            pending_tasks.push(thread_pool.run_cpu_intensive_with_priority(
+                Priority::Normal {
+                    remaining_cost_awaiting_permit,
+                    remaining_cost_in_progress,
+                },
+                move || execution_order_clone.lock().unwrap().push(index),
+                "test",
+            ));
+        }
+
+        release_tx.send(()).unwrap();
+        first_task.await.unwrap();
+        for pending_task in pending_tasks {
+            pending_task.await.unwrap();
+        }
+        assert_eq!(*execution_order.lock().unwrap(), vec![5, 4, 3, 6, 1, 0, 2]);
     }
 
     #[tokio::test]
@@ -379,7 +498,6 @@ mod tests {
                 counter_clone.fetch_add(1, Ordering::SeqCst);
             },
             "test",
-            "NA",
         );
         drop(cancelled_task);
 
@@ -404,7 +522,6 @@ mod tests {
                     Priority::High,
                     || panic!("expected panic"),
                     "test",
-                    "NA"
                 )
                 .await
                 .is_err()

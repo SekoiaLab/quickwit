@@ -196,9 +196,9 @@ impl SearchService for SearchServiceImpl {
         let Some(search_request) = leaf_search_request.search_request.as_ref() else {
             return Err(SearchError::Internal("no search request".to_string()));
         };
-        // The cost class is computed here, once per leaf request: it labels the permit and task
-        // gauges, so it has to be known before any permit is requested.
-        let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
+        // The query cost is computed here, once per leaf request.
+        let query_complexity_factor =
+            query_cost_classifier::query_complexity_factor_or_default(search_request);
         let num_splits = leaf_search_request
             .leaf_requests
             .iter()
@@ -211,13 +211,12 @@ impl SearchService for SearchServiceImpl {
                 self.searcher_context.clone(),
                 leaf_search_request,
                 &self.storage_resolver,
-                cost_class,
+                query_complexity_factor,
             )
             .detect_slow_poll("leaf_multi_index"),
             start: Instant::now(),
             targeted_splits: num_splits,
             status: None,
-            cost_class,
         };
         tokio::time::timeout(timeout, tracked_future).await?
     }
