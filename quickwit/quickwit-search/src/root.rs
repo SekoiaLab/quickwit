@@ -23,6 +23,7 @@ use itertools::Itertools;
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::shared_consts;
 use quickwit_common::slow_poll::DetectSlowPollExt;
+use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_common::uri::Uri;
 use quickwit_config::build_doc_mapper;
 use quickwit_doc_mapper::DYNAMIC_FIELD_NAME;
@@ -807,7 +808,8 @@ pub(crate) async fn search_partial_hits_phase(
     let cost_class = query_cost_classifier::classify_serialized(&search_request.query_ast);
     let span = info_span!("merge_fruits");
     let mut leaf_search_response = crate::search_thread_pool()
-        .run_cpu_intensive_with_extra_tags(
+        .run_cpu_intensive_with_priority(
+            Priority::High,
             move || {
                 let _span_guard = span.enter();
                 merge_collector.merge_fruits(leaf_search_results)
