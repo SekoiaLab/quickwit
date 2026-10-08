@@ -33,7 +33,7 @@ use aws_smithy_types::config_bag::ConfigBag;
 use quickwit_common::slow_poll::S3ScopeExt;
 
 /// Wraps the HTTP client of the S3 client so that the tasks spawned while serving its
-/// requests are recorded as `s3` by task poll attribution.
+/// requests are recorded as `s3` by S3 task poll attribution.
 pub fn s3_http_client(http_client: SharedHttpClient) -> SharedHttpClient {
     SharedHttpClient::new(S3HttpClient { inner: http_client })
 }
