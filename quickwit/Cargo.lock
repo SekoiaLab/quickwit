@@ -9702,8 +9702,7 @@ dependencies = [
 [[package]]
 name = "tokio-rustls"
 version = "0.26.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+source = "git+https://github.com/rdettai-sk/tokio-rustls?rev=a50d9b3401e86b829abc74feb38e576231f84ee2#a50d9b3401e86b829abc74feb38e576231f84ee2"
 dependencies = [
  "rustls 0.23.36",
  "tokio",
