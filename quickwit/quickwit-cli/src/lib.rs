@@ -23,6 +23,7 @@ use clap::{Arg, ArgMatches, arg};
 use dialoguer::Confirm;
 use dialoguer::theme::ColorfulTheme;
 use quickwit_common::runtimes::RuntimesConfig;
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
 use quickwit_config::service::QuickwitService;
 use quickwit_config::{
@@ -50,6 +51,7 @@ pub mod index;
 #[cfg(feature = "jemalloc")]
 pub mod jemalloc;
 pub mod logger;
+pub mod maintenance;
 pub mod metrics;
 pub mod service;
 pub mod source;
@@ -245,22 +247,54 @@ async fn load_node_config(config_uri: &Uri) -> anyhow::Result<NodeConfig> {
     Ok(config)
 }
 
+/// Builds the storage and metastore resolvers.
+///
+/// When `s3_assembly_thread_pool_opt` is set, S3 storages assemble large downloads on that pool
+/// instead of the tokio runtime. Only searcher-only nodes set it (see
+/// [`s3_assembly_thread_pool_for_services`]).
 fn get_resolvers(
     storage_configs: &StorageConfigs,
     metastore_configs: &MetastoreConfigs,
+    s3_assembly_thread_pool_opt: Option<ThreadPoolWithPriority>,
 ) -> (StorageResolver, MetastoreResolver) {
     // The CLI tests rely on the unconfigured singleton resolvers, so it's better to return them if
     // the storage and metastore configs are not set.
-    if storage_configs.is_empty() && metastore_configs.is_empty() {
+    if storage_configs.is_empty()
+        && metastore_configs.is_empty()
+        && s3_assembly_thread_pool_opt.is_none()
+    {
         return (
             StorageResolver::unconfigured(),
             MetastoreResolver::unconfigured(),
         );
     }
-    let storage_resolver = StorageResolver::configured(storage_configs);
+    let storage_resolver = match s3_assembly_thread_pool_opt {
+        Some(thread_pool) => {
+            StorageResolver::configured_with_s3_assembly_thread_pool(storage_configs, thread_pool)
+        }
+        None => StorageResolver::configured(storage_configs),
+    };
     let metastore_resolver =
         MetastoreResolver::configured(storage_resolver.clone(), metastore_configs);
     (storage_resolver, metastore_resolver)
+}
+
+/// Returns the thread pool on which S3 storages should assemble large downloads, if any.
+///
+/// Only nodes that run the searcher service alone get one: the search thread pool. On such nodes
+/// the tokio runtime only drives searches, so keeping multi-megabyte copies off it is what
+/// bounds the latency of the other queries in flight. Nodes running other services keep the
+/// default inline assembly, as the search thread pool is not sized for their workloads.
+fn s3_assembly_thread_pool_for_services(
+    enabled_services: &HashSet<QuickwitService>,
+) -> Option<ThreadPoolWithPriority> {
+    let is_searcher_only =
+        enabled_services.len() == 1 && enabled_services.contains(&QuickwitService::Searcher);
+    if !is_searcher_only {
+        return None;
+    }
+    info!("searcher-only node: S3 downloads are assembled on the search thread pool");
+    Some(quickwit_search::search_thread_pool().clone())
 }
 
 /// Runs connectivity checks for a given `metastore_uri` and `index_id`.
@@ -366,6 +400,9 @@ pub mod busy_detector {
     // LAST_UNPARK_TIMESTAMP and NEXT_DEBUG_TIMESTAMP are semantically micro-second
     // precision timestamps, but we use atomics to allow accessing them without locks.
     thread_local!(static LAST_UNPARK_TIMESTAMP: AtomicU64 = const { AtomicU64::new(0) });
+    // CPU time of the current thread at its last unpark, in microseconds. 0 means "not
+    // recorded", e.g. the thread was unparked before the detector got enabled.
+    thread_local!(static LAST_UNPARK_CPU_TIME: AtomicU64 = const { AtomicU64::new(0) });
     static NEXT_DEBUG_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
     static SUPPRESSED_DEBUG_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -379,13 +416,28 @@ pub mod busy_detector {
                 .checked_duration_since(*TIME_REF)
                 .unwrap_or_default();
             time.store(now.as_micros() as u64, Ordering::Relaxed);
-        })
+        });
+        if ENABLED.load(Ordering::Relaxed) {
+            LAST_UNPARK_CPU_TIME.with(|cpu_time| {
+                cpu_time.store(thread_cpu_time_micros(), Ordering::Relaxed);
+            });
+        }
     }
 
     pub fn thread_park() {
         if !ENABLED.load(Ordering::Relaxed) {
             return;
         }
+
+        LAST_UNPARK_CPU_TIME.with(|cpu_time| {
+            let unpark_cpu_time = cpu_time.swap(0, Ordering::Relaxed);
+            if unpark_cpu_time != 0 {
+                let cpu_delta = thread_cpu_time_micros().saturating_sub(unpark_cpu_time);
+                CLI_METRICS
+                    .thread_unpark_cpu_time_microseconds_total
+                    .inc_by(cpu_delta);
+            }
+        });
 
         LAST_UNPARK_TIMESTAMP.with(|time| {
             let now = Instant::now()
@@ -401,6 +453,23 @@ pub mod busy_detector {
                 emit_debug(delta, now);
             }
         })
+    }
+
+    /// CPU time consumed so far by the calling thread, in microseconds, or 0 if it can't be read.
+    ///
+    /// Unlike the wall clock, `CLOCK_THREAD_CPUTIME_ID` is not served by the vDSO on Linux:
+    /// each call is a real syscall (well under a microsecond).
+    fn thread_cpu_time_micros() -> u64 {
+        let mut timespec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `timespec` is a valid, writable `timespec` for the duration of the call.
+        let ret = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timespec) };
+        if ret != 0 {
+            return 0;
+        }
+        timespec.tv_sec as u64 * 1_000_000 + timespec.tv_nsec as u64 / 1_000
     }
 
     fn emit_debug(delta: u64, now: u64) {
@@ -427,6 +496,32 @@ pub mod busy_detector {
                 "thread wasn't parked for {delta}µs, is the runtime too busy? ({suppressed} \
                  similar messages suppressed)"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::time::Duration;
+
+        use super::*;
+
+        #[test]
+        fn test_thread_park_records_cpu_time_while_unparked() {
+            set_enabled(true);
+            let cpu_time_counter = &CLI_METRICS.thread_unpark_cpu_time_microseconds_total;
+            let cpu_time_before = cpu_time_counter.get();
+
+            thread_unpark();
+            let spin_start = Instant::now();
+            while spin_start.elapsed() < Duration::from_millis(50) {
+                std::hint::black_box(0u64);
+            }
+            thread_park();
+
+            // The counter is process-wide, other tests may add to it, so only bound it from below.
+            // Spinning is pure CPU, allow for some descheduling on a loaded CI machine.
+            let recorded_micros = cpu_time_counter.get() - cpu_time_before;
+            assert!(recorded_micros >= 25_000, "recorded {recorded_micros}µs");
         }
     }
 }
@@ -459,6 +554,6 @@ mod tests {
         let storage_configs = StorageConfigs::new(vec![s3_storage_config.into()]);
         let metastore_configs = MetastoreConfigs::default();
         let (_storage_resolver, _metastore_resolver) =
-            get_resolvers(&storage_configs, &metastore_configs);
+            get_resolvers(&storage_configs, &metastore_configs, None);
     }
 }

@@ -21,17 +21,18 @@ use colored::Colorize;
 use futures::future::select;
 use itertools::Itertools;
 use quickwit_common::runtimes::RuntimesConfig;
-use quickwit_common::uri::{Protocol, Uri};
-use quickwit_config::NodeConfig;
+use quickwit_common::uri::Uri;
 use quickwit_config::service::QuickwitService;
 use quickwit_serve::tcp_listener::DefaultTcpListenerResolver;
 use quickwit_serve::{BuildInfo, EnvFilterReloadFn, serve_quickwit};
-use quickwit_telemetry::payload::{QuickwitFeature, QuickwitTelemetryInfo, TelemetryEvent};
 use tokio::signal;
 use tracing::{debug, info};
 
 use crate::checklist::{BLUE_COLOR, RED_COLOR};
-use crate::{config_cli_arg, get_resolvers, load_node_config, start_actor_runtimes};
+use crate::{
+    config_cli_arg, get_resolvers, load_node_config, s3_assembly_thread_pool_for_services,
+    start_actor_runtimes,
+};
 
 pub fn build_run_command() -> Command {
     Command::new("run")
@@ -110,24 +111,23 @@ impl RunCliCommand {
         let version_text = BuildInfo::get_version_text();
         info!("quickwit version: {version_text}");
         let mut node_config = load_node_config(&self.config_uri).await?;
-        let (storage_resolver, metastore_resolver) =
-            get_resolvers(&node_config.storage_configs, &node_config.metastore_configs);
-        crate::busy_detector::set_enabled(true);
-
         if let Some(services) = &self.services {
             info!(services = %services.iter().join(", "), "setting services from override");
             node_config.enabled_services.clone_from(services);
         }
-        let telemetry_handle_opt =
-            quickwit_telemetry::start_telemetry_loop(quickwit_telemetry_info(&node_config));
-        quickwit_telemetry::send_telemetry_event(TelemetryEvent::RunCommand).await;
+        let (storage_resolver, metastore_resolver) = get_resolvers(
+            &node_config.storage_configs,
+            &node_config.metastore_configs,
+            s3_assembly_thread_pool_for_services(&node_config.enabled_services),
+        );
+        crate::busy_detector::set_enabled(true);
         // TODO move in serve quickwit?
         let runtimes_config = RuntimesConfig::default();
         start_actor_runtimes(runtimes_config, &node_config.enabled_services)?;
         let shutdown_signal = Box::pin(async {
             select(pin!(listen_interrupt()), pin!(listen_sigterm())).await;
         });
-        let serve_result = serve_quickwit(
+        serve_quickwit(
             node_config,
             runtimes_config,
             metastore_resolver,
@@ -136,44 +136,10 @@ impl RunCliCommand {
             shutdown_signal,
             env_filter_reload_fn,
         )
-        .await;
-        let return_code = match serve_result {
-            Ok(_) => 0,
-            Err(_) => 1,
-        };
-        quickwit_telemetry::send_telemetry_event(TelemetryEvent::EndCommand { return_code }).await;
-        if let Some(telemetry_handle) = telemetry_handle_opt {
-            telemetry_handle.terminate_telemetry().await;
-        }
-        serve_result?;
+        .await?;
         info!("quickwit successfully terminated");
         Ok(())
     }
-}
-
-fn quickwit_telemetry_info(config: &NodeConfig) -> QuickwitTelemetryInfo {
-    let mut features = HashSet::new();
-    if config.indexer_config.enable_otlp_endpoint {
-        features.insert(QuickwitFeature::Otlp);
-    }
-    if config.jaeger_config.enable_endpoint {
-        features.insert(QuickwitFeature::Jaeger);
-    }
-    // The metastore URI is only relevant if the metastore is enabled.
-    if config.is_service_enabled(QuickwitService::Metastore) {
-        let feature = if config.metastore_uri.protocol() == Protocol::PostgreSQL {
-            QuickwitFeature::PostgresqMetastore
-        } else {
-            QuickwitFeature::FileBackedMetastore
-        };
-        features.insert(feature);
-    }
-    let services = config
-        .enabled_services
-        .iter()
-        .map(|service| service.to_string())
-        .collect();
-    QuickwitTelemetryInfo::new(services, features)
 }
 
 #[cfg(test)]

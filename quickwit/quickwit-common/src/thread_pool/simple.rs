@@ -12,52 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use futures::{Future, TryFutureExt};
-use once_cell::sync::Lazy;
-use prometheus::IntGauge;
 use tokio::sync::oneshot;
-use tracing::error;
+use tracing::{info, warn};
 
-use crate::metrics::{GaugeGuard, IntGaugeVec, OwnedGaugeGuard, new_gauge_vec};
+use super::{Panicked, QueuedTask, ThreadPoolTaskInstrumentation, build_rayon_pool};
 
 /// An executor backed by a thread pool to run CPU-intensive tasks.
 ///
 /// tokio::spawn_blocking should only used for IO-bound tasks, as it has not limit on its
 /// thread count.
-#[derive(Clone)]
-pub struct ThreadPool {
+struct SimpleThreadPool {
     thread_pool: Arc<rayon::ThreadPool>,
-    ongoing_tasks: IntGauge,
-    pending_tasks: IntGauge,
+    name: &'static str,
 }
 
-impl ThreadPool {
-    pub fn new(name: &'static str, num_threads_opt: Option<usize>) -> ThreadPool {
-        let mut rayon_pool_builder = rayon::ThreadPoolBuilder::new()
-            .thread_name(move |thread_id| format!("quickwit-{name}-{thread_id}"))
-            .panic_handler(move |_my_panic| {
-                error!("task running in the quickwit {name} thread pool panicked");
-            });
-        if let Some(num_threads) = num_threads_opt {
-            rayon_pool_builder = rayon_pool_builder.num_threads(num_threads);
-        }
-        let thread_pool = rayon_pool_builder
-            .build()
-            .expect("failed to spawn thread pool");
-        let ongoing_tasks = THREAD_POOL_METRICS.ongoing_tasks.with_label_values([name]);
-        let pending_tasks = THREAD_POOL_METRICS.pending_tasks.with_label_values([name]);
-        ThreadPool {
-            thread_pool: Arc::new(thread_pool),
-            ongoing_tasks,
-            pending_tasks,
+impl SimpleThreadPool {
+    fn new(name: &'static str, num_threads_opt: Option<usize>) -> SimpleThreadPool {
+        SimpleThreadPool {
+            thread_pool: Arc::new(build_rayon_pool(name, num_threads_opt)),
+            name,
         }
     }
 
-    pub fn get_underlying_rayon_thread_pool(&self) -> Arc<rayon::ThreadPool> {
-        self.thread_pool.clone()
+    /// Returns a Tantivy [`tantivy::Executor`] backed by this thread pool.
+    ///
+    /// Tasks that Tantivy schedules through it are tracked by metrics.
+    fn get_executor(&self, caller: &'static str) -> tantivy::Executor {
+        tantivy::Executor::InstrumentedThreadPool(
+            self.thread_pool.clone(),
+            Arc::new(ThreadPoolTaskInstrumentation {
+                pool_name: self.name,
+                caller,
+            }),
+        )
     }
 
     /// Function similar to `tokio::spawn_blocking`.
@@ -75,33 +65,66 @@ impl ThreadPool {
     ///
     /// This is nice because it makes work that has been scheduled
     /// but is not running yet "cancellable".
-    pub fn run_cpu_intensive<F, R>(
+    fn run_cpu_intensive_with_extra_tags<F, R>(
         &self,
         cpu_intensive_fn: F,
+        caller: &'static str,
     ) -> impl Future<Output = Result<R, Panicked>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         let span = tracing::Span::current();
-        let ongoing_tasks = self.ongoing_tasks.clone();
-        let mut pending_tasks_guard: OwnedGaugeGuard =
-            OwnedGaugeGuard::from_gauge(self.pending_tasks.clone());
-        pending_tasks_guard.add(1i64);
+        let queued_task = QueuedTask::new(self.name, caller);
         let (tx, rx) = oneshot::channel();
         self.thread_pool.spawn(move || {
-            drop(pending_tasks_guard);
             if tx.is_closed() {
+                // dropping `queued_task` still records the time it spent queued
                 return;
             }
             let _guard = span.enter();
-            let mut ongoing_task_guard = GaugeGuard::from_gauge(&ongoing_tasks);
-            ongoing_task_guard.add(1i64);
+            let running_task = queued_task.start();
             let result = cpu_intensive_fn();
+            drop(running_task);
             let _ = tx.send(result);
         });
         rx.map_err(|_| Panicked)
     }
+}
+
+/// Computes the number of threads to use for the small tasks thread pool.
+///
+/// The number of threads is picked, in order of precedence, from:
+/// - the `QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS` environment variable, if set
+/// - a third of the available CPUs (at least 2), otherwise
+fn compute_small_tasks_thread_pool_num_threads() -> usize {
+    if let Some(num_cpus) =
+        crate::get_from_env_opt::<usize>("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS", false)
+    {
+        if num_cpus == 0 {
+            warn!("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS is set to 0, ignoring it");
+        } else {
+            info!(
+                threads = num_cpus,
+                "small tasks thread pool configured from QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS"
+            );
+            return num_cpus;
+        }
+    }
+    let threads = (crate::num_cpus() / 3).max(2);
+    info!(
+        threads,
+        "small tasks thread pool configured with a third of the CPUs"
+    );
+    threads
+}
+
+fn small_task_executor() -> &'static SimpleThreadPool {
+    static SMALL_TASK_EXECUTOR: OnceLock<SimpleThreadPool> = OnceLock::new();
+    SMALL_TASK_EXECUTOR.get_or_init(|| {
+        let num_threads = compute_small_tasks_thread_pool_num_threads();
+        SimpleThreadPool::new("small_tasks", Some(num_threads))
+    })
 }
 
 /// Run a small (<200ms) CPU-intensive task on a dedicated thread pool with a few threads.
@@ -117,53 +140,16 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    static SMALL_TASK_EXECUTOR: std::sync::OnceLock<ThreadPool> = std::sync::OnceLock::new();
-    SMALL_TASK_EXECUTOR
-        .get_or_init(|| {
-            let num_threads: usize = (crate::num_cpus() / 3).max(2);
-            ThreadPool::new("small_tasks", Some(num_threads))
-        })
-        .run_cpu_intensive(cpu_intensive_fn)
+    small_task_executor().run_cpu_intensive_with_extra_tags(cpu_intensive_fn, "unknown")
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Panicked;
-
-impl fmt::Display for Panicked {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "scheduled task panicked")
-    }
+/// Returns a Tantivy [`tantivy::Executor`] backed by the small tasks thread pool used by
+/// [`run_cpu_intensive`].
+///
+/// Tasks that Tantivy schedules through it are tracked by metrics, labeled with `caller`.
+pub fn small_tasks_tantivy_executor(caller: &'static str) -> tantivy::Executor {
+    small_task_executor().get_executor(caller)
 }
-
-impl std::error::Error for Panicked {}
-
-struct ThreadPoolMetrics {
-    ongoing_tasks: IntGaugeVec<1>,
-    pending_tasks: IntGaugeVec<1>,
-}
-
-impl Default for ThreadPoolMetrics {
-    fn default() -> Self {
-        ThreadPoolMetrics {
-            ongoing_tasks: new_gauge_vec(
-                "ongoing_tasks",
-                "number of tasks being currently processed by threads in the thread pool",
-                "thread_pool",
-                &[],
-                ["pool"],
-            ),
-            pending_tasks: new_gauge_vec(
-                "pending_tasks",
-                "number of tasks waiting in the queue before being processed by the thread pool",
-                "thread_pool",
-                &[],
-                ["pool"],
-            ),
-        }
-    }
-}
-
-static THREAD_POOL_METRICS: Lazy<ThreadPoolMetrics> = Lazy::new(ThreadPoolMetrics::default);
 
 #[cfg(test)]
 mod tests {
@@ -205,5 +191,28 @@ mod tests {
         }
         futures::future::join_all(futures).await;
         assert!(counter.load(Ordering::SeqCst) < 100);
+    }
+
+    // SAFETY: this test may not be entirely sound if not run with nextest or --test-threads=1, as
+    // it mutates a process-wide environment variable. The cases are checked in a single test so
+    // that they don't race with each other on it.
+    #[test]
+    fn test_compute_small_tasks_thread_pool_num_threads() {
+        let default_num_threads = (crate::num_cpus() / 3).max(2);
+        unsafe { std::env::remove_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS") };
+        assert_eq!(
+            compute_small_tasks_thread_pool_num_threads(),
+            default_num_threads
+        );
+
+        unsafe { std::env::set_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS", "3") };
+        assert_eq!(compute_small_tasks_thread_pool_num_threads(), 3);
+
+        unsafe { std::env::set_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS", "0") };
+        assert_eq!(
+            compute_small_tasks_thread_pool_num_threads(),
+            default_num_threads
+        );
+        unsafe { std::env::remove_var("QW_SMALL_TASKS_THREAD_POOL_NUM_CPUS") };
     }
 }

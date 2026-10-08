@@ -15,7 +15,7 @@
 use itertools::Itertools;
 use quickwit_common::rate_limited_error;
 use quickwit_doc_mapper::QueryParserError;
-use quickwit_proto::error::grpc_error_to_grpc_status;
+use quickwit_proto::error::{grpc_error_to_grpc_status, grpc_status_to_service_error};
 use quickwit_proto::metastore::{EntityKind, MetastoreError};
 use quickwit_proto::search::SplitSearchError;
 use quickwit_proto::{GrpcServiceError, ServiceError, ServiceErrorCode, tonic};
@@ -46,6 +46,8 @@ pub enum SearchError {
     Timeout(String),
     #[error("too many requests")]
     TooManyRequests,
+    #[error("too many splits: {0}")]
+    TooManySplits(String),
     #[error("service unavailable: {0}")]
     Unavailable(String),
 }
@@ -87,6 +89,7 @@ impl ServiceError for SearchError {
             }
             Self::Timeout(_) => ServiceErrorCode::Timeout,
             Self::TooManyRequests => ServiceErrorCode::TooManyRequests,
+            Self::TooManySplits(_) => ServiceErrorCode::BadRequest,
             Self::Unavailable(_) => ServiceErrorCode::Unavailable,
         }
     }
@@ -116,11 +119,29 @@ impl From<SearchError> for tonic::Status {
     }
 }
 
-/// Parse tonic error and returns `SearchError`.
-pub fn parse_grpc_error(grpc_error: &tonic::Status) -> SearchError {
-    // TODO: the serialization to JSON part is missing.
-    serde_json::from_str(grpc_error.message())
-        .unwrap_or_else(|_| SearchError::Internal(grpc_error.message().to_string()))
+/// Parses a tonic status into a `SearchError`.
+///
+/// Server side errors are carried in the `qw-error` binary header, which preserves the
+/// `SearchError` variant. Client side timeouts (the `tower` `Timeout` layer wrapping the
+/// channel) never reach the server, so they carry no header and tonic reports them as
+/// `Unknown`: we detect them by walking the error source chain.
+pub fn parse_grpc_error(grpc_error: tonic::Status, rpc_name: &'static str) -> SearchError {
+    if is_client_timeout(&grpc_error) {
+        return SearchError::Timeout(grpc_error.message().to_string());
+    }
+    grpc_status_to_service_error(grpc_error, rpc_name)
+}
+
+/// Returns whether the status was caused by the client side timeout layer.
+fn is_client_timeout(grpc_error: &tonic::Status) -> bool {
+    let mut error_opt: Option<&(dyn std::error::Error + 'static)> = Some(grpc_error);
+    while let Some(error) = error_opt {
+        if error.is::<tower::timeout::error::Elapsed>() {
+            return true;
+        }
+        error_opt = error.source();
+    }
+    false
 }
 
 impl From<TantivyError> for SearchError {
@@ -184,5 +205,32 @@ impl From<JoinError> for SearchError {
 impl From<std::convert::Infallible> for SearchError {
     fn from(infallible: std::convert::Infallible) -> SearchError {
         match infallible {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_grpc_error_roundtrips_timeout() {
+        // A leaf that hits its own timeout must be reported as a timeout on the root, so
+        // that the retry policy doesn't retry it.
+        let status: tonic::Status = SearchError::Timeout("timeout exceeded".to_string()).into();
+        let search_error = parse_grpc_error(status, "leaf_search");
+        assert!(
+            matches!(&search_error, SearchError::Timeout(msg) if msg == "timeout exceeded"),
+            "unexpected error: {search_error:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_grpc_error_roundtrips_other_variants() {
+        let status: tonic::Status = SearchError::Unavailable("node is down".to_string()).into();
+        let search_error = parse_grpc_error(status, "leaf_search");
+        assert!(
+            matches!(&search_error, SearchError::Unavailable(msg) if msg == "node is down"),
+            "unexpected error: {search_error:?}"
+        );
     }
 }
