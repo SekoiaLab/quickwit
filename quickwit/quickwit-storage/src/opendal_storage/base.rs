@@ -35,7 +35,7 @@ use crate::{
 /// OpenDAL based storage implementation.
 /// # TODO
 ///
-/// - Implement REQUEST_SEMAPHORE to control the concurrency.
+/// - Implement the GetObject connection limit (`QW_S3_MAX_GET_OBJECT_CONNECTIONS`).
 /// - Implement STORAGE_METRICS for metrics.
 pub struct OpendalStorage {
     uri: Uri,
