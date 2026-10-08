@@ -22,6 +22,7 @@ use futures::future::try_join_all;
 use itertools::Itertools;
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::shared_consts;
+use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_common::uri::Uri;
 use quickwit_config::build_doc_mapper;
 use quickwit_doc_mapper::DYNAMIC_FIELD_NAME;
@@ -1029,6 +1030,7 @@ async fn root_search_aux(
         &split_metadatas[..],
         cluster_client,
     )
+    .detect_slow_poll("root_search:partial_hits_phase")
     .await?;
 
     let hits = fetch_docs_phase(
@@ -1038,6 +1040,7 @@ async fn root_search_aux(
         &search_request,
         cluster_client,
     )
+    .detect_slow_poll("root_search:fetch_docs_phase")
     .await?;
 
     let mut aggregation_result_postcard_opt = finalize_aggregation_if_any(
@@ -1332,7 +1335,8 @@ pub async fn root_search(
             &mut search_request,
             &mut metastore,
             searcher_context.searcher_config.max_splits_per_search,
-        ),
+        )
+        .detect_slow_poll("root_search:plan_splits"),
         status: None,
         req_span: req_span.clone(),
     }
