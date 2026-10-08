@@ -41,8 +41,7 @@ impl Default for DnsMetrics {
                 "aws_connection_attempts_total",
                 "Number of new TCP connections the AWS SDK HTTP client tried to open, for every \
                  AWS client in the process. Hyper asks the resolver for addresses once per new \
-                 connection, so this counts resolver calls; requests served by a pooled \
-                 connection are not counted.",
+                 connection, so this counts resolver calls.",
                 "storage",
                 &[],
             ),
