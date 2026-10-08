@@ -348,11 +348,15 @@ async fn warm_up_automatons(
     cost_class: QueryCostClass,
 ) -> anyhow::Result<()> {
     let mut warm_up_futures = Vec::new();
-    let cpu_intensive_executor = |task| async {
-        crate::search_thread_pool()
-            .run_cpu_intensive_with_extra_tags(task, "automaton_warmup", cost_class.as_label())
-            .await
-            .map_err(|_| std::io::Error::other("task panicked"))?
+    // Tantivy runs two CPU intensive steps through these executors: selecting the term dictionary
+    // blocks the automaton can match, and scanning the terms of those blocks.
+    let cpu_intensive_executor = |caller: &'static str| {
+        move |task: Box<dyn FnOnce() -> std::io::Result<()> + Send>| async move {
+            crate::search_thread_pool()
+                .run_cpu_intensive_with_extra_tags(task, caller, cost_class.as_label())
+                .await
+                .map_err(|_| std::io::Error::other("task panicked"))?
+        }
     };
     for (field, automatons) in terms_grouped_by_field {
         for segment_reader in searcher.segment_readers() {
@@ -388,7 +392,8 @@ async fn warm_up_automatons(
                                             automaton: Arc::new(regex),
                                             prefix: path.clone().unwrap_or_default(),
                                         },
-                                        cpu_intensive_executor,
+                                        cpu_intensive_executor("automaton_warmup_select_blocks"),
+                                        cpu_intensive_executor("automaton_warmup_scan_terms"),
                                     )
                                     .await
                                     .with_context(|| {
@@ -404,7 +409,8 @@ async fn warm_up_automatons(
                                             automaton: Arc::new(regexes),
                                             prefix: path.clone().unwrap_or_default(),
                                         },
-                                        cpu_intensive_executor,
+                                        cpu_intensive_executor("automaton_warmup_select_blocks"),
+                                        cpu_intensive_executor("automaton_warmup_scan_terms"),
                                     )
                                     .await
                                     .with_context(|| {
@@ -417,7 +423,11 @@ async fn warm_up_automatons(
                             }
                         }
                         Automaton::TermSet(automaton) => inv_idx_clone
-                            .warm_postings_automaton(automaton.clone(), cpu_intensive_executor)
+                            .warm_postings_automaton(
+                                automaton.clone(),
+                                cpu_intensive_executor("automaton_warmup_select_blocks"),
+                                cpu_intensive_executor("automaton_warmup_scan_terms"),
+                            )
                             .await
                             .context("failed to warm term set"),
                     }
