@@ -997,6 +997,24 @@ impl QuickwitCollector {
             ..WarmupInfo::default()
         }
     }
+
+    /// Returns whether merging the aggregation results of `leaf_responses` with
+    /// [`Collector::merge_fruits`] is CPU intensive enough to run on the search thread pool.
+    pub(crate) fn is_merge_cpu_intensive(&self, leaf_responses: &[LeafSearchResponse]) -> bool {
+        let Some(aggregation) = &self.aggregation else {
+            return false;
+        };
+        let intermediate_results = leaf_responses
+            .iter()
+            .filter_map(|leaf_response| leaf_response.intermediate_aggregation_result.as_ref());
+        let num_results = intermediate_results.clone().count();
+        let num_bytes = intermediate_results.map(Vec::len).sum();
+        let is_find_trace_ids = matches!(
+            aggregation,
+            QuickwitAggregations::FindTraceIdsAggregation(_)
+        );
+        is_aggregation_merge_cpu_intensive(is_find_trace_ids, num_results, num_bytes)
+    }
 }
 
 impl Collector for QuickwitCollector {
@@ -1452,13 +1470,29 @@ pub(crate) struct IncrementalCollector {
 
 /// Merging intermediate aggregation results totalling fewer bytes than this is cheap enough to run
 /// on the calling task, without going through the search thread pool.
-pub static AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES: LazyLock<usize> = LazyLock::new(|| {
+static AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES: LazyLock<usize> = LazyLock::new(|| {
     quickwit_common::get_from_env(
         "QW_AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES",
         128 * 1024,
         false,
     )
 });
+
+/// Returns whether merging `num_results` intermediate aggregation results totalling `num_bytes` is
+/// worth the search thread pool's hand-off and queue. Shared by the leaf `finalize` and the root
+/// merge. Trace id aggregation results are expensive to merge whatever their size, as soon as
+/// there are several of them.
+fn is_aggregation_merge_cpu_intensive(
+    is_find_trace_ids: bool,
+    num_results: usize,
+    num_bytes: usize,
+) -> bool {
+    if is_find_trace_ids {
+        num_results > 1
+    } else {
+        num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES
+    }
+}
 
 impl IncrementalCollector {
     /// Create a new incremental collector
@@ -1540,11 +1574,12 @@ impl IncrementalCollector {
     pub(crate) fn is_finalize_cpu_intensive(&self) -> bool {
         match &self.incremental_aggregation {
             QuickwitIncrementalAggregations::TantivyAggregations(_, state) => {
-                let num_bytes: usize = state.iter().map(Vec::len).sum();
-                num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES
+                let num_bytes = state.iter().map(Vec::len).sum();
+                is_aggregation_merge_cpu_intensive(false, state.len(), num_bytes)
             }
-            // These are only merged when there is more than one partial result.
-            QuickwitIncrementalAggregations::FindTraceIdsAggregation(_, state) => state.len() > 1,
+            QuickwitIncrementalAggregations::FindTraceIdsAggregation(_, state) => {
+                is_aggregation_merge_cpu_intensive(true, state.len(), 0)
+            }
             QuickwitIncrementalAggregations::NoAggregation => false,
         }
     }
@@ -2641,5 +2676,24 @@ mod tests {
             })
             .unwrap();
         assert!(incremental_collector.is_finalize_cpu_intensive());
+    }
+
+    #[test]
+    fn test_is_merge_cpu_intensive_offloads_several_trace_id_results() {
+        let request = SearchRequest {
+            max_hits: 10,
+            aggregation_request: Some(
+                r#"{"num_traces":20,"trace_id_field_name":"trace_id","span_timestamp_field_name":"span_start_timestamp_nanos"}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let merge_collector = make_merge_collector(&request, Default::default()).unwrap();
+        let small_result = || LeafSearchResponse {
+            intermediate_aggregation_result: Some(vec![0; 16]),
+            ..Default::default()
+        };
+        assert!(!merge_collector.is_merge_cpu_intensive(&[small_result()]));
+        assert!(merge_collector.is_merge_cpu_intensive(&[small_result(), small_result()]));
     }
 }

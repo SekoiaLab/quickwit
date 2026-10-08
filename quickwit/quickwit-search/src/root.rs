@@ -50,9 +50,7 @@ use tantivy::schema::{Field, FieldEntry, FieldType, Schema};
 use tracing::{debug, info_span, instrument, record_all};
 
 use crate::cluster_client::ClusterClient;
-use crate::collector::{
-    AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES, QuickwitAggregations, make_merge_collector,
-};
+use crate::collector::{QuickwitAggregations, make_merge_collector};
 use crate::metrics_trackers::{RootSearchMetricsFuture, SearchPlanMetricsFuture};
 use crate::scroll_context::{ScrollContext, ScrollKeyAndStartOffset};
 use crate::search_job_placer::{Job, group_by, group_jobs_by_index_id};
@@ -803,15 +801,7 @@ pub(crate) async fn search_partial_hits_phase(
 
     // Merging is CPU bound, but only worth the search thread pool's hand-off and queue when there
     // are enough aggregation results to merge.
-    let aggregation_num_bytes: usize = leaf_search_responses
-        .iter()
-        .filter_map(|leaf_search_response| {
-            leaf_search_response
-                .intermediate_aggregation_result
-                .as_ref()
-        })
-        .map(Vec::len)
-        .sum();
+    let is_merge_cpu_intensive = merge_collector.is_merge_cpu_intensive(&leaf_search_responses);
 
     // Wrap into result for merge_fruits
     let leaf_search_results: Vec<tantivy::Result<LeafSearchResponse>> =
@@ -821,7 +811,7 @@ pub(crate) async fn search_partial_hits_phase(
         let _span_guard = span.enter();
         merge_collector.merge_fruits(leaf_search_results)
     };
-    let merge_result = if aggregation_num_bytes >= *AGGREGATION_MERGE_OFFLOAD_THRESHOLD_NUM_BYTES {
+    let merge_result = if is_merge_cpu_intensive {
         crate::search_thread_pool()
             .run_cpu_intensive_with_priority(Priority::High, merge_fruits, "root_merge")
             .await
