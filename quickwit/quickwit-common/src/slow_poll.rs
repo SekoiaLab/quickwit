@@ -39,8 +39,8 @@ static POLL_DURATION_HISTOGRAM: Lazy<HistogramVec<1>> = Lazy::new(|| {
         "task_poll_duration_seconds",
         "Duration of individual polls of futures instrumented with `detect_slow_poll`. A poll \
          blocks a tokio worker for its entire duration. Nested instrumentation points report \
-         inclusive times: `a` includes `a:b`. With task poll attribution enabled, `s3` covers the \
-         polls of the tasks spawned by the S3 client (its pooled connections).",
+         inclusive times: `a` includes `a:b`. With S3 task poll attribution enabled, `s3` covers \
+         the polls of the tasks spawned by the S3 client (its pooled connections).",
         "runtime",
         &[],
         ["name"],
@@ -75,9 +75,9 @@ impl Drop for InS3Guard {
 
 /// Extension trait marking a future as an S3 request.
 pub trait S3ScopeExt: Sized {
-    /// With task poll attribution enabled (see [`configure_task_poll_attribution`]), the tasks
-    /// spawned while this future is being polled, and their own descendants, are recorded as
-    /// `s3`.
+    /// With S3 task poll attribution enabled (see [`configure_s3_task_poll_attribution`]), the
+    /// tasks spawned while this future is being polled, and their own descendants, are recorded
+    /// as `s3`.
     ///
     /// The S3 client's connections run in tasks spawned by the first request that needed
     /// them, then shared by every later request through the pool: this attributes their work
@@ -168,20 +168,20 @@ impl<F: Future> Future for DetectSlowPoll<F> {
 
 /// Installs task hooks on `runtime_builder` that record the polls of the tasks spawned by
 /// S3 requests (see [`S3ScopeExt::in_s3_scope`]) under `s3`, when
-/// `QW_TOKIO_TASK_POLL_ATTRIBUTION` is set.
+/// `QW_TOKIO_S3_TASK_POLL_ATTRIBUTION` is set.
 ///
 /// These tasks are spawned by the S3 client's HTTP library, so they cannot be wrapped with
 /// [`DetectSlowPollExt::detect_slow_poll`] directly. It costs a lookup in a sharded set per
 /// task poll, hence the opt-in.
-pub fn configure_task_poll_attribution(runtime_builder: &mut tokio::runtime::Builder) {
-    if !crate::get_bool_from_env("QW_TOKIO_TASK_POLL_ATTRIBUTION", false) {
+pub fn configure_s3_task_poll_attribution(runtime_builder: &mut tokio::runtime::Builder) {
+    if !crate::get_bool_from_env("QW_TOKIO_S3_TASK_POLL_ATTRIBUTION", false) {
         return;
     }
     #[cfg(not(tokio_unstable))]
     {
         let _ = runtime_builder;
         tracing::warn!(
-            "`QW_TOKIO_TASK_POLL_ATTRIBUTION` requires `--cfg tokio_unstable`, ignoring it"
+            "`QW_TOKIO_S3_TASK_POLL_ATTRIBUTION` requires `--cfg tokio_unstable`, ignoring it"
         );
     }
     #[cfg(tokio_unstable)]
