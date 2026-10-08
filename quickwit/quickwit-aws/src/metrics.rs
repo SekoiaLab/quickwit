@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use once_cell::sync::Lazy;
-use quickwit_common::metrics::{Histogram, new_histogram};
+use quickwit_common::metrics::{Histogram, IntCounter, new_counter, new_histogram};
 
 /// Metrics for the DNS resolution performed when opening a connection to an AWS endpoint.
 ///
@@ -22,6 +22,7 @@ use quickwit_common::metrics::{Histogram, new_histogram};
 /// credential providers (STS, SSO, IMDS) -- not just object storage.
 pub struct DnsMetrics {
     pub resolve_duration_seconds: Histogram,
+    pub connection_attempts_total: IntCounter,
 }
 
 impl Default for DnsMetrics {
@@ -35,6 +36,14 @@ impl Default for DnsMetrics {
                 vec![
                     0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
                 ],
+            ),
+            connection_attempts_total: new_counter(
+                "aws_connection_attempts_total",
+                "Number of new TCP connections the AWS SDK HTTP client tried to open, for every \
+                 AWS client in the process. Hyper asks the resolver for addresses once per new \
+                 connection, so this counts resolver calls.",
+                "storage",
+                &[],
             ),
         }
     }
