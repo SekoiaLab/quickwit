@@ -362,8 +362,19 @@ async fn warm_up_automatons(
                 warm_up_futures.push(async move {
                     match automaton {
                         Automaton::Regex(path, patterns) => {
-                            let regex =
-                                tantivy_fst::Regex::from_patterns(patterns).with_context(|| {
+                            let patterns = patterns.clone();
+                            let regex = crate::search_thread_pool()
+                                .run_cpu_intensive_with_extra_tags(
+                                    move || {
+                                        tantivy_fst::Regex::from_patterns(&patterns)
+                                            .map_err(anyhow::Error::from)
+                                    },
+                                    "automaton_warmup_build",
+                                    cost_class.as_label(),
+                                )
+                                .await
+                                .context("regex build panicked during warmup")?
+                                .with_context(|| {
                                     format!(
                                         "failed to build regex during warmup for field `{}`",
                                         full_path(*field, path, searcher.schema()),
