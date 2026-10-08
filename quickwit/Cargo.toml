@@ -359,7 +359,7 @@ quickwit-serve = { path = "quickwit-serve" }
 quickwit-storage = { path = "quickwit-storage" }
 
 
-tantivy = { git = "https://github.com/SekoiaLab/tantivy.git", rev = "573de9bfce59c972285d2a1a909e96e812e80868", default-features = false, features = [
+tantivy = { git = "https://github.com/SekoiaLab/tantivy.git", tag = "v0.26.1_20261008", default-features = false, features = [
   "lz4-compression",
   "mmap",
   "quickwit",
