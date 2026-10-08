@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_common::uri::Uri;
 use quickwit_config::SearcherConfig;
 use quickwit_doc_mapper::DocMapper;
@@ -180,7 +181,8 @@ impl SearchService for SearchServiceImpl {
                 search_request,
                 self.metastore.clone(),
                 &self.cluster_client,
-            ),
+            )
+            .detect_slow_poll("root_search"),
         )
         .await??;
         Ok(search_result)
@@ -210,7 +212,8 @@ impl SearchService for SearchServiceImpl {
                 leaf_search_request,
                 &self.storage_resolver,
                 cost_class,
-            ),
+            )
+            .detect_slow_poll("leaf_multi_index"),
             start: Instant::now(),
             targeted_splits: num_splits,
             status: None,
@@ -236,6 +239,7 @@ impl SearchService for SearchServiceImpl {
             doc_mapper,
             snippet_request_opt,
         )
+        .detect_slow_poll("fetch_docs_service")
         .await?;
 
         Ok(fetch_docs_response)

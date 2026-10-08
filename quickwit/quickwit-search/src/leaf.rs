@@ -23,6 +23,7 @@ use anyhow::Context;
 use bytesize::ByteSize;
 use futures::future::try_join_all;
 use quickwit_common::pretty::PrettySample;
+use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
 use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
 use quickwit_proto::search::{
@@ -227,19 +228,24 @@ pub(crate) async fn warmup(
 ) -> anyhow::Result<()> {
     debug!(warmup_info=?warmup_info);
     let warm_up_terms_future = warm_up_terms(searcher, &warmup_info.terms_grouped_by_field)
+        .detect_slow_poll("leaf_single_split:warm_up_terms")
         .instrument(debug_span!("warm_up_terms"));
     let warm_up_term_ranges_future =
         warm_up_term_ranges(searcher, &warmup_info.term_ranges_grouped_by_field)
+            .detect_slow_poll("leaf_single_split:warm_up_term_ranges")
             .instrument(debug_span!("warm_up_term_ranges"));
     let warm_up_fastfields_future = warm_up_fastfields(searcher, &warmup_info.fast_fields)
+        .detect_slow_poll("leaf_single_split:warm_up_fastfields")
         .instrument(debug_span!("warm_up_fastfields"));
     let warm_up_fieldnorms_future = warm_up_fieldnorms(searcher, warmup_info.field_norms)
+        .detect_slow_poll("leaf_single_split:warm_up_fieldnorms")
         .instrument(debug_span!("warm_up_fieldnorms"));
     let warm_up_automatons_future = warm_up_automatons(
         searcher,
         &warmup_info.automatons_grouped_by_field,
         cost_class,
     )
+    .detect_slow_poll("leaf_single_split:warm_up_automatons")
     .instrument(debug_span!("warm_up_automatons"));
 
     tokio::try_join!(
@@ -1304,9 +1310,10 @@ pub async fn multi_index_leaf_search(
                     aggregation_limits,
                     cost_class,
                 )
-                .in_current_span()
                 .await
             }
+            .detect_slow_poll("leaf_single_index")
+            .in_current_span()
         });
     }
 
@@ -1453,6 +1460,7 @@ pub async fn single_doc_mapping_leaf_search(
                 leaf_split_search_permit,
                 aggregations_limits.clone(),
             )
+            .detect_slow_poll("leaf_single_split")
             .in_current_span(),
         );
         split_with_task_id.push((split_id, handle.id()));
