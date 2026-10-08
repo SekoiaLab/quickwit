@@ -690,15 +690,33 @@ mod tests {
     async fn test_coalesce_segments_large_body_uses_thread_pool() {
         let threshold = *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES;
         let thread_pool = ThreadPoolWithPriority::new("assembly_test", Some(1));
+        // Occupy the only thread of the pool.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking_task = thread_pool.run_cpu_intensive(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+
         let segment_len = threshold / 2 + 1;
         let segments = vec![
             Bytes::from(vec![1u8; segment_len]),
             Bytes::from(vec![2u8; segment_len]),
         ];
         let total_num_bytes = 2 * segment_len;
-        let coalesced = coalesce_segments(segments, total_num_bytes, Some(&thread_pool))
-            .await
-            .unwrap();
+        let mut coalesce_future = Box::pin(coalesce_segments(
+            segments,
+            total_num_bytes,
+            Some(&thread_pool),
+        ));
+        // Assembled inline, the body would be ready on the first poll. On the pool, it waits for
+        // the thread to be released.
+        assert!(futures::poll!(&mut coalesce_future).is_pending());
+
+        release_tx.send(()).unwrap();
+        blocking_task.await.unwrap();
+        let coalesced = coalesce_future.await.unwrap();
         assert_eq!(coalesced.len(), total_num_bytes);
         assert!(coalesced[..segment_len].iter().all(|&byte| byte == 1));
         assert!(coalesced[segment_len..].iter().all(|&byte| byte == 2));
