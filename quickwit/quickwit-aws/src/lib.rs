@@ -26,6 +26,7 @@ use crate::dns::CachingDnsResolver;
 
 pub mod dns;
 pub mod error;
+pub mod http_client;
 pub mod metrics;
 pub mod retry;
 
