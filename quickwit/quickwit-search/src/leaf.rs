@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bytesize::ByteSize;
-use futures::future::try_join_all;
+use futures::future::{TryJoinAll, try_join_all};
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_common::thread_pool::Panicked;
@@ -49,6 +49,7 @@ use tantivy::fastfield::FastFieldReaders;
 use tantivy::schema::{self, Field};
 use tantivy::{DateTime, Index, ReloadPolicy, Searcher, TantivyError, Term};
 use tantivy_fst::DisjunctionRegex;
+use tokio::task::coop::{Coop, cooperative};
 use tokio::task::{JoinError, JoinSet};
 use tracing::*;
 use ulid::Ulid;
@@ -209,6 +210,21 @@ pub(crate) async fn open_index_with_caches(
     Ok((index, hot_directory))
 }
 
+/// Like `try_join_all`, but each joined future consumes tokio's cooperative budget when it
+/// completes.
+///
+/// Warm-up futures complete when storage reads resolve, and those reads are delivered through
+/// channels that don't consume the budget. Without this, a burst of completed reads is processed in
+/// a single poll of the leaf task, however many there are. With it, the task yields once the
+/// budget is spent.
+fn try_join_all_cooperative<I, T, E>(futures: I) -> TryJoinAll<Coop<I::Item>>
+where
+    I: IntoIterator,
+    I::Item: Future<Output = Result<T, E>>,
+{
+    try_join_all(futures.into_iter().map(cooperative))
+}
+
 /// Tantivy search does not make it possible to fetch data asynchronously during
 /// search.
 ///
@@ -275,7 +291,7 @@ async fn warm_up_fastfield(
             .await?;
         columns.extend(subpath_columns);
     }
-    futures::future::try_join_all(
+    try_join_all_cooperative(
         columns
             .into_iter()
             .map(|col| async move { col.file_slice().read_bytes_async().await }),
@@ -298,7 +314,7 @@ async fn warm_up_fastfields(
             warm_up_futures.push(Box::pin(warm_up_fut));
         }
     }
-    futures::future::try_join_all(warm_up_futures).await?;
+    try_join_all_cooperative(warm_up_futures).await?;
     Ok(())
 }
 
@@ -317,7 +333,7 @@ async fn warm_up_terms(
             }
         }
     }
-    try_join_all(warm_up_futures).await?;
+    try_join_all_cooperative(warm_up_futures).await?;
     Ok(())
 }
 
@@ -340,7 +356,7 @@ async fn warm_up_term_ranges(
             }
         }
     }
-    try_join_all(warm_up_futures).await?;
+    try_join_all_cooperative(warm_up_futures).await?;
     Ok(())
 }
 
@@ -437,7 +453,7 @@ async fn warm_up_automatons(
             }
         }
     }
-    try_join_all(warm_up_futures).await?;
+    try_join_all_cooperative(warm_up_futures).await?;
     Ok(())
 }
 
@@ -455,7 +471,7 @@ async fn warm_up_fieldnorms(searcher: &Searcher, requires_scoring: bool) -> anyh
             }
         }
     }
-    try_join_all(warm_up_futures).await?;
+    try_join_all_cooperative(warm_up_futures).await?;
     Ok(())
 }
 
@@ -1741,6 +1757,33 @@ mod tests {
     };
 
     use super::*;
+
+    /// Polls `future` to completion and returns how many polls it took.
+    async fn count_polls<F: Future>(future: F) -> usize {
+        let mut future = std::pin::pin!(future);
+        let mut num_polls = 0;
+        std::future::poll_fn(|cx| {
+            num_polls += 1;
+            future.as_mut().poll(cx)
+        })
+        .await;
+        num_polls
+    }
+
+    #[tokio::test]
+    async fn test_try_join_all_cooperative_yields_when_budget_is_spent() {
+        const NUM_FUTURES: usize = 1_000;
+        let ready_futures = || (0..NUM_FUTURES).map(|_| async { Ok::<(), ()>(()) });
+
+        // A plain join completes every ready future in a single poll.
+        assert_eq!(count_polls(try_join_all(ready_futures())).await, 1);
+        // The cooperative join yields each time the task budget (128 units) is spent.
+        let num_polls = count_polls(try_join_all_cooperative(ready_futures())).await;
+        assert!(
+            num_polls >= NUM_FUTURES / 128,
+            "expected the join to yield, got {num_polls} polls"
+        );
+    }
 
     fn bool_filter(ast: impl Into<QueryAst>) -> QueryAst {
         BoolQuery {
