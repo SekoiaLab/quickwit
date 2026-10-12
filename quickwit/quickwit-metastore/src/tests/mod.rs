@@ -382,6 +382,13 @@ macro_rules! metastore_test_suite {
 
             #[tokio::test]
             #[serial_test::file_serial]
+            async fn test_metastore_list_splits_by_max_secondary_time_range_end() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::list_splits::test_metastore_list_splits_by_max_secondary_time_range_end::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
             async fn test_metastore_split_update_timestamp() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::split::test_metastore_split_update_timestamp::<$metastore_type>()

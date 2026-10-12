@@ -1774,3 +1774,74 @@ pub async fn test_metastore_list_splits_from_all_indexes<
     cleanup_index(&mut metastore, index_uid_1.clone()).await;
     cleanup_index(&mut metastore, index_uid_2.clone()).await;
 }
+
+pub async fn test_metastore_list_splits_by_max_secondary_time_range_end<
+    MetastoreToTest: MetastoreServiceExt + DefaultForTest,
+>() {
+    let mut metastore = MetastoreToTest::default_for_test().await;
+
+    let index_id = append_random_suffix("test-max-secondary-end");
+    let index_uri = format!("ram:///indexes/{index_id}");
+    let index_config = IndexConfig::for_test(&index_id, &index_uri);
+
+    let create_index_request = CreateIndexRequest::try_from_index_config(&index_config).unwrap();
+    let index_uid: IndexUid = metastore
+        .create_index(create_index_request)
+        .await
+        .unwrap()
+        .index_uid
+        .unwrap();
+
+    // (split name, time range, secondary time range), evaluated against a max end of 1000.
+    let split_specs = [
+        ("no-secondary-expired", Some(0..=500), None),
+        ("no-secondary-not-expired", Some(0..=1500), None),
+        ("both-expired", Some(0..=500), Some(0..=900)),
+        ("only-primary-expired", Some(0..=500), Some(0..=1500)),
+        ("only-secondary-expired", Some(0..=1500), Some(0..=900)),
+        ("both-at-max-end", Some(0..=1000), Some(0..=1000)),
+        ("no-time-range", None, None),
+        ("only-secondary-time-range", None, Some(0..=900)),
+    ];
+    let splits_metadata: Vec<SplitMetadata> = split_specs
+        .iter()
+        .map(|(name, time_range, secondary_time_range)| SplitMetadata {
+            split_id: name.to_string(),
+            index_uid: index_uid.clone(),
+            time_range: time_range.clone(),
+            secondary_time_range: secondary_time_range.clone(),
+            ..Default::default()
+        })
+        .collect();
+    let stage_splits_request =
+        StageSplitsRequest::try_from_splits_metadata(index_uid.clone(), splits_metadata).unwrap();
+    metastore.stage_splits(stage_splits_request).await.unwrap();
+
+    let query =
+        ListSplitsQuery::for_index(index_uid.clone()).with_max_secondary_time_range_end(1000);
+    let splits = metastore
+        .list_splits(ListSplitsRequest::try_from_list_splits_query(&query).unwrap())
+        .await
+        .unwrap()
+        .collect_splits()
+        .await
+        .unwrap();
+    let split_ids: Vec<&str> = splits
+        .iter()
+        .map(|split| split.split_metadata.split_id.as_str())
+        .sorted()
+        .collect();
+    let expected_split_ids: Vec<String> = [
+        "both-at-max-end",
+        "both-expired",
+        "no-secondary-expired",
+        "only-secondary-expired",
+        "only-secondary-time-range",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect();
+    assert_eq!(split_ids, expected_split_ids);
+
+    cleanup_index(&mut metastore, index_uid).await;
+}
