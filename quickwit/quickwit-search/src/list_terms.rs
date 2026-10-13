@@ -33,10 +33,12 @@ use tantivy::schema::{Field, FieldType};
 use tantivy::{ReloadPolicy, Term};
 use tracing::{debug, error, info, instrument};
 
+use crate::cost::compute_split_query_cost;
 use crate::leaf::open_index_with_caches;
-use crate::metrics::queue_label;
 use crate::search_job_placer::group_jobs_by_index_id;
-use crate::search_permit_provider::compute_initial_memory_allocation;
+use crate::search_permit_provider::{
+    QueryRemainingCost, SplitSearchTaskMetadata, compute_initial_memory_allocation,
+};
 use crate::{ClusterClient, SearchError, SearchJob, SearcherContext, resolve_index_patterns};
 
 /// Performs a distributed list terms.
@@ -217,7 +219,7 @@ async fn leaf_list_terms_single_split(
     let cache =
         ByteRangeCache::with_infinite_capacity(&quickwit_storage::STORAGE_METRICS.shortlived_cache);
     let (index, _) =
-        open_index_with_caches(searcher_context, storage, &split, None, Some(cache), false).await?;
+        open_index_with_caches(searcher_context, storage, &split, None, Some(cache)).await?;
     let split_schema = index.schema();
     let reader = index
         .reader_builder()
@@ -327,17 +329,26 @@ pub async fn leaf_list_terms(
     splits: &[SplitIdAndFooterOffsets],
 ) -> Result<LeafListTermsResponse, SearchError> {
     info!(split_offsets = ?PrettySample::new(splits, 5));
-    let permit_sizes = splits.iter().map(|split| {
-        compute_initial_memory_allocation(
-            split,
-            searcher_context
-                .searcher_config
-                .warmup_single_split_initial_allocation,
-        )
-    });
+    // List terms requests don't run a query, so the query complexity factor has no effect.
+    let split_tasks: Vec<SplitSearchTaskMetadata> = splits
+        .iter()
+        .map(|split| SplitSearchTaskMetadata {
+            memory_allocation: compute_initial_memory_allocation(
+                split,
+                searcher_context
+                    .searcher_config
+                    .warmup_single_split_initial_allocation,
+            ),
+            job_cost: compute_split_query_cost(split.num_docs, 1.0),
+        })
+        .collect();
+    let total_cost = split_tasks
+        .iter()
+        .map(|split_task| split_task.job_cost)
+        .sum();
     let permits = searcher_context
         .search_permit_provider
-        .get_permits(permit_sizes)
+        .get_permits(split_tasks, QueryRemainingCost::new(total_cost))
         .await;
     let leaf_search_single_split_futures: Vec<_> = splits
         .iter()
@@ -351,7 +362,6 @@ pub async fn leaf_list_terms(
                 crate::SEARCH_METRICS.leaf_list_terms_splits_total.inc();
                 let timer = crate::SEARCH_METRICS
                     .leaf_search_split_duration_secs
-                    .with_label_values([queue_label(false)])
                     .start_timer();
                 let leaf_search_single_split_res = leaf_list_terms_single_split(
                     &searcher_context_clone,

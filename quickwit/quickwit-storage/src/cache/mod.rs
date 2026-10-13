@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod base_cache;
 mod byte_range_cache;
+mod disk_sized_cache;
 mod memory_sized_cache;
 mod quickwit_cache;
 mod slice_address;
 mod storage_with_cache;
 mod stored_item;
+mod tiered_sized_cache;
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -28,7 +31,9 @@ pub use quickwit_cache::QuickwitCache;
 pub use storage_with_cache::StorageWithCache;
 
 pub use self::byte_range_cache::ByteRangeCache;
+pub use self::disk_sized_cache::DiskSizedCache;
 pub use self::memory_sized_cache::MemorySizedCache;
+pub use self::tiered_sized_cache::TieredSizedCache;
 use crate::{OwnedBytes, Storage};
 
 /// Wraps the given directory with a slice cache that is actually global

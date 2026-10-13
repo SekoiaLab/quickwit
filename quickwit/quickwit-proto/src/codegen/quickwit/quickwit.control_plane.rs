@@ -73,6 +73,83 @@ pub struct AdviseResetShardsResponse {
     pub shards_to_truncate: ::prost::alloc::vec::Vec<super::ingest::ShardIdPositions>,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SwapIndexingPipelinesRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub swaps: ::prost::alloc::vec::Vec<SwapIndexingPipelinesEntry>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SwapIndexingPipelinesEntry {
+    #[prost(string, tag = "1")]
+    pub left_node_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub left_index_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub right_node_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub right_index_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SwapIndexingPipelinesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub results: ::prost::alloc::vec::Vec<SwapIndexingPipelinesResult>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SwapIndexingPipelinesResult {
+    #[prost(message, optional, tag = "1")]
+    pub swap: ::core::option::Option<SwapIndexingPipelinesEntry>,
+    #[prost(bool, tag = "2")]
+    pub success: bool,
+    /// Human-readable reason when success is false.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EnableMaintenanceModeRequest {}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EnableMaintenanceModeResponse {
+    /// The frozen physical indexing plan serialized as JSON.
+    #[prost(string, tag = "1")]
+    pub frozen_plan_json: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DisableMaintenanceModeRequest {}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DisableMaintenanceModeResponse {}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetMaintenanceModeRequest {}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetMaintenanceModeResponse {
+    #[prost(bool, tag = "1")]
+    pub is_maintenance_mode: bool,
+    /// If maintenance mode is active, the RFC 3339 datetime string when it was enabled.
+    #[prost(string, optional, tag = "2")]
+    pub enabled_at: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MaintenanceFrozenPlanForNode {
+    #[prost(string, tag = "1")]
+    pub index_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub indexing_tasks: ::prost::alloc::vec::Vec<super::indexing::IndexingTask>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MaintenanceFrozenPlan {
+    #[prost(message, repeated, tag = "2")]
+    pub state_per_node: ::prost::alloc::vec::Vec<MaintenanceFrozenPlanForNode>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -180,6 +257,27 @@ pub trait ControlPlaneService: std::fmt::Debug + Send + Sync + 'static {
         &self,
         request: super::metastore::PruneShardsRequest,
     ) -> crate::control_plane::ControlPlaneResult<super::metastore::EmptyResponse>;
+    ///Swaps indexing pipelines of different indexes between different indexers.
+    async fn swap_indexing_pipelines(
+        &self,
+        request: SwapIndexingPipelinesRequest,
+    ) -> crate::control_plane::ControlPlaneResult<SwapIndexingPipelinesResponse>;
+    ///Enables maintenance mode on the cluster. When active, the indexing plan is frozen,
+    ///metadata mutations (index/source CRUD) are accepted but the plan is not rebuilt, and shard scaling/rebalancing is paused.
+    async fn enable_maintenance_mode(
+        &self,
+        request: EnableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<EnableMaintenanceModeResponse>;
+    ///Disables maintenance mode. Triggers a full indexing plan rebuild to reconcile the cluster.
+    async fn disable_maintenance_mode(
+        &self,
+        request: DisableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<DisableMaintenanceModeResponse>;
+    ///Returns the current maintenance mode status.
+    async fn get_maintenance_mode(
+        &self,
+        request: GetMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<GetMaintenanceModeResponse>;
 }
 #[derive(Debug, Clone)]
 pub struct ControlPlaneServiceClient {
@@ -352,6 +450,30 @@ impl ControlPlaneService for ControlPlaneServiceClient {
     ) -> crate::control_plane::ControlPlaneResult<super::metastore::EmptyResponse> {
         self.inner.0.prune_shards(request).await
     }
+    async fn swap_indexing_pipelines(
+        &self,
+        request: SwapIndexingPipelinesRequest,
+    ) -> crate::control_plane::ControlPlaneResult<SwapIndexingPipelinesResponse> {
+        self.inner.0.swap_indexing_pipelines(request).await
+    }
+    async fn enable_maintenance_mode(
+        &self,
+        request: EnableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<EnableMaintenanceModeResponse> {
+        self.inner.0.enable_maintenance_mode(request).await
+    }
+    async fn disable_maintenance_mode(
+        &self,
+        request: DisableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<DisableMaintenanceModeResponse> {
+        self.inner.0.disable_maintenance_mode(request).await
+    }
+    async fn get_maintenance_mode(
+        &self,
+        request: GetMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<GetMaintenanceModeResponse> {
+        self.inner.0.get_maintenance_mode(request).await
+    }
 }
 #[cfg(any(test, feature = "testsuite"))]
 pub mod mock_control_plane_service {
@@ -439,6 +561,38 @@ pub mod mock_control_plane_service {
             super::super::metastore::EmptyResponse,
         > {
             self.inner.lock().await.prune_shards(request).await
+        }
+        async fn swap_indexing_pipelines(
+            &self,
+            request: super::SwapIndexingPipelinesRequest,
+        ) -> crate::control_plane::ControlPlaneResult<
+            super::SwapIndexingPipelinesResponse,
+        > {
+            self.inner.lock().await.swap_indexing_pipelines(request).await
+        }
+        async fn enable_maintenance_mode(
+            &self,
+            request: super::EnableMaintenanceModeRequest,
+        ) -> crate::control_plane::ControlPlaneResult<
+            super::EnableMaintenanceModeResponse,
+        > {
+            self.inner.lock().await.enable_maintenance_mode(request).await
+        }
+        async fn disable_maintenance_mode(
+            &self,
+            request: super::DisableMaintenanceModeRequest,
+        ) -> crate::control_plane::ControlPlaneResult<
+            super::DisableMaintenanceModeResponse,
+        > {
+            self.inner.lock().await.disable_maintenance_mode(request).await
+        }
+        async fn get_maintenance_mode(
+            &self,
+            request: super::GetMaintenanceModeRequest,
+        ) -> crate::control_plane::ControlPlaneResult<
+            super::GetMaintenanceModeResponse,
+        > {
+            self.inner.lock().await.get_maintenance_mode(request).await
         }
     }
 }
@@ -613,6 +767,70 @@ for InnerControlPlaneServiceClient {
         Box::pin(fut)
     }
 }
+impl tower::Service<SwapIndexingPipelinesRequest> for InnerControlPlaneServiceClient {
+    type Response = SwapIndexingPipelinesResponse;
+    type Error = crate::control_plane::ControlPlaneError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: SwapIndexingPipelinesRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.swap_indexing_pipelines(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<EnableMaintenanceModeRequest> for InnerControlPlaneServiceClient {
+    type Response = EnableMaintenanceModeResponse;
+    type Error = crate::control_plane::ControlPlaneError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: EnableMaintenanceModeRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.enable_maintenance_mode(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<DisableMaintenanceModeRequest> for InnerControlPlaneServiceClient {
+    type Response = DisableMaintenanceModeResponse;
+    type Error = crate::control_plane::ControlPlaneError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: DisableMaintenanceModeRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.disable_maintenance_mode(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<GetMaintenanceModeRequest> for InnerControlPlaneServiceClient {
+    type Response = GetMaintenanceModeResponse;
+    type Error = crate::control_plane::ControlPlaneError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: GetMaintenanceModeRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.get_maintenance_mode(request).await };
+        Box::pin(fut)
+    }
+}
 /// A tower service stack is a set of tower services.
 #[derive(Debug)]
 struct ControlPlaneServiceTowerServiceStack {
@@ -666,6 +884,26 @@ struct ControlPlaneServiceTowerServiceStack {
     prune_shards_svc: quickwit_common::tower::BoxService<
         super::metastore::PruneShardsRequest,
         super::metastore::EmptyResponse,
+        crate::control_plane::ControlPlaneError,
+    >,
+    swap_indexing_pipelines_svc: quickwit_common::tower::BoxService<
+        SwapIndexingPipelinesRequest,
+        SwapIndexingPipelinesResponse,
+        crate::control_plane::ControlPlaneError,
+    >,
+    enable_maintenance_mode_svc: quickwit_common::tower::BoxService<
+        EnableMaintenanceModeRequest,
+        EnableMaintenanceModeResponse,
+        crate::control_plane::ControlPlaneError,
+    >,
+    disable_maintenance_mode_svc: quickwit_common::tower::BoxService<
+        DisableMaintenanceModeRequest,
+        DisableMaintenanceModeResponse,
+        crate::control_plane::ControlPlaneError,
+    >,
+    get_maintenance_mode_svc: quickwit_common::tower::BoxService<
+        GetMaintenanceModeRequest,
+        GetMaintenanceModeResponse,
         crate::control_plane::ControlPlaneError,
     >,
 }
@@ -734,6 +972,30 @@ impl ControlPlaneService for ControlPlaneServiceTowerServiceStack {
         request: super::metastore::PruneShardsRequest,
     ) -> crate::control_plane::ControlPlaneResult<super::metastore::EmptyResponse> {
         self.prune_shards_svc.clone().ready().await?.call(request).await
+    }
+    async fn swap_indexing_pipelines(
+        &self,
+        request: SwapIndexingPipelinesRequest,
+    ) -> crate::control_plane::ControlPlaneResult<SwapIndexingPipelinesResponse> {
+        self.swap_indexing_pipelines_svc.clone().ready().await?.call(request).await
+    }
+    async fn enable_maintenance_mode(
+        &self,
+        request: EnableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<EnableMaintenanceModeResponse> {
+        self.enable_maintenance_mode_svc.clone().ready().await?.call(request).await
+    }
+    async fn disable_maintenance_mode(
+        &self,
+        request: DisableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<DisableMaintenanceModeResponse> {
+        self.disable_maintenance_mode_svc.clone().ready().await?.call(request).await
+    }
+    async fn get_maintenance_mode(
+        &self,
+        request: GetMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<GetMaintenanceModeResponse> {
+        self.get_maintenance_mode_svc.clone().ready().await?.call(request).await
     }
 }
 type CreateIndexLayer = quickwit_common::tower::BoxLayer<
@@ -836,18 +1098,62 @@ type PruneShardsLayer = quickwit_common::tower::BoxLayer<
     super::metastore::EmptyResponse,
     crate::control_plane::ControlPlaneError,
 >;
+type SwapIndexingPipelinesLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        SwapIndexingPipelinesRequest,
+        SwapIndexingPipelinesResponse,
+        crate::control_plane::ControlPlaneError,
+    >,
+    SwapIndexingPipelinesRequest,
+    SwapIndexingPipelinesResponse,
+    crate::control_plane::ControlPlaneError,
+>;
+type EnableMaintenanceModeLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        EnableMaintenanceModeRequest,
+        EnableMaintenanceModeResponse,
+        crate::control_plane::ControlPlaneError,
+    >,
+    EnableMaintenanceModeRequest,
+    EnableMaintenanceModeResponse,
+    crate::control_plane::ControlPlaneError,
+>;
+type DisableMaintenanceModeLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        DisableMaintenanceModeRequest,
+        DisableMaintenanceModeResponse,
+        crate::control_plane::ControlPlaneError,
+    >,
+    DisableMaintenanceModeRequest,
+    DisableMaintenanceModeResponse,
+    crate::control_plane::ControlPlaneError,
+>;
+type GetMaintenanceModeLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        GetMaintenanceModeRequest,
+        GetMaintenanceModeResponse,
+        crate::control_plane::ControlPlaneError,
+    >,
+    GetMaintenanceModeRequest,
+    GetMaintenanceModeResponse,
+    crate::control_plane::ControlPlaneError,
+>;
 #[derive(Debug, Default)]
 pub struct ControlPlaneServiceTowerLayerStack {
-    create_index_layers: Vec<CreateIndexLayer>,
-    update_index_layers: Vec<UpdateIndexLayer>,
-    delete_index_layers: Vec<DeleteIndexLayer>,
-    add_source_layers: Vec<AddSourceLayer>,
-    update_source_layers: Vec<UpdateSourceLayer>,
-    toggle_source_layers: Vec<ToggleSourceLayer>,
-    delete_source_layers: Vec<DeleteSourceLayer>,
-    get_or_create_open_shards_layers: Vec<GetOrCreateOpenShardsLayer>,
-    advise_reset_shards_layers: Vec<AdviseResetShardsLayer>,
-    prune_shards_layers: Vec<PruneShardsLayer>,
+    pub create_index_layers: Vec<CreateIndexLayer>,
+    pub update_index_layers: Vec<UpdateIndexLayer>,
+    pub delete_index_layers: Vec<DeleteIndexLayer>,
+    pub add_source_layers: Vec<AddSourceLayer>,
+    pub update_source_layers: Vec<UpdateSourceLayer>,
+    pub toggle_source_layers: Vec<ToggleSourceLayer>,
+    pub delete_source_layers: Vec<DeleteSourceLayer>,
+    pub get_or_create_open_shards_layers: Vec<GetOrCreateOpenShardsLayer>,
+    pub advise_reset_shards_layers: Vec<AdviseResetShardsLayer>,
+    pub prune_shards_layers: Vec<PruneShardsLayer>,
+    pub swap_indexing_pipelines_layers: Vec<SwapIndexingPipelinesLayer>,
+    pub enable_maintenance_mode_layers: Vec<EnableMaintenanceModeLayer>,
+    pub disable_maintenance_mode_layers: Vec<DisableMaintenanceModeLayer>,
+    pub get_maintenance_mode_layers: Vec<GetMaintenanceModeLayer>,
 }
 impl ControlPlaneServiceTowerLayerStack {
     pub fn stack_layer<L>(mut self, layer: L) -> Self
@@ -1120,6 +1426,114 @@ impl ControlPlaneServiceTowerLayerStack {
         >>::Service as tower::Service<
             super::metastore::PruneShardsRequest,
         >>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    SwapIndexingPipelinesRequest,
+                    SwapIndexingPipelinesResponse,
+                    crate::control_plane::ControlPlaneError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                SwapIndexingPipelinesRequest,
+                SwapIndexingPipelinesResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >>::Service: tower::Service<
+                SwapIndexingPipelinesRequest,
+                Response = SwapIndexingPipelinesResponse,
+                Error = crate::control_plane::ControlPlaneError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                SwapIndexingPipelinesRequest,
+                SwapIndexingPipelinesResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >>::Service as tower::Service<
+            SwapIndexingPipelinesRequest,
+        >>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    EnableMaintenanceModeRequest,
+                    EnableMaintenanceModeResponse,
+                    crate::control_plane::ControlPlaneError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                EnableMaintenanceModeRequest,
+                EnableMaintenanceModeResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >>::Service: tower::Service<
+                EnableMaintenanceModeRequest,
+                Response = EnableMaintenanceModeResponse,
+                Error = crate::control_plane::ControlPlaneError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                EnableMaintenanceModeRequest,
+                EnableMaintenanceModeResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >>::Service as tower::Service<
+            EnableMaintenanceModeRequest,
+        >>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    DisableMaintenanceModeRequest,
+                    DisableMaintenanceModeResponse,
+                    crate::control_plane::ControlPlaneError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                DisableMaintenanceModeRequest,
+                DisableMaintenanceModeResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >>::Service: tower::Service<
+                DisableMaintenanceModeRequest,
+                Response = DisableMaintenanceModeResponse,
+                Error = crate::control_plane::ControlPlaneError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                DisableMaintenanceModeRequest,
+                DisableMaintenanceModeResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >>::Service as tower::Service<
+            DisableMaintenanceModeRequest,
+        >>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    GetMaintenanceModeRequest,
+                    GetMaintenanceModeResponse,
+                    crate::control_plane::ControlPlaneError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                GetMaintenanceModeRequest,
+                GetMaintenanceModeResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >>::Service: tower::Service<
+                GetMaintenanceModeRequest,
+                Response = GetMaintenanceModeResponse,
+                Error = crate::control_plane::ControlPlaneError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                GetMaintenanceModeRequest,
+                GetMaintenanceModeResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >>::Service as tower::Service<
+            GetMaintenanceModeRequest,
+        >>::Future: Send + 'static,
     {
         self.create_index_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
@@ -1140,6 +1554,14 @@ impl ControlPlaneServiceTowerLayerStack {
         self.advise_reset_shards_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.prune_shards_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.swap_indexing_pipelines_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.enable_maintenance_mode_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.disable_maintenance_mode_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.get_maintenance_mode_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self
     }
@@ -1353,6 +1775,94 @@ impl ControlPlaneServiceTowerLayerStack {
         self.prune_shards_layers.push(quickwit_common::tower::BoxLayer::new(layer));
         self
     }
+    pub fn stack_swap_indexing_pipelines_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    SwapIndexingPipelinesRequest,
+                    SwapIndexingPipelinesResponse,
+                    crate::control_plane::ControlPlaneError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                SwapIndexingPipelinesRequest,
+                Response = SwapIndexingPipelinesResponse,
+                Error = crate::control_plane::ControlPlaneError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<
+            SwapIndexingPipelinesRequest,
+        >>::Future: Send + 'static,
+    {
+        self.swap_indexing_pipelines_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_enable_maintenance_mode_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    EnableMaintenanceModeRequest,
+                    EnableMaintenanceModeResponse,
+                    crate::control_plane::ControlPlaneError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                EnableMaintenanceModeRequest,
+                Response = EnableMaintenanceModeResponse,
+                Error = crate::control_plane::ControlPlaneError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<
+            EnableMaintenanceModeRequest,
+        >>::Future: Send + 'static,
+    {
+        self.enable_maintenance_mode_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_disable_maintenance_mode_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    DisableMaintenanceModeRequest,
+                    DisableMaintenanceModeResponse,
+                    crate::control_plane::ControlPlaneError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                DisableMaintenanceModeRequest,
+                Response = DisableMaintenanceModeResponse,
+                Error = crate::control_plane::ControlPlaneError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<
+            DisableMaintenanceModeRequest,
+        >>::Future: Send + 'static,
+    {
+        self.disable_maintenance_mode_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_get_maintenance_mode_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    GetMaintenanceModeRequest,
+                    GetMaintenanceModeResponse,
+                    crate::control_plane::ControlPlaneError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                GetMaintenanceModeRequest,
+                Response = GetMaintenanceModeResponse,
+                Error = crate::control_plane::ControlPlaneError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<
+            GetMaintenanceModeRequest,
+        >>::Future: Send + 'static,
+    {
+        self.get_maintenance_mode_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
     pub fn build<T>(self, instance: T) -> ControlPlaneServiceClient
     where
         T: ControlPlaneService,
@@ -1496,6 +2006,38 @@ impl ControlPlaneServiceTowerLayerStack {
                 quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
+        let swap_indexing_pipelines_svc = self
+            .swap_indexing_pipelines_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
+        let enable_maintenance_mode_svc = self
+            .enable_maintenance_mode_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
+        let disable_maintenance_mode_svc = self
+            .disable_maintenance_mode_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
+        let get_maintenance_mode_svc = self
+            .get_maintenance_mode_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
         let tower_svc_stack = ControlPlaneServiceTowerServiceStack {
             inner: inner_client,
             create_index_svc,
@@ -1508,6 +2050,10 @@ impl ControlPlaneServiceTowerLayerStack {
             get_or_create_open_shards_svc,
             advise_reset_shards_svc,
             prune_shards_svc,
+            swap_indexing_pipelines_svc,
+            enable_maintenance_mode_svc,
+            disable_maintenance_mode_svc,
+            get_maintenance_mode_svc,
         };
         ControlPlaneServiceClient::new(tower_svc_stack)
     }
@@ -1673,6 +2219,42 @@ where
                 super::metastore::EmptyResponse,
                 crate::control_plane::ControlPlaneError,
             >,
+        >
+        + tower::Service<
+            SwapIndexingPipelinesRequest,
+            Response = SwapIndexingPipelinesResponse,
+            Error = crate::control_plane::ControlPlaneError,
+            Future = BoxFuture<
+                SwapIndexingPipelinesResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >
+        + tower::Service<
+            EnableMaintenanceModeRequest,
+            Response = EnableMaintenanceModeResponse,
+            Error = crate::control_plane::ControlPlaneError,
+            Future = BoxFuture<
+                EnableMaintenanceModeResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >
+        + tower::Service<
+            DisableMaintenanceModeRequest,
+            Response = DisableMaintenanceModeResponse,
+            Error = crate::control_plane::ControlPlaneError,
+            Future = BoxFuture<
+                DisableMaintenanceModeResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
+        >
+        + tower::Service<
+            GetMaintenanceModeRequest,
+            Response = GetMaintenanceModeResponse,
+            Error = crate::control_plane::ControlPlaneError,
+            Future = BoxFuture<
+                GetMaintenanceModeResponse,
+                crate::control_plane::ControlPlaneError,
+            >,
         >,
 {
     async fn create_index(
@@ -1737,6 +2319,30 @@ where
         &self,
         request: super::metastore::PruneShardsRequest,
     ) -> crate::control_plane::ControlPlaneResult<super::metastore::EmptyResponse> {
+        self.clone().call(request).await
+    }
+    async fn swap_indexing_pipelines(
+        &self,
+        request: SwapIndexingPipelinesRequest,
+    ) -> crate::control_plane::ControlPlaneResult<SwapIndexingPipelinesResponse> {
+        self.clone().call(request).await
+    }
+    async fn enable_maintenance_mode(
+        &self,
+        request: EnableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<EnableMaintenanceModeResponse> {
+        self.clone().call(request).await
+    }
+    async fn disable_maintenance_mode(
+        &self,
+        request: DisableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<DisableMaintenanceModeResponse> {
+        self.clone().call(request).await
+    }
+    async fn get_maintenance_mode(
+        &self,
+        request: GetMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<GetMaintenanceModeResponse> {
         self.clone().call(request).await
     }
 }
@@ -1918,6 +2524,62 @@ where
                 super::metastore::PruneShardsRequest::rpc_name(),
             ))
     }
+    async fn swap_indexing_pipelines(
+        &self,
+        request: SwapIndexingPipelinesRequest,
+    ) -> crate::control_plane::ControlPlaneResult<SwapIndexingPipelinesResponse> {
+        self.inner
+            .clone()
+            .swap_indexing_pipelines(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                SwapIndexingPipelinesRequest::rpc_name(),
+            ))
+    }
+    async fn enable_maintenance_mode(
+        &self,
+        request: EnableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<EnableMaintenanceModeResponse> {
+        self.inner
+            .clone()
+            .enable_maintenance_mode(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                EnableMaintenanceModeRequest::rpc_name(),
+            ))
+    }
+    async fn disable_maintenance_mode(
+        &self,
+        request: DisableMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<DisableMaintenanceModeResponse> {
+        self.inner
+            .clone()
+            .disable_maintenance_mode(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                DisableMaintenanceModeRequest::rpc_name(),
+            ))
+    }
+    async fn get_maintenance_mode(
+        &self,
+        request: GetMaintenanceModeRequest,
+    ) -> crate::control_plane::ControlPlaneResult<GetMaintenanceModeResponse> {
+        self.inner
+            .clone()
+            .get_maintenance_mode(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                GetMaintenanceModeRequest::rpc_name(),
+            ))
+    }
 }
 #[derive(Debug)]
 pub struct ControlPlaneServiceGrpcServerAdapter {
@@ -2045,6 +2707,50 @@ for ControlPlaneServiceGrpcServerAdapter {
         self.inner
             .0
             .prune_shards(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
+    async fn swap_indexing_pipelines(
+        &self,
+        request: tonic::Request<SwapIndexingPipelinesRequest>,
+    ) -> Result<tonic::Response<SwapIndexingPipelinesResponse>, tonic::Status> {
+        self.inner
+            .0
+            .swap_indexing_pipelines(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
+    async fn enable_maintenance_mode(
+        &self,
+        request: tonic::Request<EnableMaintenanceModeRequest>,
+    ) -> Result<tonic::Response<EnableMaintenanceModeResponse>, tonic::Status> {
+        self.inner
+            .0
+            .enable_maintenance_mode(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
+    async fn disable_maintenance_mode(
+        &self,
+        request: tonic::Request<DisableMaintenanceModeRequest>,
+    ) -> Result<tonic::Response<DisableMaintenanceModeResponse>, tonic::Status> {
+        self.inner
+            .0
+            .disable_maintenance_mode(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
+    async fn get_maintenance_mode(
+        &self,
+        request: tonic::Request<GetMaintenanceModeRequest>,
+    ) -> Result<tonic::Response<GetMaintenanceModeResponse>, tonic::Status> {
+        self.inner
+            .0
+            .get_maintenance_mode(request.into_inner())
             .await
             .map(tonic::Response::new)
             .map_err(crate::error::grpc_error_to_grpc_status)
@@ -2450,6 +3156,127 @@ pub mod control_plane_service_grpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Swaps indexing pipelines of different indexes between different indexers.
+        pub async fn swap_indexing_pipelines(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SwapIndexingPipelinesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SwapIndexingPipelinesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.control_plane.ControlPlaneService/SwapIndexingPipelines",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.control_plane.ControlPlaneService",
+                        "SwapIndexingPipelines",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Enables maintenance mode on the cluster. When active, the indexing plan is frozen,
+        /// metadata mutations (index/source CRUD) are accepted but the plan is not rebuilt, and shard scaling/rebalancing is paused.
+        pub async fn enable_maintenance_mode(
+            &mut self,
+            request: impl tonic::IntoRequest<super::EnableMaintenanceModeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::EnableMaintenanceModeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.control_plane.ControlPlaneService/EnableMaintenanceMode",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.control_plane.ControlPlaneService",
+                        "EnableMaintenanceMode",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Disables maintenance mode. Triggers a full indexing plan rebuild to reconcile the cluster.
+        pub async fn disable_maintenance_mode(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DisableMaintenanceModeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DisableMaintenanceModeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.control_plane.ControlPlaneService/DisableMaintenanceMode",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.control_plane.ControlPlaneService",
+                        "DisableMaintenanceMode",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Returns the current maintenance mode status.
+        pub async fn get_maintenance_mode(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetMaintenanceModeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetMaintenanceModeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.control_plane.ControlPlaneService/GetMaintenanceMode",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.control_plane.ControlPlaneService",
+                        "GetMaintenanceMode",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -2544,6 +3371,39 @@ pub mod control_plane_service_grpc_server {
             request: tonic::Request<super::super::metastore::PruneShardsRequest>,
         ) -> std::result::Result<
             tonic::Response<super::super::metastore::EmptyResponse>,
+            tonic::Status,
+        >;
+        /// Swaps indexing pipelines of different indexes between different indexers.
+        async fn swap_indexing_pipelines(
+            &self,
+            request: tonic::Request<super::SwapIndexingPipelinesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SwapIndexingPipelinesResponse>,
+            tonic::Status,
+        >;
+        /// Enables maintenance mode on the cluster. When active, the indexing plan is frozen,
+        /// metadata mutations (index/source CRUD) are accepted but the plan is not rebuilt, and shard scaling/rebalancing is paused.
+        async fn enable_maintenance_mode(
+            &self,
+            request: tonic::Request<super::EnableMaintenanceModeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::EnableMaintenanceModeResponse>,
+            tonic::Status,
+        >;
+        /// Disables maintenance mode. Triggers a full indexing plan rebuild to reconcile the cluster.
+        async fn disable_maintenance_mode(
+            &self,
+            request: tonic::Request<super::DisableMaintenanceModeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DisableMaintenanceModeResponse>,
+            tonic::Status,
+        >;
+        /// Returns the current maintenance mode status.
+        async fn get_maintenance_mode(
+            &self,
+            request: tonic::Request<super::GetMaintenanceModeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetMaintenanceModeResponse>,
             tonic::Status,
         >;
     }
@@ -3122,6 +3982,208 @@ pub mod control_plane_service_grpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = PruneShardsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.control_plane.ControlPlaneService/SwapIndexingPipelines" => {
+                    #[allow(non_camel_case_types)]
+                    struct SwapIndexingPipelinesSvc<T: ControlPlaneServiceGrpc>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: ControlPlaneServiceGrpc,
+                    > tonic::server::UnaryService<super::SwapIndexingPipelinesRequest>
+                    for SwapIndexingPipelinesSvc<T> {
+                        type Response = super::SwapIndexingPipelinesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SwapIndexingPipelinesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ControlPlaneServiceGrpc>::swap_indexing_pipelines(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SwapIndexingPipelinesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.control_plane.ControlPlaneService/EnableMaintenanceMode" => {
+                    #[allow(non_camel_case_types)]
+                    struct EnableMaintenanceModeSvc<T: ControlPlaneServiceGrpc>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: ControlPlaneServiceGrpc,
+                    > tonic::server::UnaryService<super::EnableMaintenanceModeRequest>
+                    for EnableMaintenanceModeSvc<T> {
+                        type Response = super::EnableMaintenanceModeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::EnableMaintenanceModeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ControlPlaneServiceGrpc>::enable_maintenance_mode(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = EnableMaintenanceModeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.control_plane.ControlPlaneService/DisableMaintenanceMode" => {
+                    #[allow(non_camel_case_types)]
+                    struct DisableMaintenanceModeSvc<T: ControlPlaneServiceGrpc>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: ControlPlaneServiceGrpc,
+                    > tonic::server::UnaryService<super::DisableMaintenanceModeRequest>
+                    for DisableMaintenanceModeSvc<T> {
+                        type Response = super::DisableMaintenanceModeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DisableMaintenanceModeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ControlPlaneServiceGrpc>::disable_maintenance_mode(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DisableMaintenanceModeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.control_plane.ControlPlaneService/GetMaintenanceMode" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetMaintenanceModeSvc<T: ControlPlaneServiceGrpc>(pub Arc<T>);
+                    impl<
+                        T: ControlPlaneServiceGrpc,
+                    > tonic::server::UnaryService<super::GetMaintenanceModeRequest>
+                    for GetMaintenanceModeSvc<T> {
+                        type Response = super::GetMaintenanceModeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetMaintenanceModeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ControlPlaneServiceGrpc>::get_maintenance_mode(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetMaintenanceModeSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

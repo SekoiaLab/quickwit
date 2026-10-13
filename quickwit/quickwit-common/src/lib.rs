@@ -27,6 +27,7 @@ pub mod jemalloc_profiled;
 mod kill_switch;
 pub mod metrics;
 pub mod net;
+pub mod numeric_types;
 mod path_hasher;
 pub mod pretty;
 mod progress;
@@ -38,6 +39,7 @@ pub mod rendezvous_hasher;
 pub mod retry;
 pub mod runtimes;
 pub mod shared_consts;
+pub mod slow_poll;
 pub mod sorted_iter;
 pub mod stream_utils;
 pub mod temp_dir;
@@ -89,7 +91,10 @@ pub fn into_u64_range(range: Range<usize>) -> Range<u64> {
 }
 
 pub fn setup_logging_for_tests() {
-    let _ = env_logger::builder().format_timestamp(None).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
 }
 
 pub fn split_file(split_id: impl Display) -> String {
