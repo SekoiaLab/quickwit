@@ -2192,7 +2192,7 @@ mod tests {
             SplitMetadata, StageSplitsRequestExt,
         };
 
-        let metastore = PostgresqlMetastore::default_for_test().await;
+        let mut metastore = PostgresqlMetastore::default_for_test().await;
         let index_id = append_random_suffix("test-backfilled-secondary");
         let index_config = IndexConfig::for_test(&index_id, &format!("ram:///indexes/{index_id}"));
         let create_index_request =
@@ -2249,6 +2249,7 @@ mod tests {
             secondary_time_ranges,
             [("backfilled", Some(10..=900)), ("legacy", None)]
         );
+        crate::tests::cleanup_index(&mut metastore, index_uid).await;
     }
 
     #[test]
