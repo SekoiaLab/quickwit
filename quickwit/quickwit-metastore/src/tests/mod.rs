@@ -120,7 +120,7 @@ fn to_btree_set(tags: &[&str]) -> BTreeSet<String> {
     tags.iter().map(|tag| tag.to_string()).collect()
 }
 
-async fn cleanup_index(metastore: &mut dyn MetastoreServiceExt, index_uid: IndexUid) {
+pub(crate) async fn cleanup_index(metastore: &mut dyn MetastoreServiceExt, index_uid: IndexUid) {
     // List all splits.
     let all_splits = metastore
         .list_splits(ListSplitsRequest::try_from_index_uid(index_uid.clone()).unwrap())

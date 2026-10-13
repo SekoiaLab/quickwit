@@ -2181,6 +2181,77 @@ mod tests {
         assert_eq!(metastore.endpoints()[0].protocol(), Protocol::PostgreSQL);
     }
 
+    #[tokio::test]
+    #[serial_test::file_serial]
+    async fn test_list_splits_with_backfilled_secondary_time_range() {
+        use quickwit_common::rand::append_random_suffix;
+        use quickwit_config::IndexConfig;
+
+        use crate::{
+            CreateIndexRequestExt, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt,
+            SplitMetadata, StageSplitsRequestExt,
+        };
+
+        let mut metastore = PostgresqlMetastore::default_for_test().await;
+        let index_id = append_random_suffix("test-backfilled-secondary");
+        let index_config = IndexConfig::for_test(&index_id, &format!("ram:///indexes/{index_id}"));
+        let create_index_request =
+            CreateIndexRequest::try_from_index_config(&index_config).unwrap();
+        let index_uid: IndexUid = metastore
+            .create_index(create_index_request)
+            .await
+            .unwrap()
+            .index_uid
+            .unwrap();
+        // Both splits are staged without a secondary time range, as before the secondary
+        // timestamp existed.
+        let splits_metadata: Vec<SplitMetadata> = [("backfilled", 0..=5000), ("legacy", 0..=500)]
+            .into_iter()
+            .map(|(split_id, time_range)| SplitMetadata {
+                split_id: split_id.to_string(),
+                index_uid: index_uid.clone(),
+                time_range: Some(time_range),
+                ..Default::default()
+            })
+            .collect();
+        let stage_splits_request =
+            StageSplitsRequest::try_from_splits_metadata(index_uid.clone(), splits_metadata)
+                .unwrap();
+        metastore.stage_splits(stage_splits_request).await.unwrap();
+
+        // Backfill the secondary time range columns only, leaving the JSON untouched.
+        sqlx::query(
+            "UPDATE splits SET secondary_time_range_start = 10, secondary_time_range_end = 900 \
+             WHERE index_uid = $1 AND split_id = 'backfilled'",
+        )
+        .bind(index_uid.to_string())
+        .execute(&metastore.connection_pool)
+        .await
+        .unwrap();
+
+        // The backfilled split matches through its secondary time range and the legacy split
+        // through its primary time range, and the returned metadata tells them apart.
+        let query =
+            ListSplitsQuery::for_index(index_uid.clone()).with_max_secondary_time_range_end(1000);
+        let mut splits = metastore
+            .list_splits(ListSplitsRequest::try_from_list_splits_query(&query).unwrap())
+            .await
+            .unwrap()
+            .collect_splits_metadata()
+            .await
+            .unwrap();
+        splits.sort_by(|left, right| left.split_id.cmp(&right.split_id));
+        let secondary_time_ranges: Vec<(&str, Option<std::ops::RangeInclusive<i64>>)> = splits
+            .iter()
+            .map(|split| (split.split_id(), split.secondary_time_range.clone()))
+            .collect();
+        assert_eq!(
+            secondary_time_ranges,
+            [("backfilled", Some(10..=900)), ("legacy", None)]
+        );
+        crate::tests::cleanup_index(&mut metastore, index_uid).await;
+    }
+
     #[test]
     fn test_single_sql_query_builder() {
         let mut select_statement = Query::select();
