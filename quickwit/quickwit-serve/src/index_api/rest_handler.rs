@@ -31,9 +31,10 @@ use super::index_resource::{
     list_indexes_metadata_handler, update_index_handler,
 };
 use super::source_resource::{
-    __path_create_source, __path_delete_source, __path_reset_source_checkpoint,
-    __path_toggle_source, __path_update_source, ToggleSource, create_source_handler,
-    delete_source_handler, get_source_handler, get_source_shards_handler,
+    __path_create_source, __path_delete_source, __path_get_source_checkpoint,
+    __path_reset_source_checkpoint, __path_toggle_source, __path_update_source,
+    SourceCheckpointResponse, ToggleSource, create_source_handler, delete_source_handler,
+    get_source_checkpoint_handler, get_source_handler, get_source_shards_handler,
     reset_source_checkpoint_handler, toggle_source_handler, update_source_handler,
 };
 use super::split_resource::{
@@ -59,10 +60,11 @@ use crate::simple_list::from_simple_list;
         create_source,
         update_source,
         reset_source_checkpoint,
+        get_source_checkpoint,
         toggle_source,
         delete_source,
     ),
-    components(schemas(ToggleSource, SplitsForDeletion, IndexStats))
+    components(schemas(ToggleSource, SplitsForDeletion, IndexStats, SourceCheckpointResponse))
 )]
 pub struct IndexApi;
 
@@ -104,6 +106,7 @@ pub fn index_management_handlers(
         .boxed()
         // Sources handlers.
         .or(reset_source_checkpoint_handler(index_service.metastore()))
+        .or(get_source_checkpoint_handler(index_service.metastore()))
         .or(toggle_source_handler(index_service.metastore()))
         .or(create_source_handler(index_service.clone()))
         .or(update_source_handler(index_service.clone()))
@@ -214,9 +217,13 @@ mod tests {
     use quickwit_common::ServiceStream;
     use quickwit_common::uri::Uri;
     use quickwit_config::{
-        CLI_SOURCE_ID, INGEST_API_SOURCE_ID, NodeConfig, SourceParams, VecSourceParams,
+        CLI_SOURCE_ID, INGEST_API_SOURCE_ID, NodeConfig, SourceConfig, SourceParams,
+        VecSourceParams,
     };
     use quickwit_indexing::{MockSplitBuilder, mock_split};
+    use quickwit_metastore::checkpoint::{
+        IndexCheckpointDelta, PartitionId, SourceCheckpointDelta,
+    };
     use quickwit_metastore::{
         IndexMetadata, IndexMetadataResponseExt, ListIndexesMetadataResponseExt,
         ListSplitsRequestExt, ListSplitsResponseExt, SplitState, metastore_for_test,
@@ -228,7 +235,7 @@ mod tests {
         MetastoreService, MetastoreServiceClient, MockMetastoreService,
         ResetSourceCheckpointRequest, SourceType, ToggleSourceRequest,
     };
-    use quickwit_proto::types::IndexUid;
+    use quickwit_proto::types::{IndexUid, Position};
     use quickwit_storage::StorageResolver;
     use serde_json::Value as JsonValue;
 
@@ -1330,6 +1337,92 @@ mod tests {
             .reply(&index_management_handler)
             .await;
         assert_eq!(resp.status(), 500);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_source_checkpoint() -> anyhow::Result<()> {
+        let mut index_metadata = IndexMetadata::for_test(
+            "quickwit-demo-index",
+            "file:///path/to/index/quickwit-demo-index",
+        );
+        for source_id in ["source-with-checkpoint", "source-without-checkpoint"] {
+            index_metadata
+                .add_source(SourceConfig::for_test(source_id, SourceParams::void()))
+                .unwrap();
+        }
+        let source_delta = SourceCheckpointDelta::from_partition_delta(
+            PartitionId::from(0u64),
+            Position::Beginning,
+            Position::offset(42u64),
+        )
+        .unwrap();
+        index_metadata
+            .checkpoint
+            .try_apply_delta(IndexCheckpointDelta {
+                source_id: "source-with-checkpoint".to_string(),
+                source_delta,
+            })
+            .unwrap();
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_index_metadata()
+            .returning(move |index_metadata_request: IndexMetadataRequest| {
+                if index_metadata_request.index_id.as_deref() != Some("quickwit-demo-index") {
+                    return Err(MetastoreError::NotFound(EntityKind::Index {
+                        index_id: "unknown-index".to_string(),
+                    }));
+                }
+                Ok(IndexMetadataResponse::try_from_index_metadata(&index_metadata).unwrap())
+            })
+            .times(4);
+        let index_service = IndexService::new(
+            MetastoreServiceClient::from_mock(mock_metastore),
+            StorageResolver::unconfigured(),
+        );
+        let index_management_handler =
+            super::index_management_handlers(index_service, Arc::new(NodeConfig::for_test()))
+                .recover(recover_fn);
+
+        let resp = warp::test::request()
+            .path("/indexes/quickwit-demo-index/sources/source-with-checkpoint/checkpoint")
+            .reply(&index_management_handler)
+            .await;
+        assert_eq!(resp.status(), 200);
+        let actual_response_json: JsonValue = serde_json::from_slice(resp.body())?;
+        let expected_response_json = serde_json::json!({
+            "index_id": "quickwit-demo-index",
+            "source_id": "source-with-checkpoint",
+            "checkpoint": {
+                "00000000000000000000": "00000000000000000042"
+            }
+        });
+        assert_eq!(actual_response_json, expected_response_json);
+
+        let resp = warp::test::request()
+            .path("/indexes/quickwit-demo-index/sources/source-without-checkpoint/checkpoint")
+            .reply(&index_management_handler)
+            .await;
+        assert_eq!(resp.status(), 200);
+        let actual_response_json: JsonValue = serde_json::from_slice(resp.body())?;
+        let expected_response_json = serde_json::json!({
+            "index_id": "quickwit-demo-index",
+            "source_id": "source-without-checkpoint",
+            "checkpoint": {}
+        });
+        assert_eq!(actual_response_json, expected_response_json);
+
+        let resp = warp::test::request()
+            .path("/indexes/quickwit-demo-index/sources/unknown-source/checkpoint")
+            .reply(&index_management_handler)
+            .await;
+        assert_eq!(resp.status(), 404);
+
+        let resp = warp::test::request()
+            .path("/indexes/unknown-index/sources/source-with-checkpoint/checkpoint")
+            .reply(&index_management_handler)
+            .await;
+        assert_eq!(resp.status(), 404);
         Ok(())
     }
 
