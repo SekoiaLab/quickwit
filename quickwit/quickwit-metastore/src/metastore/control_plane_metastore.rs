@@ -24,9 +24,10 @@ use quickwit_proto::metastore::{
     DeleteShardsResponse, DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse,
     FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse, GetClusterIdentityRequest,
     GetClusterIdentityResponse, GetIndexTemplateRequest, GetIndexTemplateResponse, GetKvRequest,
-    GetKvResponse, IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataRequest,
-    IndexesMetadataResponse, LastDeleteOpstampRequest, LastDeleteOpstampResponse,
-    ListDeleteTasksRequest, ListDeleteTasksResponse, ListIndexStatsRequest, ListIndexStatsResponse,
+    GetKvResponse, GetSourceCheckpointRequest, GetSourceCheckpointResponse, IndexMetadataRequest,
+    IndexMetadataResponse, IndexesMetadataRequest, IndexesMetadataResponse,
+    LastDeleteOpstampRequest, LastDeleteOpstampResponse, ListDeleteTasksRequest,
+    ListDeleteTasksResponse, ListIndexStatsRequest, ListIndexStatsResponse,
     ListIndexTemplatesRequest, ListIndexTemplatesResponse, ListIndexesMetadataRequest,
     ListIndexesMetadataResponse, ListShardsRequest, ListShardsResponse, ListSplitsRequest,
     ListSplitsResponse, ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreResult,
@@ -201,6 +202,13 @@ impl MetastoreService for ControlPlaneMetastore {
         request: ResetSourceCheckpointRequest,
     ) -> MetastoreResult<EmptyResponse> {
         self.metastore.reset_source_checkpoint(request).await
+    }
+
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> MetastoreResult<GetSourceCheckpointResponse> {
+        self.metastore.get_source_checkpoint(request).await
     }
 
     // Delete tasks API

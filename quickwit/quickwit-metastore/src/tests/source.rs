@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use quickwit_common::rand::append_random_suffix;
@@ -19,14 +20,17 @@ use quickwit_config::{
     IndexConfig, SourceConfig, SourceInputFormat, SourceParams, TransformConfig,
 };
 use quickwit_proto::metastore::{
-    AddSourceRequest, CreateIndexRequest, DeleteSourceRequest, EntityKind, IndexMetadataRequest,
-    MetastoreError, PublishSplitsRequest, ResetSourceCheckpointRequest, SourceType,
-    StageSplitsRequest, ToggleSourceRequest, UpdateSourceRequest,
+    AddSourceRequest, CreateIndexRequest, DeleteSourceRequest, EntityKind,
+    GetSourceCheckpointRequest, IndexMetadataRequest, MetastoreError, PublishSplitsRequest,
+    ResetSourceCheckpointRequest, SourceType, StageSplitsRequest, ToggleSourceRequest,
+    UpdateSourceRequest,
 };
-use quickwit_proto::types::IndexUid;
+use quickwit_proto::types::{IndexUid, Position};
 
 use super::DefaultForTest;
-use crate::checkpoint::SourceCheckpoint;
+use crate::checkpoint::{
+    IndexCheckpointDelta, PartitionId, SourceCheckpoint, SourceCheckpointDelta,
+};
 use crate::metastore::UpdateSourceRequestExt;
 use crate::tests::cleanup_index;
 use crate::{
@@ -556,6 +560,145 @@ pub async fn test_metastore_reset_checkpoint<
             .checkpoint
             .is_empty()
     );
+
+    cleanup_index(&mut metastore, index_uid).await;
+}
+
+pub async fn test_metastore_get_source_checkpoint<
+    MetastoreToTest: MetastoreServiceExt + DefaultForTest,
+>() {
+    let mut metastore = MetastoreToTest::default_for_test().await;
+
+    let index_id = append_random_suffix("test-get-source-checkpoint");
+    let index_uri = format!("ram:///indexes/{index_id}");
+    let index_config = IndexConfig::for_test(&index_id, &index_uri);
+
+    let create_index_request = CreateIndexRequest::try_from_index_config(&index_config).unwrap();
+    let index_uid: IndexUid = metastore
+        .create_index(create_index_request)
+        .await
+        .unwrap()
+        .index_uid()
+        .clone();
+
+    let source_ids: Vec<String> = (0..2).map(|i| format!("{index_id}--source-{i}")).collect();
+
+    for source_id in &source_ids {
+        let source = SourceConfig {
+            source_id: source_id.clone(),
+            num_pipelines: NonZeroUsize::MIN,
+            enabled: true,
+            source_params: SourceParams::void(),
+            transform_config: None,
+            input_format: SourceInputFormat::Json,
+        };
+        metastore
+            .add_source(
+                AddSourceRequest::try_from_source_config(index_uid.clone(), &source).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let split_id = format!("{index_id}--split");
+    let split_metadata = SplitMetadata {
+        split_id: split_id.clone(),
+        index_uid: index_uid.clone(),
+        ..Default::default()
+    };
+    let stage_splits_request =
+        StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata).unwrap();
+    metastore.stage_splits(stage_splits_request).await.unwrap();
+
+    let index_checkpoint_delta = IndexCheckpointDelta {
+        source_id: source_ids[0].clone(),
+        source_delta: SourceCheckpointDelta::from_partition_delta(
+            PartitionId::from(0u64),
+            Position::Beginning,
+            Position::offset(42u64),
+        )
+        .unwrap(),
+    };
+    let publish_splits_request = PublishSplitsRequest {
+        index_uid: Some(index_uid.clone()),
+        staged_split_ids: vec![split_id],
+        index_checkpoint_delta_json_opt: Some(
+            serde_json::to_string(&index_checkpoint_delta).unwrap(),
+        ),
+        ..Default::default()
+    };
+    metastore
+        .publish_splits(publish_splits_request)
+        .await
+        .unwrap();
+
+    let expected_checkpoint = HashMap::from([(
+        "00000000000000000000".to_string(),
+        "00000000000000000042".to_string(),
+    )]);
+
+    let checkpoint = metastore
+        .get_source_checkpoint(GetSourceCheckpointRequest::for_index_id(
+            index_id.clone(),
+            source_ids[0].clone(),
+        ))
+        .await
+        .unwrap()
+        .checkpoint;
+    assert_eq!(checkpoint, expected_checkpoint);
+
+    let checkpoint = metastore
+        .get_source_checkpoint(GetSourceCheckpointRequest::for_index_uid(
+            index_uid.clone(),
+            source_ids[0].clone(),
+        ))
+        .await
+        .unwrap()
+        .checkpoint;
+    assert_eq!(checkpoint, expected_checkpoint);
+
+    let checkpoint = metastore
+        .get_source_checkpoint(GetSourceCheckpointRequest::for_index_id(
+            index_id.clone(),
+            source_ids[1].clone(),
+        ))
+        .await
+        .unwrap()
+        .checkpoint;
+    assert!(checkpoint.is_empty());
+
+    assert!(matches!(
+        metastore
+            .get_source_checkpoint(GetSourceCheckpointRequest::for_index_id(
+                index_id.clone(),
+                "source-not-found".to_string(),
+            ))
+            .await
+            .unwrap_err(),
+        MetastoreError::NotFound(EntityKind::Source { .. })
+    ));
+
+    assert!(matches!(
+        metastore
+            .get_source_checkpoint(GetSourceCheckpointRequest::for_index_id(
+                "index-not-found".to_string(),
+                source_ids[0].clone(),
+            ))
+            .await
+            .unwrap_err(),
+        MetastoreError::NotFound(EntityKind::Index { .. })
+    ));
+
+    assert!(matches!(
+        metastore
+            .get_source_checkpoint(GetSourceCheckpointRequest::for_index_uid(
+                IndexUid::new_with_random_ulid(&index_id),
+                source_ids[0].clone(),
+            ))
+            .await
+            .unwrap_err(),
+        MetastoreError::NotFound(EntityKind::Index { .. })
+    ));
 
     cleanup_index(&mut metastore, index_uid).await;
 }

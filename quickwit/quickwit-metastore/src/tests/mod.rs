@@ -432,6 +432,13 @@ macro_rules! metastore_test_suite {
 
             #[tokio::test]
             #[serial_test::file_serial]
+            async fn test_metastore_get_source_checkpoint() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::source::test_metastore_get_source_checkpoint::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
             async fn test_metastore_create_delete_task() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::delete_task::test_metastore_create_delete_task::<$metastore_type>().await;

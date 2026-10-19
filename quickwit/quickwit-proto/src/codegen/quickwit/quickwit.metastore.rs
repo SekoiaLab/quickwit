@@ -272,6 +272,30 @@ pub struct ResetSourceCheckpointRequest {
     #[prost(string, tag = "2")]
     pub source_id: ::prost::alloc::string::String,
 }
+/// Request the checkpoint of a source.
+/// Either `index_uid` or `index_id` must be specified.
+///
+/// If both are supplied, `index_uid` is used.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetSourceCheckpointRequest {
+    #[prost(string, optional, tag = "1")]
+    pub index_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub index_uid: ::core::option::Option<crate::types::IndexUid>,
+    #[prost(string, tag = "3")]
+    pub source_id: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetSourceCheckpointResponse {
+    /// Map of partition ID to the last processed position.
+    #[prost(map = "string, string", tag = "1")]
+    pub checkpoint: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteTask {
@@ -772,6 +796,11 @@ impl RpcName for ResetSourceCheckpointRequest {
         "reset_source_checkpoint"
     }
 }
+impl RpcName for GetSourceCheckpointRequest {
+    fn rpc_name() -> &'static str {
+        "get_source_checkpoint"
+    }
+}
 impl RpcName for LastDeleteOpstampRequest {
     fn rpc_name() -> &'static str {
         "last_delete_opstamp"
@@ -966,6 +995,11 @@ pub trait MetastoreService: std::fmt::Debug + Send + Sync + 'static {
         &self,
         request: ResetSourceCheckpointRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse>;
+    ///Gets source checkpoint.
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse>;
     ///Gets last opstamp for a given `index_id`.
     async fn last_delete_opstamp(
         &self,
@@ -1292,6 +1326,12 @@ impl MetastoreService for MetastoreServiceClient {
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.inner.0.reset_source_checkpoint(request).await
     }
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse> {
+        self.inner.0.get_source_checkpoint(request).await
+    }
     async fn last_delete_opstamp(
         &self,
         request: LastDeleteOpstampRequest,
@@ -1531,6 +1571,12 @@ pub mod mock_metastore_service {
             request: super::ResetSourceCheckpointRequest,
         ) -> crate::metastore::MetastoreResult<super::EmptyResponse> {
             self.inner.lock().await.reset_source_checkpoint(request).await
+        }
+        async fn get_source_checkpoint(
+            &self,
+            request: super::GetSourceCheckpointRequest,
+        ) -> crate::metastore::MetastoreResult<super::GetSourceCheckpointResponse> {
+            self.inner.lock().await.get_source_checkpoint(request).await
         }
         async fn last_delete_opstamp(
             &self,
@@ -1947,6 +1993,22 @@ impl tower::Service<ResetSourceCheckpointRequest> for InnerMetastoreServiceClien
         Box::pin(fut)
     }
 }
+impl tower::Service<GetSourceCheckpointRequest> for InnerMetastoreServiceClient {
+    type Response = GetSourceCheckpointResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: GetSourceCheckpointRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.get_source_checkpoint(request).await };
+        Box::pin(fut)
+    }
+}
 impl tower::Service<LastDeleteOpstampRequest> for InnerMetastoreServiceClient {
     type Response = LastDeleteOpstampResponse;
     type Error = crate::metastore::MetastoreError;
@@ -2346,6 +2408,11 @@ struct MetastoreServiceTowerServiceStack {
         EmptyResponse,
         crate::metastore::MetastoreError,
     >,
+    get_source_checkpoint_svc: quickwit_common::tower::BoxService<
+        GetSourceCheckpointRequest,
+        GetSourceCheckpointResponse,
+        crate::metastore::MetastoreError,
+    >,
     last_delete_opstamp_svc: quickwit_common::tower::BoxService<
         LastDeleteOpstampRequest,
         LastDeleteOpstampResponse,
@@ -2551,6 +2618,12 @@ impl MetastoreService for MetastoreServiceTowerServiceStack {
         request: ResetSourceCheckpointRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.reset_source_checkpoint_svc.clone().ready().await?.call(request).await
+    }
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse> {
+        self.get_source_checkpoint_svc.clone().ready().await?.call(request).await
     }
     async fn last_delete_opstamp(
         &self,
@@ -2853,6 +2926,16 @@ type ResetSourceCheckpointLayer = quickwit_common::tower::BoxLayer<
     EmptyResponse,
     crate::metastore::MetastoreError,
 >;
+type GetSourceCheckpointLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        GetSourceCheckpointRequest,
+        GetSourceCheckpointResponse,
+        crate::metastore::MetastoreError,
+    >,
+    GetSourceCheckpointRequest,
+    GetSourceCheckpointResponse,
+    crate::metastore::MetastoreError,
+>;
 type LastDeleteOpstampLayer = quickwit_common::tower::BoxLayer<
     quickwit_common::tower::BoxService<
         LastDeleteOpstampRequest,
@@ -3063,6 +3146,7 @@ pub struct MetastoreServiceTowerLayerStack {
     pub toggle_source_layers: Vec<ToggleSourceLayer>,
     pub delete_source_layers: Vec<DeleteSourceLayer>,
     pub reset_source_checkpoint_layers: Vec<ResetSourceCheckpointLayer>,
+    pub get_source_checkpoint_layers: Vec<GetSourceCheckpointLayer>,
     pub last_delete_opstamp_layers: Vec<LastDeleteOpstampLayer>,
     pub create_delete_task_layers: Vec<CreateDeleteTaskLayer>,
     pub update_splits_delete_opstamp_layers: Vec<UpdateSplitsDeleteOpstampLayer>,
@@ -3543,6 +3627,33 @@ impl MetastoreServiceTowerLayerStack {
             >,
         >>::Service as tower::Service<
             ResetSourceCheckpointRequest,
+        >>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    GetSourceCheckpointRequest,
+                    GetSourceCheckpointResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                GetSourceCheckpointRequest,
+                GetSourceCheckpointResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                GetSourceCheckpointRequest,
+                Response = GetSourceCheckpointResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                GetSourceCheckpointRequest,
+                GetSourceCheckpointResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<
+            GetSourceCheckpointRequest,
         >>::Future: Send + 'static,
         L: tower::Layer<
                 quickwit_common::tower::BoxService<
@@ -4068,6 +4179,8 @@ impl MetastoreServiceTowerLayerStack {
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.reset_source_checkpoint_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.get_source_checkpoint_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.last_delete_opstamp_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.create_delete_task_layers
@@ -4456,6 +4569,28 @@ impl MetastoreServiceTowerLayerStack {
         >>::Future: Send + 'static,
     {
         self.reset_source_checkpoint_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_get_source_checkpoint_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    GetSourceCheckpointRequest,
+                    GetSourceCheckpointResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                GetSourceCheckpointRequest,
+                Response = GetSourceCheckpointResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<
+            GetSourceCheckpointRequest,
+        >>::Future: Send + 'static,
+    {
+        self.get_source_checkpoint_layers
             .push(quickwit_common::tower::BoxLayer::new(layer));
         self
     }
@@ -5045,6 +5180,14 @@ impl MetastoreServiceTowerLayerStack {
                 quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
+        let get_source_checkpoint_svc = self
+            .get_source_checkpoint_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
         let last_delete_opstamp_svc = self
             .last_delete_opstamp_layers
             .into_iter()
@@ -5217,6 +5360,7 @@ impl MetastoreServiceTowerLayerStack {
             toggle_source_svc,
             delete_source_svc,
             reset_source_checkpoint_svc,
+            get_source_checkpoint_svc,
             last_delete_opstamp_svc,
             create_delete_task_svc,
             update_splits_delete_opstamp_svc,
@@ -5428,6 +5572,15 @@ where
             Response = EmptyResponse,
             Error = crate::metastore::MetastoreError,
             Future = BoxFuture<EmptyResponse, crate::metastore::MetastoreError>,
+        >
+        + tower::Service<
+            GetSourceCheckpointRequest,
+            Response = GetSourceCheckpointResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<
+                GetSourceCheckpointResponse,
+                crate::metastore::MetastoreError,
+            >,
         >
         + tower::Service<
             LastDeleteOpstampRequest,
@@ -5668,6 +5821,12 @@ where
         &self,
         request: ResetSourceCheckpointRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.clone().call(request).await
+    }
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse> {
         self.clone().call(request).await
     }
     async fn last_delete_opstamp(
@@ -6089,6 +6248,20 @@ where
             .map_err(|status| crate::error::grpc_status_to_service_error(
                 status,
                 ResetSourceCheckpointRequest::rpc_name(),
+            ))
+    }
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse> {
+        self.inner
+            .clone()
+            .get_source_checkpoint(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                GetSourceCheckpointRequest::rpc_name(),
             ))
     }
     async fn last_delete_opstamp(
@@ -6589,6 +6762,17 @@ for MetastoreServiceGrpcServerAdapter {
         self.inner
             .0
             .reset_source_checkpoint(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
+    async fn get_source_checkpoint(
+        &self,
+        request: tonic::Request<GetSourceCheckpointRequest>,
+    ) -> Result<tonic::Response<GetSourceCheckpointResponse>, tonic::Status> {
+        self.inner
+            .0
+            .get_source_checkpoint(request.into_inner())
             .await
             .map(tonic::Response::new)
             .map_err(crate::error::grpc_error_to_grpc_status)
@@ -7443,6 +7627,36 @@ pub mod metastore_service_grpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Gets source checkpoint.
+        pub async fn get_source_checkpoint(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetSourceCheckpointRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetSourceCheckpointResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/GetSourceCheckpoint",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.metastore.MetastoreService",
+                        "GetSourceCheckpoint",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Gets last opstamp for a given `index_id`.
         pub async fn last_delete_opstamp(
             &mut self,
@@ -8118,6 +8332,14 @@ pub mod metastore_service_grpc_server {
             &self,
             request: tonic::Request<super::ResetSourceCheckpointRequest>,
         ) -> std::result::Result<tonic::Response<super::EmptyResponse>, tonic::Status>;
+        /// Gets source checkpoint.
+        async fn get_source_checkpoint(
+            &self,
+            request: tonic::Request<super::GetSourceCheckpointRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetSourceCheckpointResponse>,
+            tonic::Status,
+        >;
         /// Gets last opstamp for a given `index_id`.
         async fn last_delete_opstamp(
             &self,
@@ -9226,6 +9448,55 @@ pub mod metastore_service_grpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ResetSourceCheckpointSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.metastore.MetastoreService/GetSourceCheckpoint" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetSourceCheckpointSvc<T: MetastoreServiceGrpc>(pub Arc<T>);
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::GetSourceCheckpointRequest>
+                    for GetSourceCheckpointSvc<T> {
+                        type Response = super::GetSourceCheckpointResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetSourceCheckpointRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::get_source_checkpoint(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetSourceCheckpointSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

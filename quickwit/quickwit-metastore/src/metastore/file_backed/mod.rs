@@ -46,19 +46,20 @@ use quickwit_proto::metastore::{
     DeleteShardsResponse, DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse,
     EntityKind, FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse,
     GetClusterIdentityRequest, GetClusterIdentityResponse, GetIndexTemplateRequest,
-    GetIndexTemplateResponse, GetKvRequest, GetKvResponse, IndexMetadataFailure,
-    IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse, IndexTemplateMatch,
-    IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
-    LastDeleteOpstampResponse, ListDeleteTasksRequest, ListDeleteTasksResponse,
-    ListIndexStatsRequest, ListIndexStatsResponse, ListIndexTemplatesRequest,
-    ListIndexTemplatesResponse, ListIndexesMetadataRequest, ListIndexesMetadataResponse,
-    ListShardsRequest, ListShardsResponse, ListSplitsRequest, ListSplitsResponse,
-    ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreError, MetastoreResult,
-    MetastoreService, MetastoreServiceStream, OpenShardSubrequest, OpenShardsRequest,
-    OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest, ResetSourceCheckpointRequest,
-    SetKvRequest, SoftDeleteDocumentsRequest, SoftDeleteDocumentsResponse, StageSplitsRequest,
-    ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest,
-    UpdateSplitsDeleteOpstampResponse, serde_utils,
+    GetIndexTemplateResponse, GetKvRequest, GetKvResponse, GetSourceCheckpointRequest,
+    GetSourceCheckpointResponse, IndexMetadataFailure, IndexMetadataFailureReason,
+    IndexMetadataRequest, IndexMetadataResponse, IndexTemplateMatch, IndexesMetadataRequest,
+    IndexesMetadataResponse, LastDeleteOpstampRequest, LastDeleteOpstampResponse,
+    ListDeleteTasksRequest, ListDeleteTasksResponse, ListIndexStatsRequest, ListIndexStatsResponse,
+    ListIndexTemplatesRequest, ListIndexTemplatesResponse, ListIndexesMetadataRequest,
+    ListIndexesMetadataResponse, ListShardsRequest, ListShardsResponse, ListSplitsRequest,
+    ListSplitsResponse, ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreError,
+    MetastoreResult, MetastoreService, MetastoreServiceStream, OpenShardSubrequest,
+    OpenShardsRequest, OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest,
+    ResetSourceCheckpointRequest, SetKvRequest, SoftDeleteDocumentsRequest,
+    SoftDeleteDocumentsResponse, StageSplitsRequest, ToggleSourceRequest, UpdateIndexRequest,
+    UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest, UpdateSplitsDeleteOpstampResponse,
+    serde_utils,
 };
 use quickwit_proto::types::{IndexId, IndexUid};
 use quickwit_storage::Storage;
@@ -812,6 +813,46 @@ impl MetastoreService for FileBackedMetastore {
 
     // -------------------------------------------------------------------------------
     // Read-only accessors
+
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> MetastoreResult<GetSourceCheckpointResponse> {
+        let source_id = request.source_id;
+        let view = |index: &FileBackedIndex| {
+            let index_metadata = index.metadata();
+            if !index_metadata.sources.contains_key(&source_id) {
+                return Err(MetastoreError::NotFound(EntityKind::Source {
+                    index_id: index_metadata.index_id().to_string(),
+                    source_id: source_id.clone(),
+                }));
+            }
+            let checkpoint = index_metadata
+                .checkpoint
+                .source_checkpoint(&source_id)
+                .map(|source_checkpoint| {
+                    source_checkpoint
+                        .iter()
+                        .map(|(partition_id, position)| {
+                            (partition_id.0.to_string(), position.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(GetSourceCheckpointResponse { checkpoint })
+        };
+        if let Some(index_uid) = &request.index_uid {
+            self.read(index_uid, view).await
+        } else if let Some(index_id) = &request.index_id {
+            self.read_any(index_id, None, view).await
+        } else {
+            let message = "invalid request: neither `index_id` nor `index_uid` is set".to_string();
+            Err(MetastoreError::Internal {
+                message,
+                cause: "".to_string(),
+            })
+        }
+    }
 
     /// Streams of splits for the given request.
     /// No error is returned if any of the requested `index_uid` does not exist.

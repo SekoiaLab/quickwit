@@ -19,14 +19,14 @@ use quickwit_config::{
 };
 use quickwit_index_management::{IndexService, IndexServiceError};
 use quickwit_metastore::IndexMetadataResponseExt;
-use quickwit_metastore::checkpoint::SourceCheckpoint;
+use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
 use quickwit_proto::ingest::Shard;
 use quickwit_proto::metastore::{
-    DeleteSourceRequest, EntityKind, IndexMetadataRequest, ListShardsRequest, ListShardsSubrequest,
-    MetastoreError, MetastoreResult, MetastoreService, MetastoreServiceClient,
-    ResetSourceCheckpointRequest, ToggleSourceRequest,
+    DeleteSourceRequest, EntityKind, GetSourceCheckpointRequest, IndexMetadataRequest,
+    ListShardsRequest, ListShardsSubrequest, MetastoreError, MetastoreResult, MetastoreService,
+    MetastoreServiceClient, ResetSourceCheckpointRequest, ToggleSourceRequest,
 };
-use quickwit_proto::types::{IndexId, IndexUid, SourceId};
+use quickwit_proto::types::{IndexId, IndexUid, Position, SourceId};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use warp::{Filter, Rejection};
@@ -328,22 +328,15 @@ pub async fn get_source_checkpoint(
     metastore: MetastoreServiceClient,
 ) -> MetastoreResult<SourceCheckpointResponse> {
     info!(index_id = %index_id, source_id = %source_id, "get-source-checkpoint");
-    let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
-    let index_metadata = metastore
-        .index_metadata(index_metadata_request)
+    let get_source_checkpoint_request =
+        GetSourceCheckpointRequest::for_index_id(index_id.clone(), source_id.clone());
+    let checkpoint: SourceCheckpoint = metastore
+        .get_source_checkpoint(get_source_checkpoint_request)
         .await?
-        .deserialize_index_metadata()?;
-    if !index_metadata.sources.contains_key(&source_id) {
-        return Err(MetastoreError::NotFound(EntityKind::Source {
-            index_id,
-            source_id,
-        }));
-    }
-    let checkpoint = index_metadata
         .checkpoint
-        .source_checkpoint(&source_id)
-        .cloned()
-        .unwrap_or_default();
+        .into_iter()
+        .map(|(partition_id, position)| (PartitionId::from(partition_id), Position::from(position)))
+        .collect();
     Ok(SourceCheckpointResponse {
         index_id,
         source_id,
