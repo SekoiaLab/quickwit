@@ -34,9 +34,10 @@ use quickwit_proto::metastore::{
     DeleteShardsResponse, DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse,
     EntityKind, FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse,
     GetClusterIdentityRequest, GetClusterIdentityResponse, GetIndexTemplateRequest,
-    GetIndexTemplateResponse, GetKvRequest, GetKvResponse, IndexMetadataFailure,
-    IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse, IndexStats,
-    IndexTemplateMatch, IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
+    GetIndexTemplateResponse, GetKvRequest, GetKvResponse, GetSourceCheckpointRequest,
+    GetSourceCheckpointResponse, IndexMetadataFailure, IndexMetadataFailureReason,
+    IndexMetadataRequest, IndexMetadataResponse, IndexStats, IndexTemplateMatch,
+    IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
     LastDeleteOpstampResponse, ListDeleteTasksRequest, ListDeleteTasksResponse,
     ListIndexStatsRequest, ListIndexStatsResponse, ListIndexTemplatesRequest,
     ListIndexTemplatesResponse, ListIndexesMetadataRequest, ListIndexesMetadataResponse,
@@ -1378,6 +1379,76 @@ impl MetastoreService for PostgresqlMetastore {
             Ok(())
         })?;
         Ok(EmptyResponse {})
+    }
+
+    #[instrument(skip(self))]
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> MetastoreResult<GetSourceCheckpointResponse> {
+        let (index_filter_column, index_id) = if let Some(index_uid) = &request.index_uid {
+            ("index_uid", index_uid.index_id.clone())
+        } else if let Some(index_id) = &request.index_id {
+            ("index_id", index_id.clone())
+        } else {
+            let message = "invalid request: neither `index_id` nor `index_uid` is set".to_string();
+            return Err(MetastoreError::Internal {
+                message,
+                cause: "".to_string(),
+            });
+        };
+        // Extracts the source checkpoint directly in Postgres to avoid loading and deserializing
+        // the whole index metadata. This relies on the serialized `IndexMetadata` layout:
+        // `sources` is an array of source configs and `checkpoint` maps source IDs to their
+        // checkpoint.
+        let query = format!(
+            r#"
+            SELECT
+                COALESCE(
+                    index_metadata -> 'sources' @> jsonb_build_array(
+                        jsonb_build_object('source_id', $2::text)
+                    ),
+                    FALSE
+                ),
+                (index_metadata -> 'checkpoint' -> $2::text)::text
+            FROM (
+                SELECT index_metadata_json::jsonb AS index_metadata
+                FROM indexes
+                WHERE {index_filter_column} = $1
+            ) AS index_metadata
+            "#
+        );
+        let query = sqlx::query_as::<_, (bool, Option<String>)>(&query);
+        let query = if let Some(index_uid) = &request.index_uid {
+            query.bind(index_uid)
+        } else {
+            query.bind(&index_id)
+        };
+        let (source_exists, checkpoint_json_opt) = query
+            .bind(&request.source_id)
+            .fetch_optional(&self.connection_pool)
+            .await?
+            .ok_or_else(|| {
+                MetastoreError::NotFound(EntityKind::Index {
+                    index_id: index_id.clone(),
+                })
+            })?;
+        if !source_exists {
+            return Err(MetastoreError::NotFound(EntityKind::Source {
+                index_id,
+                source_id: request.source_id,
+            }));
+        }
+        let checkpoint = match checkpoint_json_opt {
+            Some(checkpoint_json) => serde_json::from_str(&checkpoint_json).map_err(|error| {
+                MetastoreError::JsonDeserializeError {
+                    struct_name: "SourceCheckpoint".to_string(),
+                    message: error.to_string(),
+                }
+            })?,
+            None => HashMap::new(),
+        };
+        Ok(GetSourceCheckpointResponse { checkpoint })
     }
 
     /// Retrieves the last delete opstamp for a given `index_id`.

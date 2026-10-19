@@ -211,31 +211,29 @@ async fn parse_query_request(request: ParseQueryRequest) -> Result<QueryAst, Ind
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::ops::{Bound, RangeInclusive};
 
     use assert_json_diff::assert_json_include;
     use quickwit_common::ServiceStream;
     use quickwit_common::uri::Uri;
     use quickwit_config::{
-        CLI_SOURCE_ID, INGEST_API_SOURCE_ID, NodeConfig, SourceConfig, SourceParams,
-        VecSourceParams,
+        CLI_SOURCE_ID, INGEST_API_SOURCE_ID, NodeConfig, SourceParams, VecSourceParams,
     };
     use quickwit_indexing::{MockSplitBuilder, mock_split};
-    use quickwit_metastore::checkpoint::{
-        IndexCheckpointDelta, PartitionId, SourceCheckpointDelta,
-    };
     use quickwit_metastore::{
         IndexMetadata, IndexMetadataResponseExt, ListIndexesMetadataResponseExt,
         ListSplitsRequestExt, ListSplitsResponseExt, SplitState, metastore_for_test,
     };
     use quickwit_proto::metastore::{
-        DeleteSourceRequest, EmptyResponse, EntityKind, IndexMetadataRequest,
-        IndexMetadataResponse, ListIndexesMetadataRequest, ListIndexesMetadataResponse,
-        ListSplitsRequest, ListSplitsResponse, MarkSplitsForDeletionRequest, MetastoreError,
-        MetastoreService, MetastoreServiceClient, MockMetastoreService,
-        ResetSourceCheckpointRequest, SourceType, ToggleSourceRequest,
+        DeleteSourceRequest, EmptyResponse, EntityKind, GetSourceCheckpointRequest,
+        GetSourceCheckpointResponse, IndexMetadataRequest, IndexMetadataResponse,
+        ListIndexesMetadataRequest, ListIndexesMetadataResponse, ListSplitsRequest,
+        ListSplitsResponse, MarkSplitsForDeletionRequest, MetastoreError, MetastoreService,
+        MetastoreServiceClient, MockMetastoreService, ResetSourceCheckpointRequest, SourceType,
+        ToggleSourceRequest,
     };
-    use quickwit_proto::types::{IndexUid, Position};
+    use quickwit_proto::types::IndexUid;
     use quickwit_storage::StorageResolver;
     use serde_json::Value as JsonValue;
 
@@ -1342,38 +1340,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_source_checkpoint() -> anyhow::Result<()> {
-        let mut index_metadata = IndexMetadata::for_test(
-            "quickwit-demo-index",
-            "file:///path/to/index/quickwit-demo-index",
-        );
-        for source_id in ["source-with-checkpoint", "source-without-checkpoint"] {
-            index_metadata
-                .add_source(SourceConfig::for_test(source_id, SourceParams::void()))
-                .unwrap();
-        }
-        let source_delta = SourceCheckpointDelta::from_partition_delta(
-            PartitionId::from(0u64),
-            Position::Beginning,
-            Position::offset(42u64),
-        )
-        .unwrap();
-        index_metadata
-            .checkpoint
-            .try_apply_delta(IndexCheckpointDelta {
-                source_id: "source-with-checkpoint".to_string(),
-                source_delta,
-            })
-            .unwrap();
         let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
-            .expect_index_metadata()
-            .returning(move |index_metadata_request: IndexMetadataRequest| {
-                if index_metadata_request.index_id.as_deref() != Some("quickwit-demo-index") {
-                    return Err(MetastoreError::NotFound(EntityKind::Index {
-                        index_id: "unknown-index".to_string(),
-                    }));
+            .expect_get_source_checkpoint()
+            .returning(|request: GetSourceCheckpointRequest| {
+                let index_id = request.index_id.unwrap();
+                if index_id != "quickwit-demo-index" {
+                    return Err(MetastoreError::NotFound(EntityKind::Index { index_id }));
                 }
-                Ok(IndexMetadataResponse::try_from_index_metadata(&index_metadata).unwrap())
+                let checkpoint = match request.source_id.as_str() {
+                    "source-with-checkpoint" => HashMap::from([(
+                        "00000000000000000000".to_string(),
+                        "00000000000000000042".to_string(),
+                    )]),
+                    "source-without-checkpoint" => HashMap::new(),
+                    _ => {
+                        return Err(MetastoreError::NotFound(EntityKind::Source {
+                            index_id,
+                            source_id: request.source_id,
+                        }));
+                    }
+                };
+                Ok(GetSourceCheckpointResponse { checkpoint })
             })
             .times(4);
         let index_service = IndexService::new(

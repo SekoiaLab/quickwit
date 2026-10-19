@@ -143,6 +143,9 @@ service MetastoreService {
   // Resets source checkpoint.
   rpc ResetSourceCheckpoint(ResetSourceCheckpointRequest) returns (EmptyResponse);
 
+  // Gets source checkpoint.
+  rpc GetSourceCheckpoint(GetSourceCheckpointRequest) returns (GetSourceCheckpointResponse);
+
   // Gets last opstamp for a given `index_id`.
   rpc LastDeleteOpstamp(LastDeleteOpstampRequest) returns (LastDeleteOpstampResponse);
 
@@ -400,6 +403,21 @@ message DeleteSourceRequest {
 message ResetSourceCheckpointRequest {
   quickwit.common.IndexUid index_uid = 1;
   string source_id = 2;
+}
+
+// Request the checkpoint of a source.
+// Either `index_uid` or `index_id` must be specified.
+//
+// If both are supplied, `index_uid` is used.
+message GetSourceCheckpointRequest {
+  optional string index_id = 1;
+  optional quickwit.common.IndexUid index_uid = 2;
+  string source_id = 3;
+}
+
+message GetSourceCheckpointResponse {
+  // Map of partition ID to the last processed position.
+  map<string, string> checkpoint = 1;
 }
 
 //
