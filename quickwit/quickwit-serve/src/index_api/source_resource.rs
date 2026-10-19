@@ -19,6 +19,7 @@ use quickwit_config::{
 };
 use quickwit_index_management::{IndexService, IndexServiceError};
 use quickwit_metastore::IndexMetadataResponseExt;
+use quickwit_metastore::checkpoint::SourceCheckpoint;
 use quickwit_proto::ingest::Shard;
 use quickwit_proto::metastore::{
     DeleteSourceRequest, EntityKind, IndexMetadataRequest, ListShardsRequest, ListShardsSubrequest,
@@ -26,7 +27,7 @@ use quickwit_proto::metastore::{
     ResetSourceCheckpointRequest, ToggleSourceRequest,
 };
 use quickwit_proto::types::{IndexId, IndexUid, SourceId};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 use warp::{Filter, Rejection};
 
@@ -277,6 +278,77 @@ pub async fn reset_source_checkpoint(
         .reset_source_checkpoint(reset_source_checkpoint_request)
         .await?;
     Ok(())
+}
+
+/// Checkpoint of a single source.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SourceCheckpointResponse {
+    /// The index ID of the source.
+    #[schema(value_type = String)]
+    pub index_id: IndexId,
+    /// The source ID.
+    #[schema(value_type = String)]
+    pub source_id: SourceId,
+    /// Map of partition ID to last processed position.
+    #[schema(value_type = std::collections::HashMap<String, String>)]
+    pub checkpoint: SourceCheckpoint,
+}
+
+pub fn get_source_checkpoint_handler(
+    metastore: MetastoreServiceClient,
+) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
+    warp::path!("indexes" / String / "sources" / String / "checkpoint")
+        .and(warp::get())
+        .and(with_arg(metastore))
+        .then(get_source_checkpoint)
+        .and(extract_format_from_qs())
+        .map(into_rest_api_response)
+        .boxed()
+}
+
+#[utoipa::path(
+    get,
+    tag = "Sources",
+    path = "/indexes/{index_id}/sources/{source_id}/checkpoint",
+    responses(
+        (status = 200, description = "Successfully fetched source checkpoint.", body = SourceCheckpointResponse)
+    ),
+    params(
+        ("index_id" = String, Path, description = "The index ID of the source."),
+        ("source_id" = String, Path, description = "The source ID whose checkpoint is fetched."),
+    )
+)]
+/// Gets source checkpoint.
+///
+/// Sources relying on the shard API (ingest v2, notification based file sources) track their
+/// positions in the shards table, so their checkpoint is always empty.
+pub async fn get_source_checkpoint(
+    index_id: IndexId,
+    source_id: SourceId,
+    metastore: MetastoreServiceClient,
+) -> MetastoreResult<SourceCheckpointResponse> {
+    info!(index_id = %index_id, source_id = %source_id, "get-source-checkpoint");
+    let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
+    let index_metadata = metastore
+        .index_metadata(index_metadata_request)
+        .await?
+        .deserialize_index_metadata()?;
+    if !index_metadata.sources.contains_key(&source_id) {
+        return Err(MetastoreError::NotFound(EntityKind::Source {
+            index_id,
+            source_id,
+        }));
+    }
+    let checkpoint = index_metadata
+        .checkpoint
+        .source_checkpoint(&source_id)
+        .cloned()
+        .unwrap_or_default();
+    Ok(SourceCheckpointResponse {
+        index_id,
+        source_id,
+        checkpoint,
+    })
 }
 
 pub fn toggle_source_handler(
