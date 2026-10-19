@@ -1397,7 +1397,7 @@ impl MetastoreService for PostgresqlMetastore {
                 cause: "".to_string(),
             });
         };
-        // Extracts the source checkpoint directly in Postgres to avoid loading and deserializing
+        // Extracts the source checkpoint directly in Postgres to avoid transferring
         // the whole index metadata. This relies on the serialized `IndexMetadata` layout:
         // `sources` is an array of source configs and `checkpoint` maps source IDs to their
         // checkpoint.
