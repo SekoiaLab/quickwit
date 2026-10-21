@@ -78,6 +78,10 @@ impl Source {
 pub struct SchedulingProblem {
     sources: Vec<Source>,
     indexer_cpu_capacities: Vec<CpuCapacity>,
+    /// Maximum number of shards that can be assigned to a single indexer.
+    /// Unlike cpu capacities, this limit is never inflated: shards that do not fit
+    /// are left unassigned.
+    indexer_max_num_shards: u32,
 }
 
 impl SchedulingProblem {
@@ -98,7 +102,16 @@ impl SchedulingProblem {
         SchedulingProblem {
             sources: Vec::new(),
             indexer_cpu_capacities,
+            indexer_max_num_shards: u32::MAX,
         }
+    }
+
+    pub fn set_indexer_max_num_shards(&mut self, indexer_max_num_shards: u32) {
+        self.indexer_max_num_shards = indexer_max_num_shards;
+    }
+
+    pub fn indexer_max_num_shards(&self) -> u32 {
+        self.indexer_max_num_shards
     }
 
     pub fn new_solution(&self) -> SchedulingSolution {
@@ -131,6 +144,13 @@ impl SchedulingProblem {
             .iter()
             .map(|source| source.num_shards * source.load_per_shard.get())
             .sum()
+    }
+
+    /// Returns the total number of shards of the problem.
+    ///
+    /// Unlike `sources()`, this does not clone the sources.
+    pub fn total_num_shards(&self) -> u32 {
+        self.sources.iter().map(|source| source.num_shards).sum()
     }
 
     pub fn sources(&self) -> impl Iterator<Item = Source> + '_ {
@@ -202,6 +222,10 @@ impl IndexerAssignment {
             .sum()
     }
 
+    pub fn total_num_shards(&self) -> u32 {
+        self.num_shards_per_source.values().sum()
+    }
+
     pub fn num_shards(&self, source_ord: SourceOrd) -> u32 {
         self.num_shards_per_source
             .get(&source_ord)
@@ -250,6 +274,14 @@ impl SchedulingSolution {
     }
     pub fn num_indexers(&self) -> usize {
         self.indexer_assignments.len()
+    }
+
+    /// Returns the total number of shards assigned to the indexers.
+    pub fn total_num_shards(&self) -> u32 {
+        self.indexer_assignments
+            .iter()
+            .map(|indexer_assignment| indexer_assignment.total_num_shards())
+            .sum()
     }
 }
 
