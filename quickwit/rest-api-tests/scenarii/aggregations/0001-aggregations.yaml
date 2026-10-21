@@ -355,16 +355,13 @@ json:
         field: "date"
 expected:
   aggregations:
-    # cardinality queries are currently being improved upstream
+    # Low cardinalities are exact, also when merged across splits.
     unique_names:
-      value:
-        $expect: 'abs(val - 8) <= 2'
+      value: 8.0
     unique_response:
-      value:
-        $expect: 'abs(val - 6) <= 2'
+      value: 5.0
     unique_dates:
-      value:
-        $expect: 'abs(val - 6) <= 3'
+      value: 6.0
 ---
 # Test extended stats aggregation
 method: [GET]

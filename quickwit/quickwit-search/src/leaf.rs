@@ -549,10 +549,10 @@ async fn leaf_search_single_split(
         .try_into()?;
     let searcher = reader.searcher();
 
-    let agg_context_params = AggContextParams {
-        limits: aggregations_limits,
-        tokenizers: ctx.doc_mapper.tokenizer_manager().tantivy_manager().clone(),
-    };
+    let agg_context_params = AggContextParams::new(
+        aggregations_limits,
+        ctx.doc_mapper.tokenizer_manager().tantivy_manager().clone(),
+    );
     let mut collector =
         make_collector_for_split(split_id.clone(), &search_request, agg_context_params)?;
 
