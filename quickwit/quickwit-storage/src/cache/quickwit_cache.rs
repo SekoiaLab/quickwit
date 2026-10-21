@@ -26,7 +26,9 @@ use crate::metrics::ComponentCacheMetrics;
 const FULL_SLICE: Range<usize> = 0..usize::MAX;
 
 /// Quickwit storage cache with a size limit.
-/// It is used currently by to cache only fast fields data.
+///
+/// Every route currently shares a single underlying cache instance, so the components listed
+/// in [`QuickwitCache::new`] compete for one budget.
 pub struct QuickwitCache {
     router: Vec<(&'static str, Arc<dyn StorageCache>)>,
 }
@@ -38,18 +40,27 @@ impl From<Vec<(&'static str, Arc<dyn StorageCache>)>> for QuickwitCache {
 }
 
 impl QuickwitCache {
-    /// Creates a [`QuickwitCache`] with a cache on fast fields, built from `cache_config`.
+    /// Creates a [`QuickwitCache`] built from `cache_config`, shared by all the routed
+    /// tantivy components.
+    ///
+    /// All routes point at the same underlying cache, so a single eviction policy arbitrates
+    /// between components instead of each one getting a fixed budget. Each route is wrapped in
+    /// a [`MeteredRoute`] so the shared pool's behaviour stays attributable per component.
     pub fn new(cache_config: &CacheConfig) -> Self {
         let mut quickwit_cache = QuickwitCache::empty();
-        let fast_field_cache_counters: &'static ComponentCacheMetrics =
-            &crate::STORAGE_METRICS.fast_field_cache;
-        quickwit_cache.add_route(
-            ".fast",
-            Arc::new(SimpleCache::from_config(
-                cache_config,
-                fast_field_cache_counters,
-            )),
-        );
+        let cache: Arc<dyn StorageCache> = Arc::new(SimpleCache::from_config(
+            cache_config,
+            &crate::STORAGE_METRICS.fast_field_cache,
+        ));
+        for suffix in [".fast", ".term", ".idx", ".pos", ".fieldnorm"] {
+            quickwit_cache.add_route(
+                suffix,
+                Arc::new(MeteredRoute {
+                    suffix,
+                    inner: cache.clone(),
+                }),
+            );
+        }
         quickwit_cache
     }
 
@@ -106,9 +117,64 @@ impl StorageCache for QuickwitCache {
     }
 }
 
+/// Records per-suffix hit/miss metrics around a shared underlying cache.
+///
+/// The shared pool reports a single aggregate hit rate under its own component name, which
+/// cannot tell us whether a given component regressed or which one is winning the shared
+/// space. These counters are recorded *in addition* to the pool's own metrics, so summing the
+/// two would double count.
+///
+/// Puts are not metered: a put only ever follows a miss, which is already counted.
+struct MeteredRoute {
+    suffix: &'static str,
+    inner: Arc<dyn StorageCache>,
+}
+
+impl MeteredRoute {
+    fn record(&self, result: Option<&OwnedBytes>) {
+        let metrics = &crate::STORAGE_METRICS;
+        let outcome = if let Some(bytes) = result {
+            metrics
+                .cache_route_hit_bytes
+                .with_label_values([self.suffix])
+                .inc_by(bytes.len() as u64);
+            "hit"
+        } else {
+            "miss"
+        };
+        metrics
+            .cache_route_events
+            .with_label_values([self.suffix, outcome])
+            .inc();
+    }
+}
+
+#[async_trait]
+impl StorageCache for MeteredRoute {
+    async fn get(&self, path: &Path, byte_range: Range<usize>) -> Option<OwnedBytes> {
+        let result = self.inner.get(path, byte_range).await;
+        self.record(result.as_ref());
+        result
+    }
+
+    async fn get_all(&self, path: &Path) -> Option<OwnedBytes> {
+        let result = self.inner.get_all(path).await;
+        self.record(result.as_ref());
+        result
+    }
+
+    async fn put(&self, path: PathBuf, byte_range: Range<usize>, bytes: OwnedBytes) {
+        self.inner.put(path, byte_range, bytes).await;
+    }
+
+    async fn put_all(&self, path: PathBuf, bytes: OwnedBytes) {
+        self.inner.put_all(path, bytes).await;
+    }
+}
+
 /// The Quickwit cache logic is very simple for the moment.
 ///
-/// It stores hotcache files using an LRU cache.
+/// It stores slices of the routed files in a size-bounded cache.
 ///
 /// HACK! We use `0..usize::MAX` to signify the "entire file".
 /// TODO fixme

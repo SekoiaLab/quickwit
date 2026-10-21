@@ -196,6 +196,7 @@ impl<K: Hash + Eq, V: ValueLen + Clone> Lru<K, V> {
     fn put(&mut self, key: K, bytes: V) {
         if self.capacity.exceeds_capacity(bytes.len()) {
             // The value does not fit in the cache. We simply don't store it.
+            self.cache_metrics.admission_rejected_num_items.inc();
             if self.capacity != Capacity::InBytes(0) {
                 warn!(
                     capacity_in_bytes = ?self.capacity,
@@ -222,6 +223,7 @@ impl<K: Hash + Eq, V: ValueLen + Clone> Lru<K, V> {
                     // It is not worth doing an eviction.
                     // TODO: It is sub-optimal that we might have needlessly evicted items in this
                     // loop before just returning.
+                    self.cache_metrics.admission_rejected_num_items.inc();
                     return;
                 }
             }
@@ -326,6 +328,7 @@ impl<K: Hash + Eq, V: ValueLen + Clone> S3Fifo<K, V> {
     fn put(&mut self, key: K, value: V) {
         if self.capacity < value.len() as u64 {
             // The value does not fit in the cache. We simply don't store it.
+            self.cache_metrics.admission_rejected_num_items.inc();
             if self.capacity != 0 {
                 warn!(
                     capacity_in_bytes = ?self.capacity,
@@ -445,6 +448,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: ValueLen + Clone + Send + Sync + '
     fn put(&mut self, key: K, value: V) {
         if self.capacity < value.len() as u64 {
             // The value does not fit in the cache. We simply don't store it.
+            self.cache_metrics.admission_rejected_num_items.inc();
             if self.capacity != 0 {
                 rate_limited_warn!(
                     limit_per_min = 1,
@@ -456,6 +460,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: ValueLen + Clone + Send + Sync + '
             return;
         }
         if value.len() > u32::MAX as usize {
+            self.cache_metrics.admission_rejected_num_items.inc();
             rate_limited_warn!(
                 limit_per_min = 1,
                 len = value.len(),
