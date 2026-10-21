@@ -202,6 +202,16 @@ fn get_default_load_per_shard() -> NonZeroU32 {
     })
 }
 
+/// Maximum number of indexing pipelines the scheduler assigns to a single indexer.
+///
+/// Pipelines that cannot be assigned because all indexers reached this limit are left out of the
+/// indexing plan.
+fn get_max_num_pipelines_per_indexer() -> u32 {
+    static MAX_NUM_PIPELINES_PER_INDEXER: OnceLock<u32> = OnceLock::new();
+    *MAX_NUM_PIPELINES_PER_INDEXER
+        .get_or_init(|| quickwit_common::get_from_env("QW_MAX_PIPELINES_PER_INDEXER", 500, false))
+}
+
 fn get_sources_to_schedule(model: &ControlPlaneModel) -> Vec<SourceToSchedule> {
     let mut sources = Vec::new();
 
@@ -368,6 +378,7 @@ impl IndexingScheduler {
             &indexer_id_to_cpu_capacities,
             self.state.current_targeted_physical_plan.as_ref(),
             &shard_locations,
+            get_max_num_pipelines_per_indexer(),
         );
         let shard_locality_metrics =
             get_shard_locality_metrics(&new_physical_plan, &shard_locations);
@@ -532,14 +543,42 @@ impl IndexingScheduler {
 
         // Phase 3: Apply all valid swaps atomically to a working copy.
         if !valid_operations.is_empty() {
+            let mut new_plan = original_plan.clone();
             for operation in &valid_operations {
-                Self::apply_swap_operation(original_plan, operation);
+                Self::apply_swap_operation(&mut new_plan, operation);
+            }
+            // Phase 4: Reject the swaps if they overload an indexer.
+            if let Err(reason) = Self::check_max_num_pipelines_per_indexer(&new_plan) {
+                for swap_result in swap_results.iter_mut().filter(|result| result.success) {
+                    swap_result.success = false;
+                    swap_result.reason = reason.clone();
+                }
+            } else {
+                *original_plan = new_plan;
             }
         }
 
         Ok(SwapIndexingPipelinesResponse {
             results: swap_results,
         })
+    }
+
+    /// Checks that no indexer is assigned more than the maximum number of pipelines per indexer.
+    ///
+    /// Returns the reason of the failure otherwise.
+    fn check_max_num_pipelines_per_indexer(plan: &PhysicalIndexingPlan) -> Result<(), String> {
+        let max_num_pipelines_per_indexer = get_max_num_pipelines_per_indexer();
+        let Some((node_id, _)) = plan
+            .indexing_tasks_per_indexer()
+            .iter()
+            .find(|(_, tasks)| tasks.len() > max_num_pipelines_per_indexer as usize)
+        else {
+            return Ok(());
+        };
+        Err(format!(
+            "would exceed max pipelines per indexer ({max_num_pipelines_per_indexer}) on node \
+             `{node_id}`"
+        ))
     }
 
     /// Validates the entire swap request for contradictions.
@@ -1655,6 +1694,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_swap_pipelines_exceeding_max_pipelines_per_indexer() {
+        let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
+            "indexer-1".to_string(),
+            "indexer-2".to_string(),
+        ]);
+        plan.add_indexing_task("indexer-1", make_test_task("index-a", "source-1", 0));
+        for pipeline_uid in 1..=get_max_num_pipelines_per_indexer() {
+            plan.add_indexing_task(
+                "indexer-2",
+                make_test_task("index-b", "source-1", pipeline_uid as u128),
+            );
+        }
+        let mut scheduler = build_test_scheduler_with_plan(plan.clone());
+
+        let request = SwapIndexingPipelinesRequest {
+            swaps: vec![make_move_entry("indexer-1", "index-a", "indexer-2")],
+        };
+        let response = scheduler.swap_pipelines(request).unwrap();
+
+        assert_eq!(response.results.len(), 1);
+        assert!(!response.results[0].success);
+        assert!(
+            response.results[0]
+                .reason
+                .contains("would exceed max pipelines per indexer")
+        );
+        // Plan should be unchanged.
+        assert_eq!(
+            scheduler
+                .state
+                .current_targeted_physical_plan
+                .as_ref()
+                .unwrap(),
+            &plan,
+        );
+    }
+
+    #[tokio::test]
     async fn test_swap_pipelines_move_without_swap() {
         let mut plan = PhysicalIndexingPlan::with_indexer_ids(&[
             "indexer-1".to_string(),
@@ -1931,8 +2008,13 @@ mod tests {
         indexer_max_loads.insert("indexer1".to_string(), mcpu(3_000));
         indexer_max_loads.insert("indexer2".to_string(), mcpu(3_000));
         let shard_locations = ShardLocations::default();
-        let physical_plan =
-            build_physical_indexing_plan(&sources[..], &indexer_max_loads, None, &shard_locations);
+        let physical_plan = build_physical_indexing_plan(
+            &sources[..],
+            &indexer_max_loads,
+            None,
+            &shard_locations,
+            u32::MAX,
+        );
         assert_eq!(physical_plan.indexing_tasks_per_indexer().len(), 2);
         let indexing_tasks_1 = physical_plan.indexer("indexer1").unwrap();
         assert_eq!(indexing_tasks_1.len(), 2);
@@ -2008,7 +2090,7 @@ mod tests {
                 indexer_max_loads.insert(indexer_id, mcpu(4_000));
             }
             let shard_locations = ShardLocations::default();
-            let _physical_indexing_plan = build_physical_indexing_plan(&sources, &indexer_max_loads, None, &shard_locations);
+            let _physical_indexing_plan = build_physical_indexing_plan(&sources, &indexer_max_loads, None, &shard_locations, u32::MAX);
         }
     }
 
