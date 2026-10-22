@@ -1487,6 +1487,57 @@ async fn test_single_node_aggregation() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_single_node_cardinality_aggregation_merges_splits() -> anyhow::Result<()> {
+    let index_id = "single-node-agg-cardinality";
+    let doc_mapping_yaml = r#"
+            field_mappings:
+              - name: num
+                type: u64
+                fast: true
+              - name: str
+                type: text
+                tokenizer: raw
+                fast: true
+        "#;
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["str"]).await?;
+    // 4 splits of 100 distinct values, each overlapping half of the previous one: 250 distinct
+    // values overall, which is above what a sketch counts exactly with a precision threshold of
+    // 100, and below the default threshold.
+    for split_ord in 0..4u64 {
+        let docs: Vec<JsonValue> = (split_ord * 50..split_ord * 50 + 100)
+            .map(|value| json!({"num": value, "str": format!("value-{value}")}))
+            .collect();
+        test_sandbox.add_documents(docs).await?;
+    }
+    let agg_req = json!({
+        "num": {"cardinality": {"field": "num"}},
+        "str": {"cardinality": {"field": "str"}},
+        "num_low_precision": {"cardinality": {"field": "num", "precision_threshold": 100}},
+    });
+    let search_request = SearchRequest {
+        index_id_patterns: vec![index_id.to_string()],
+        query_ast: qast_json_helper("*", &[]),
+        aggregation_request: Some(agg_req.to_string()),
+        ..Default::default()
+    };
+    let single_node_result = single_node_search(
+        search_request,
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    let agg_res_struct =
+        AggregationResults::from_postcard(&single_node_result.aggregation_postcard.unwrap())?;
+    let agg_res_json: JsonValue = serde_json::to_value(&agg_res_struct)?;
+    assert_eq!(agg_res_json["num"]["value"], 250.0);
+    assert_eq!(agg_res_json["str"]["value"], 250.0);
+    let low_precision = agg_res_json["num_low_precision"]["value"].as_f64().unwrap();
+    assert!((low_precision - 250.0).abs() < 25.0, "{low_precision}");
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_single_node_aggregation_missing_fast_field() {
     let index_id = "single-node-agg-2";
     let doc_mapping_yaml = r#"
