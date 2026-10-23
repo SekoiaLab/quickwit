@@ -723,19 +723,34 @@ impl S3CompatibleObjectStorage {
         } else {
             DownloadKind::Object
         };
-        let (get_object_output, _connection_permit) = aws_retry(&self.retry_params, || {
-            self.get_object(path, range_opt.clone())
+        // The body is read within the retried closure: a connection dropped or stalled while
+        // streaming the body fails the attempt, and the whole GET is sent again.
+        let payload = aws_retry(&self.retry_params, || async {
+            let (get_object_output, _connection_permit) = self
+                .get_object(path, range_opt.clone())
+                .await
+                .map_err(|sdk_error| {
+                    if sdk_error.is_retryable() {
+                        Retry::Transient(StorageError::from(sdk_error))
+                    } else {
+                        Retry::Permanent(StorageError::from(sdk_error))
+                    }
+                })?;
+            // only record ranged get request as being in flight
+            let _in_flight_guards = range_opt
+                .clone()
+                .map(|range| object_storage_get_slice_in_flight_guards(range.len()));
+            collect_with_download_metrics(
+                get_object_output.body,
+                download_kind,
+                self.assembly_thread_pool.as_ref(),
+            )
+            .await
+            // GET requests are idempotent, and a body error is a transport failure.
+            .map_err(|io_error| Retry::Transient(StorageError::from(io_error)))
         })
-        .await?;
-        // only record ranged get request as being in flight
-        let _in_flight_guards =
-            range_opt.map(|range| object_storage_get_slice_in_flight_guards(range.len()));
-        let payload = collect_with_download_metrics(
-            get_object_output.body,
-            download_kind,
-            self.assembly_thread_pool.as_ref(),
-        )
-        .await?;
+        .await
+        .map_err(Retry::into_inner)?;
         Ok(payload)
     }
 
@@ -1400,6 +1415,86 @@ mod tests {
             .put(Path::new("my-path"), Box::new(vec![1, 2, 3]))
             .await
             .unwrap();
+    }
+
+    /// A response whose body streams a few bytes, then fails as if the connection was reset.
+    fn get_object_event_with_body_error() -> ReplayEvent {
+        let failing_body = http_body_util::StreamBody::new(futures::stream::iter(vec![
+            Ok(hyper::body::Frame::data(Bytes::from_static(b"ab"))),
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection reset",
+            )),
+        ]));
+        ReplayEvent::new(
+            http::Request::builder().body(SdkBody::empty()).unwrap(),
+            http::Response::builder()
+                .status(206)
+                .body(SdkBody::from_body_1_x(failing_body))
+                .unwrap(),
+        )
+    }
+
+    fn s3_storage_for_get_test(client: StaticReplayClient) -> S3CompatibleObjectStorage {
+        let credentials = Credentials::new("mock_key", "mock_secret", None, None, "mock_provider");
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_behavior_version())
+            .region(Some(Region::new("Foo")))
+            .http_client(client)
+            .credentials_provider(credentials)
+            .build();
+        S3CompatibleObjectStorage {
+            s3_client: S3Client::from_conf(config),
+            uri: Uri::for_test("s3://bucket/indexes"),
+            bucket: "bucket".to_string(),
+            prefix: PathBuf::new(),
+            multipart_policy: MultiPartPolicy::default(),
+            retry_params: RetryParams::for_test(),
+            disable_multi_object_delete: false,
+            disable_multipart_upload: false,
+            encryption: None,
+            assembly_thread_pool: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_retries_body_error() {
+        let client = StaticReplayClient::new(vec![
+            get_object_event_with_body_error(),
+            ReplayEvent::new(
+                http::Request::builder().body(SdkBody::empty()).unwrap(),
+                http::Response::builder()
+                    .status(206)
+                    .body(SdkBody::from("abcd"))
+                    .unwrap(),
+            ),
+        ]);
+        let s3_storage = s3_storage_for_get_test(client.clone());
+
+        let slice = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap();
+        assert_eq!(slice.as_slice(), b"abcd");
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_body_error_exhausts_retries() {
+        let retry_params = RetryParams::for_test();
+        let client = StaticReplayClient::new(
+            (0..retry_params.max_attempts)
+                .map(|_| get_object_event_with_body_error())
+                .collect(),
+        );
+        let s3_storage = s3_storage_for_get_test(client.clone());
+
+        let error = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Io);
+        assert_eq!(client.actual_requests().count(), retry_params.max_attempts);
     }
 
     #[tokio::test]
