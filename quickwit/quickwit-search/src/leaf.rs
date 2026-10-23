@@ -147,18 +147,24 @@ pub(crate) async fn open_split_bundle(
 /// if configured in the searcher config.
 ///
 /// The goal here is too ensure a low latency.
+///
+/// Storages that already apply this policy themselves, to each attempt of a request, are left as
+/// is (see [`Storage::timeout_policy`]).
 fn configure_storage_retries(
     searcher_context: &SearcherContext,
     index_storage: Arc<dyn Storage>,
 ) -> Arc<dyn Storage> {
-    if let Some(storage_timeout_policy) = &searcher_context.searcher_config.storage_timeout_policy {
-        Arc::new(TimeoutAndRetryStorage::new(
-            index_storage,
-            storage_timeout_policy.clone(),
-        ))
-    } else {
-        index_storage
+    let Some(storage_timeout_policy) = &searcher_context.searcher_config.storage_timeout_policy
+    else {
+        return index_storage;
+    };
+    if index_storage.timeout_policy().as_ref() == Some(storage_timeout_policy) {
+        return index_storage;
     }
+    Arc::new(TimeoutAndRetryStorage::new(
+        index_storage,
+        storage_timeout_policy.clone(),
+    ))
 }
 
 /// Opens a `tantivy::Index` for the given split with several cache layers:
@@ -1732,6 +1738,7 @@ mod tests {
     use std::ops::Bound;
 
     use bytes::BufMut;
+    use quickwit_config::{SearcherConfig, StorageTimeoutPolicy};
     use quickwit_directories::write_hotcache;
     use rand::Rng;
     use tantivy::TantivyDocument;
@@ -1741,6 +1748,38 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_configure_storage_retries_skips_storages_applying_the_policy() {
+        let timeout_policy = StorageTimeoutPolicy {
+            min_throughtput_bytes_per_secs: 100_000,
+            timeout_millis: 2_000,
+            max_num_retries: 1,
+        };
+        let mut searcher_config = SearcherConfig::default();
+        searcher_config.storage_timeout_policy = Some(timeout_policy.clone());
+        let searcher_context = SearcherContext::new(searcher_config, None, None);
+        let storage_applying = |policy_opt: Option<StorageTimeoutPolicy>| -> Arc<dyn Storage> {
+            let mut storage = quickwit_storage::MockStorage::new();
+            storage
+                .expect_timeout_policy()
+                .returning(move || policy_opt.clone());
+            Arc::new(storage)
+        };
+        let is_wrapped = |storage: Arc<dyn Storage>| {
+            let configured_storage = configure_storage_retries(&searcher_context, storage.clone());
+            !std::ptr::addr_eq(Arc::as_ptr(&configured_storage), Arc::as_ptr(&storage))
+        };
+        // The storage applies the searcher's policy itself.
+        assert!(!is_wrapped(storage_applying(Some(timeout_policy.clone()))));
+        // The storage applies no policy, or another one.
+        assert!(is_wrapped(storage_applying(None)));
+        let other_policy = StorageTimeoutPolicy {
+            max_num_retries: 0,
+            ..timeout_policy
+        };
+        assert!(is_wrapped(storage_applying(Some(other_policy))));
+    }
 
     fn bool_filter(ast: impl Into<QueryAst>) -> QueryAst {
         BoolQuery {

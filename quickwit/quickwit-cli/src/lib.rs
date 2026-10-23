@@ -270,9 +270,18 @@ fn get_resolvers(
 }
 
 /// Returns the S3 storage settings of a node running `node_config`.
+///
+/// The searcher's storage timeout policy is applied by the S3 storages themselves, to each attempt
+/// of a request, so it is handed over to them whenever the node runs the searcher.
 fn s3_node_options(node_config: &NodeConfig) -> S3NodeOptions {
+    let timeout_policy = if node_config.is_service_enabled(QuickwitService::Searcher) {
+        node_config.searcher_config.storage_timeout_policy.clone()
+    } else {
+        None
+    };
     S3NodeOptions {
         assembly_thread_pool: s3_assembly_thread_pool_for_services(&node_config.enabled_services),
+        timeout_policy,
     }
 }
 

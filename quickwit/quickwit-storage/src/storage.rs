@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use quickwit_common::uri::Uri;
+use quickwit_config::StorageTimeoutPolicy;
 use tempfile::TempPath;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
@@ -137,6 +138,11 @@ pub trait Storage: fmt::Debug + Send + Sync + 'static {
 
     /// Returns an URI identifying the storage
     fn uri(&self) -> &Uri;
+
+    /// Returns the timeout policy that the storage applies to its requests itself, if any.
+    fn timeout_policy(&self) -> Option<StorageTimeoutPolicy> {
+        None
+    }
 }
 
 async fn default_copy_to_file<S: Storage + ?Sized>(

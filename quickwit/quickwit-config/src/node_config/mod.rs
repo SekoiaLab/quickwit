@@ -413,6 +413,10 @@ impl std::fmt::Display for CachePolicy {
 /// This policy is inspired by this guidance. It does not track instanteneous throughput, but
 /// computes an overall timeout using the following formula:
 /// `timeout_offset + num_bytes_get_request / min_throughtput`
+///
+/// S3-compatible storages apply this timeout to each attempt of a request, response body
+/// included, inside their own retry loop: the delays between attempts, for instance after a
+/// throttling error, are not counted. Other storages apply it to the whole `get_slice` call.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StorageTimeoutPolicy {
     pub min_throughtput_bytes_per_secs: u64,
@@ -423,15 +427,18 @@ pub struct StorageTimeoutPolicy {
 }
 
 impl StorageTimeoutPolicy {
-    pub fn compute_timeout(&self, num_bytes: usize) -> impl Iterator<Item = Duration> {
+    /// Returns the timeout of a single attempt to download `num_bytes`.
+    pub fn timeout(&self, num_bytes: usize) -> Duration {
         let min_download_time_secs: f64 = if self.min_throughtput_bytes_per_secs == 0 {
             0.0f64
         } else {
             num_bytes as f64 / self.min_throughtput_bytes_per_secs as f64
         };
-        let timeout = Duration::from_millis(self.timeout_millis)
-            + Duration::from_secs_f64(min_download_time_secs);
-        std::iter::repeat_n(timeout, self.max_num_retries + 1)
+        Duration::from_millis(self.timeout_millis) + Duration::from_secs_f64(min_download_time_secs)
+    }
+
+    pub fn compute_timeout(&self, num_bytes: usize) -> impl Iterator<Item = Duration> {
+        std::iter::repeat_n(self.timeout(num_bytes), self.max_num_retries + 1)
     }
 }
 

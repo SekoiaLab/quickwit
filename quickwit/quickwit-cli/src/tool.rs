@@ -65,7 +65,7 @@ use tracing::{debug, info};
 use crate::checklist::{GREEN_COLOR, RED_COLOR};
 use crate::{
     THROUGHPUT_WINDOW_SIZE, config_cli_arg, get_resolvers, load_node_config, run_index_checklist,
-    start_actor_runtimes,
+    s3_node_options, start_actor_runtimes,
 };
 
 pub fn build_tool_command() -> Command {
@@ -721,7 +721,7 @@ pub async fn local_search_cli(args: LocalSearchArgs) -> anyhow::Result<()> {
     let (storage_resolver, metastore_resolver) = get_resolvers(
         &config.storage_configs,
         &config.metastore_configs,
-        S3NodeOptions::default(),
+        s3_node_options(&config),
     );
     let metastore: MetastoreServiceClient =
         metastore_resolver.resolve(&config.metastore_uri).await?;
