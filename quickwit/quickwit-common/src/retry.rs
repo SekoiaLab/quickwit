@@ -24,12 +24,17 @@ pub trait Retryable {
     fn is_retryable(&self) -> bool {
         false
     }
+
+    fn is_throttling(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Retry<E> {
     Permanent(E),
     Transient(E),
+    Throttled(E),
 }
 
 impl<E> Retry<E> {
@@ -37,6 +42,7 @@ impl<E> Retry<E> {
         match self {
             Self::Transient(error) => error,
             Self::Permanent(error) => error,
+            Self::Throttled(error) => error,
         }
     }
 }
@@ -45,10 +51,19 @@ impl<E> Retryable for Retry<E> {
     fn is_retryable(&self) -> bool {
         match self {
             Retry::Permanent(_) => false,
-            Retry::Transient(_) => true,
+            Retry::Transient(_) | Retry::Throttled(_) => true,
         }
     }
+
+    fn is_throttling(&self) -> bool {
+        matches!(self, Retry::Throttled(_))
+    }
 }
+
+/// Number of attempts granted to an operation that keeps being throttled, on top of
+/// [`RetryParams::max_attempts`]. Throttling can last longer than the other transient errors, and
+/// the exponential backoff spaces these last attempts out, so they add little load.
+pub const THROTTLING_EXTRA_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RetryParams {
@@ -159,7 +174,13 @@ where
         }
         num_attempts += 1;
 
-        if num_attempts >= retry_params.max_attempts {
+        // Throttled operations get extra attempts, unless retries are disabled altogether.
+        let max_attempts = if error.is_throttling() && retry_params.max_attempts > 1 {
+            retry_params.max_attempts + THROTTLING_EXTRA_ATTEMPTS
+        } else {
+            retry_params.max_attempts
+        };
+        if num_attempts >= max_attempts {
             warn!(
                 num_attempts=%num_attempts,
                 "request failed"
@@ -188,11 +209,14 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::RwLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use futures::future::ready;
 
-    use super::{MockableSleep, RetryParams, Retryable, retry_with_mockable_sleep};
+    use super::{
+        MockableSleep, RetryParams, Retryable, THROTTLING_EXTRA_ATTEMPTS, retry_with_mockable_sleep,
+    };
 
     #[derive(Debug, Eq, PartialEq)]
     pub enum Retry<E> {
@@ -263,6 +287,44 @@ mod tests {
         assert_eq!(
             simulate_retries(retry_sequence).await,
             Err(Retry::Transient(29))
+        );
+    }
+
+    /// Returns the number of attempts of an operation that always fails with `error`.
+    async fn count_attempts(retry_params: RetryParams, error: fn() -> super::Retry<()>) -> usize {
+        let num_attempts = AtomicUsize::new(0);
+        retry_with_mockable_sleep(
+            &retry_params,
+            || {
+                num_attempts.fetch_add(1, Ordering::Relaxed);
+                ready(Err::<(), _>(error()))
+            },
+            NoopSleep,
+        )
+        .await
+        .unwrap_err();
+        num_attempts.into_inner()
+    }
+
+    #[tokio::test]
+    async fn test_retry_gives_throttled_operations_extra_attempts() {
+        let retry_params = RetryParams {
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            max_attempts: 3,
+        };
+        assert_eq!(
+            count_attempts(retry_params, || super::Retry::Transient(())).await,
+            3
+        );
+        assert_eq!(
+            count_attempts(retry_params, || super::Retry::Throttled(())).await,
+            3 + THROTTLING_EXTRA_ATTEMPTS
+        );
+        // Disabled retries stay disabled for throttled operations.
+        assert_eq!(
+            count_attempts(RetryParams::no_retries(), || super::Retry::Throttled(())).await,
+            1
         );
     }
 

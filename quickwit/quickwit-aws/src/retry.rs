@@ -23,14 +23,19 @@ pub trait AwsRetryable {
     fn is_retryable(&self) -> bool {
         false
     }
+
+    fn is_throttling(&self) -> bool {
+        false
+    }
 }
 
 impl<E> AwsRetryable for Retry<E> {
     fn is_retryable(&self) -> bool {
-        match self {
-            Retry::Transient(_) => true,
-            Retry::Permanent(_) => false,
-        }
+        Retryable::is_retryable(self)
+    }
+
+    fn is_throttling(&self) -> bool {
+        Retryable::is_throttling(self)
     }
 }
 
@@ -42,6 +47,10 @@ where E: AwsRetryable
 {
     fn is_retryable(&self) -> bool {
         self.0.is_retryable()
+    }
+
+    fn is_throttling(&self) -> bool {
+        self.0.is_throttling()
     }
 }
 
