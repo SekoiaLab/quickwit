@@ -39,6 +39,7 @@ pub struct StorageMetrics {
     pub get_slice_timeout_all_timeouts: IntCounter,
     pub object_storage_requests_total: IntCounterVec<3>,
     pub object_storage_request_duration: HistogramVec<3>,
+    pub object_storage_operation_attempts: HistogramVec<2>,
     pub object_storage_get_slice_in_flight_count: IntGauge,
     pub object_storage_get_slice_in_flight_num_bytes: IntGauge,
     pub object_storage_get_object_connections_in_use: IntGauge,
@@ -94,6 +95,17 @@ impl Default for StorageMetrics {
                 &[],
                 ["action", "status", "bucket"],
                 vec![0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
+            ),
+            object_storage_operation_attempts: new_histogram_vec(
+                "object_storage_operation_attempts",
+                "Number of attempts per object store operation (a request and its retries), by \
+                 action and outcome: `success`, `exhausted` (every attempt failed with a \
+                 retryable error), `permanent_error`, `cancelled_during_attempt` or \
+                 `cancelled_during_backoff`.",
+                "storage",
+                &[],
+                ["action", "outcome"],
+                vec![1.0, 2.0, 3.0, 4.0, 5.0],
             ),
             object_storage_get_slice_in_flight_count: new_gauge(
                 "object_storage_get_slice_in_flight_count",
