@@ -35,7 +35,7 @@ use quickwit_metastore::{IndexMetadataResponseExt, MetastoreResolver};
 use quickwit_proto::metastore::{IndexMetadataRequest, MetastoreService, MetastoreServiceClient};
 use quickwit_rest_client::models::Timeout;
 use quickwit_rest_client::rest_client::{DEFAULT_BASE_URL, QuickwitClient, QuickwitClientBuilder};
-use quickwit_storage::{StorageResolver, load_file};
+use quickwit_storage::{S3NodeOptions, StorageResolver, load_file};
 use reqwest::Url;
 use tabled::settings::object::Rows;
 use tabled::settings::panel::Header;
@@ -247,36 +247,33 @@ async fn load_node_config(config_uri: &Uri) -> anyhow::Result<NodeConfig> {
     Ok(config)
 }
 
-/// Builds the storage and metastore resolvers.
-///
-/// When `s3_assembly_thread_pool_opt` is set, S3 storages assemble large downloads on that pool
-/// instead of the tokio runtime. Only searcher-only nodes set it (see
-/// [`s3_assembly_thread_pool_for_services`]).
+/// Builds the storage and metastore resolvers. `s3_node_options` are the S3 storage settings that
+/// depend on the node rather than on the storage configs (see [`s3_node_options`]).
 fn get_resolvers(
     storage_configs: &StorageConfigs,
     metastore_configs: &MetastoreConfigs,
-    s3_assembly_thread_pool_opt: Option<ThreadPoolWithPriority>,
+    s3_node_options: S3NodeOptions,
 ) -> (StorageResolver, MetastoreResolver) {
     // The CLI tests rely on the unconfigured singleton resolvers, so it's better to return them if
     // the storage and metastore configs are not set.
-    if storage_configs.is_empty()
-        && metastore_configs.is_empty()
-        && s3_assembly_thread_pool_opt.is_none()
-    {
+    if storage_configs.is_empty() && metastore_configs.is_empty() && s3_node_options.is_empty() {
         return (
             StorageResolver::unconfigured(),
             MetastoreResolver::unconfigured(),
         );
     }
-    let storage_resolver = match s3_assembly_thread_pool_opt {
-        Some(thread_pool) => {
-            StorageResolver::configured_with_s3_assembly_thread_pool(storage_configs, thread_pool)
-        }
-        None => StorageResolver::configured(storage_configs),
-    };
+    let storage_resolver =
+        StorageResolver::configured_with_s3_node_options(storage_configs, s3_node_options);
     let metastore_resolver =
         MetastoreResolver::configured(storage_resolver.clone(), metastore_configs);
     (storage_resolver, metastore_resolver)
+}
+
+/// Returns the S3 storage settings of a node running `node_config`.
+fn s3_node_options(node_config: &NodeConfig) -> S3NodeOptions {
+    S3NodeOptions {
+        assembly_thread_pool: s3_assembly_thread_pool_for_services(&node_config.enabled_services),
+    }
 }
 
 /// Returns the thread pool on which S3 storages should assemble large downloads, if any.
@@ -553,7 +550,10 @@ mod tests {
         };
         let storage_configs = StorageConfigs::new(vec![s3_storage_config.into()]);
         let metastore_configs = MetastoreConfigs::default();
-        let (_storage_resolver, _metastore_resolver) =
-            get_resolvers(&storage_configs, &metastore_configs, None);
+        let (_storage_resolver, _metastore_resolver) = get_resolvers(
+            &storage_configs,
+            &metastore_configs,
+            S3NodeOptions::default(),
+        );
     }
 }
