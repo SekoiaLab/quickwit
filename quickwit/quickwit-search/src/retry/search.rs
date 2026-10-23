@@ -93,6 +93,7 @@ mod tests {
                         timestamp_start: None,
                         timestamp_end: None,
                         num_docs: 0,
+                        soft_deleted_doc_ids: Vec::new(),
                     },
                     SplitIdAndFooterOffsets {
                         split_id: "split_2".to_string(),
@@ -101,6 +102,7 @@ mod tests {
                         timestamp_start: None,
                         timestamp_end: None,
                         num_docs: 0,
+                        soft_deleted_doc_ids: Vec::new(),
                     },
                 ],
             }],
@@ -115,6 +117,16 @@ mod tests {
             "test".to_string(),
         ));
         retry_policy.retry_request(request, &response_res).unwrap();
+    }
+
+    #[test]
+    fn test_should_not_retry_on_timeout() {
+        let retry_policy = LeafSearchRetryPolicy {};
+        let request = mock_leaf_search_request();
+        let response_res = Result::<LeafSearchResponse, SearchError>::Err(SearchError::Timeout(
+            "timeout exceeded".to_string(),
+        ));
+        assert!(retry_policy.retry_request(request, &response_res).is_none());
     }
 
     #[test]

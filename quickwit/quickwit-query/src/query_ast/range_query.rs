@@ -152,7 +152,7 @@ impl BuildTantivyAst for RangeQuery {
                 )
                 .into()
             }
-            tantivy::schema::FieldType::I64(_) => {
+            tantivy::schema::FieldType::I64(_) | tantivy::schema::FieldType::TieBreaker => {
                 let (lower_bound, upper_bound) =
                     convert_bounds(&self.lower_bound, &self.upper_bound, field_entry.name())?;
                 FastFieldRangeQuery::new(
@@ -192,6 +192,12 @@ impl BuildTantivyAst for RangeQuery {
             tantivy::schema::FieldType::Facet(_) => {
                 return Err(InvalidQuery::RangeQueryNotSupportedForField {
                     value_type: "facet",
+                    field_name: field_entry.name().to_string(),
+                });
+            }
+            tantivy::schema::FieldType::Custom(_) => {
+                return Err(InvalidQuery::RangeQueryNotSupportedForField {
+                    value_type: "custom",
                     field_name: field_entry.name().to_string(),
                 });
             }

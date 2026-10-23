@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use once_cell::sync::Lazy;
-use quickwit_common::metrics::{HistogramVec, new_histogram_vec};
+use quickwit_common::metrics::{HistogramVec, IntCounter, new_counter, new_histogram_vec};
 
 pub struct CliMetrics {
     pub thread_unpark_duration_microseconds: HistogramVec<0>,
+    pub thread_unpark_cpu_time_microseconds_total: IntCounter,
 }
 
 impl Default for CliMetrics {
@@ -29,6 +30,15 @@ impl Default for CliMetrics {
                 &[],
                 [],
                 quickwit_common::metrics::exponential_buckets(5.0, 5.0, 5).unwrap(),
+            ),
+            thread_unpark_cpu_time_microseconds_total: new_counter(
+                "thread_unpark_cpu_time_microseconds_total",
+                "CPU time consumed by threads of the main tokio runtime while unparked. Compare \
+                 with `thread_unpark_duration_microseconds_sum` (wall time over the same \
+                 intervals): the gap is time spent runnable but descheduled (CPU starvation, CFS \
+                 throttling) or blocked in the kernel.",
+                "cli",
+                &[],
             ),
         }
     }

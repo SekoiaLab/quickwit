@@ -458,7 +458,7 @@ impl IngestController {
         let unavailable_leaders: FnvHashSet<NodeId> = get_open_shards_request
             .unavailable_leaders
             .into_iter()
-            .map(NodeId::from)
+            .map(|s| NodeId::from_str(&s))
             .collect();
 
         // We do a first pass to identify the shards that are missing from the model and need to be
@@ -570,7 +570,7 @@ impl IngestController {
         }
 
         for shard in model.all_shards() {
-            if shard.is_open() && !unavailable_leaders.contains(&shard.leader_id) {
+            if shard.is_open() && !unavailable_leaders.contains(shard.leader_id.as_str()) {
                 for ingest_node in shard.ingesters() {
                     if let Some(shard_count) =
                         per_node_num_open_shards.get_mut(ingest_node.as_str())
@@ -639,7 +639,7 @@ impl IngestController {
                     }
                 })
                 .collect();
-            let Some(leader) = self.ingester_pool.get(&leader_id) else {
+            let Some(leader) = self.ingester_pool.get(leader_id.as_str()) else {
                 warn!("failed to init shards: ingester `{leader_id}` is unavailable");
                 failures.extend(init_shard_failures);
                 continue;
@@ -1006,6 +1006,10 @@ impl IngestController {
     /// Moving a shard consists of closing the shard on the source ingester and opening a new
     /// one on the target ingester.
     ///
+    /// When in maintenance mode (`is_maintenance` is true), this function exits early to keep
+    /// the indexing plan frozen. This design provides a simple safeguard to prevent unintended
+    /// plan modifications during maintenance.
+    ///
     /// This method is guarded by a lock to ensure that only one rebalance operation is performed at
     /// a time.
     pub(crate) async fn rebalance_shards(
@@ -1013,7 +1017,11 @@ impl IngestController {
         model: &mut ControlPlaneModel,
         mailbox: &Mailbox<ControlPlane>,
         progress: &Progress,
+        is_maintenance: bool,
     ) -> MetastoreResult<Option<JoinHandle<()>>> {
+        if is_maintenance {
+            return Ok(None);
+        }
         let Ok(rebalance_guard) = self.rebalance_lock.clone().try_lock_owned() else {
             debug!("skipping rebalance: another rebalance is already in progress");
             return Ok(None);
@@ -1202,7 +1210,7 @@ impl IngestController {
                 source_id: shard.source_id,
                 shard_id: shard.shard_id,
             };
-            let leader_id = NodeId::from(shard.leader_id);
+            let leader_id = NodeId::from_str(&shard.leader_id);
             per_leader_shards_to_close
                 .entry(leader_id)
                 .or_default()
@@ -1294,7 +1302,7 @@ fn find_scale_down_candidate(
         .max_by_key(|(_leader_id, shard_entries)| (shard_entries.len(), rng.next_u32()))
         .map(|(leader_id, shard_entries)| {
             (
-                leader_id.clone().into(),
+                NodeId::from_str(leader_id),
                 shard_entries.choose(&mut rng).unwrap().shard_id().clone(),
             )
         })
@@ -1385,7 +1393,7 @@ mod tests {
         let ingester = IngesterServiceClient::from_mock(mock_ingester);
 
         let ingester_pool = IngesterPool::default();
-        ingester_pool.insert(NodeId::from("test-ingester-1"), ingester.clone());
+        ingester_pool.insert(NodeId::from_str("test-ingester-1"), ingester.clone());
 
         let mut mock_ingester = MockIngesterService::new();
         let index_uid_1_clone = index_uid_1.clone();
@@ -1413,7 +1421,7 @@ mod tests {
                 Ok(response)
             });
         let ingester = IngesterServiceClient::from_mock(mock_ingester);
-        ingester_pool.insert(NodeId::from("test-ingester-2"), ingester.clone());
+        ingester_pool.insert(NodeId::from_str("test-ingester-2"), ingester.clone());
 
         let replication_factor = 2;
         let mut controller = IngestController::new(
@@ -1599,7 +1607,7 @@ mod tests {
         let ingester = IngesterServiceClient::from_mock(mock_ingester);
 
         let ingester_pool = IngesterPool::default();
-        ingester_pool.insert(NodeId::from("test-ingester-1"), ingester.clone());
+        ingester_pool.insert(NodeId::from_str("test-ingester-1"), ingester.clone());
 
         let replication_factor = 1;
         let mut controller = IngestController::new(
@@ -1711,7 +1719,7 @@ mod tests {
         assert!(leader_follower_pairs_opt.is_none());
 
         ingester_pool.insert(
-            NodeId::from("test-ingester-1"),
+            NodeId::from_str("test-ingester-1"),
             IngesterServiceClient::mocked(),
         );
 
@@ -1722,7 +1730,10 @@ mod tests {
         // find any solution.
         assert!(leader_follower_pairs_opt.is_none());
 
-        ingester_pool.insert("test-ingester-2".into(), IngesterServiceClient::mocked());
+        ingester_pool.insert(
+            NodeId::from_str("test-ingester-2"),
+            IngesterServiceClient::mocked(),
+        );
 
         let leader_follower_pairs = controller
             .allocate_shards(0, &FnvHashSet::default(), &model)
@@ -1741,13 +1752,13 @@ mod tests {
         if leader_follower_pairs[0].0 == "test-ingester-1" {
             assert_eq!(
                 leader_follower_pairs[0].1,
-                Some(NodeId::from("test-ingester-2"))
+                Some(NodeId::from_str("test-ingester-2"))
             );
         } else {
             assert_eq!(leader_follower_pairs[0].0, "test-ingester-2");
             assert_eq!(
                 leader_follower_pairs[0].1,
-                Some(NodeId::from("test-ingester-1"))
+                Some(NodeId::from_str("test-ingester-1"))
             );
         }
 
@@ -1760,13 +1771,13 @@ mod tests {
             if leader_follower_pair.0 == "test-ingester-1" {
                 assert_eq!(
                     leader_follower_pair.1,
-                    Some(NodeId::from("test-ingester-2"))
+                    Some(NodeId::from_str("test-ingester-2"))
                 );
             } else {
                 assert_eq!(leader_follower_pair.0, "test-ingester-2");
                 assert_eq!(
                     leader_follower_pair.1,
-                    Some(NodeId::from("test-ingester-1"))
+                    Some(NodeId::from_str("test-ingester-1"))
                 );
             }
         }
@@ -1795,19 +1806,19 @@ mod tests {
         assert_eq!(leader_follower_pairs[0].0, "test-ingester-2");
         assert_eq!(
             leader_follower_pairs[0].1,
-            Some(NodeId::from("test-ingester-1"))
+            Some(NodeId::from_str("test-ingester-1"))
         );
 
         assert_eq!(leader_follower_pairs[1].0, "test-ingester-2");
         assert_eq!(
             leader_follower_pairs[1].1,
-            Some(NodeId::from("test-ingester-1"))
+            Some(NodeId::from_str("test-ingester-1"))
         );
 
         assert_eq!(leader_follower_pairs[2].0, "test-ingester-2");
         assert_eq!(
             leader_follower_pairs[2].1,
-            Some(NodeId::from("test-ingester-1"))
+            Some(NodeId::from_str("test-ingester-1"))
         );
 
         let open_shards = vec![
@@ -1838,11 +1849,14 @@ mod tests {
         assert_eq!(leader_follower_pairs[0].0, "test-ingester-2");
         assert_eq!(
             leader_follower_pairs[0].1,
-            Some(NodeId::from("test-ingester-1"))
+            Some(NodeId::from_str("test-ingester-1"))
         );
 
-        ingester_pool.insert("test-ingester-3".into(), IngesterServiceClient::mocked());
-        let unavailable_leaders = FnvHashSet::from_iter([NodeId::from("test-ingester-2")]);
+        ingester_pool.insert(
+            NodeId::from_str("test-ingester-3"),
+            IngesterServiceClient::mocked(),
+        );
+        let unavailable_leaders = FnvHashSet::from_iter([NodeId::from_str("test-ingester-2")]);
         let leader_follower_pairs = controller
             .allocate_shards(4, &unavailable_leaders, &model)
             .unwrap();
@@ -1851,25 +1865,25 @@ mod tests {
         assert_eq!(leader_follower_pairs[0].0, "test-ingester-3");
         assert_eq!(
             leader_follower_pairs[0].1,
-            Some(NodeId::from("test-ingester-1"))
+            Some(NodeId::from_str("test-ingester-1"))
         );
 
         assert_eq!(leader_follower_pairs[1].0, "test-ingester-3");
         assert_eq!(
             leader_follower_pairs[1].1,
-            Some(NodeId::from("test-ingester-1"))
+            Some(NodeId::from_str("test-ingester-1"))
         );
 
         assert_eq!(leader_follower_pairs[2].0, "test-ingester-3");
         assert_eq!(
             leader_follower_pairs[2].1,
-            Some(NodeId::from("test-ingester-1"))
+            Some(NodeId::from_str("test-ingester-1"))
         );
 
         assert_eq!(leader_follower_pairs[3].0, "test-ingester-3");
         assert_eq!(
             leader_follower_pairs[3].1,
-            Some(NodeId::from("test-ingester-1"))
+            Some(NodeId::from_str("test-ingester-1"))
         );
     }
 
@@ -1887,7 +1901,7 @@ mod tests {
             1.001,
         );
 
-        let ingester_id_0 = NodeId::from("test-ingester-0");
+        let ingester_id_0 = NodeId::from_str("test-ingester-0");
         let mut mock_ingester_0 = MockIngesterService::new();
         mock_ingester_0
             .expect_init_shards()
@@ -1936,7 +1950,7 @@ mod tests {
         let ingester_0 = IngesterServiceClient::from_mock(mock_ingester_0);
         ingester_pool.insert(ingester_id_0, ingester_0);
 
-        let ingester_id_1 = NodeId::from("test-ingester-1");
+        let ingester_id_1 = NodeId::from_str("test-ingester-1");
         let mut mock_ingester_1 = MockIngesterService::new();
         mock_ingester_1
             .expect_init_shards()
@@ -1958,7 +1972,7 @@ mod tests {
         let ingester_1 = IngesterServiceClient::from_mock(mock_ingester_1);
         ingester_pool.insert(ingester_id_1, ingester_1);
 
-        let ingester_id_2 = NodeId::from("test-ingester-2");
+        let ingester_id_2 = NodeId::from_str("test-ingester-2");
         let mut mock_ingester_2 = MockIngesterService::new();
         mock_ingester_2.expect_init_shards().never();
 
@@ -2172,7 +2186,7 @@ mod tests {
             });
 
         ingester_pool.insert(
-            NodeId::from("test-ingester-1"),
+            NodeId::from_str("test-ingester-1"),
             IngesterServiceClient::from_mock(mock_ingester),
         );
         let source_uids: HashMap<SourceUid, usize> = HashMap::from_iter([(source_uid.clone(), 1)]);
@@ -2287,7 +2301,7 @@ mod tests {
             long_term_ingestion_rate: RateMibPerSec(1),
         }]);
         let local_shards_update = LocalShardsUpdate {
-            leader_id: "test-ingester".into(),
+            leader_id: NodeId::from_str("test-ingester"),
             source_uid: source_uid.clone(),
             shard_infos,
         };
@@ -2344,7 +2358,7 @@ mod tests {
                 ))
             });
         let ingester = IngesterServiceClient::from_mock(mock_ingester);
-        ingester_pool.insert("test-ingester".into(), ingester);
+        ingester_pool.insert(NodeId::from_str("test-ingester"), ingester);
 
         let shard_infos = BTreeSet::from_iter([
             ShardInfo {
@@ -2361,7 +2375,7 @@ mod tests {
             },
         ]);
         let local_shards_update = LocalShardsUpdate {
-            leader_id: "test-ingester".into(),
+            leader_id: NodeId::from_str("test-ingester"),
             source_uid: source_uid.clone(),
             shard_infos,
         };
@@ -2386,7 +2400,7 @@ mod tests {
             },
         ]);
         let local_shards_update = LocalShardsUpdate {
-            leader_id: "test-ingester".into(),
+            leader_id: NodeId::from_str("test-ingester"),
             source_uid: source_uid.clone(),
             shard_infos,
         };
@@ -2497,7 +2511,7 @@ mod tests {
         );
 
         let ingester = IngesterServiceClient::from_mock(mock_ingester);
-        ingester_pool.insert("test-ingester".into(), ingester);
+        ingester_pool.insert(NodeId::from_str("test-ingester"), ingester);
 
         let shard_infos = BTreeSet::from_iter([ShardInfo {
             shard_id: ShardId::from(1),
@@ -2506,7 +2520,7 @@ mod tests {
             long_term_ingestion_rate: RateMibPerSec(4),
         }]);
         let local_shards_update = LocalShardsUpdate {
-            leader_id: "test-ingester".into(),
+            leader_id: NodeId::from_str("test-ingester"),
             source_uid: source_uid.clone(),
             shard_infos,
         };
@@ -2643,7 +2657,7 @@ mod tests {
                 Ok(response)
             });
         let ingester = IngesterServiceClient::from_mock(mock_ingester);
-        ingester_pool.insert("test-ingester".into(), ingester);
+        ingester_pool.insert(NodeId::from_str("test-ingester"), ingester);
 
         // Test failed to open shards.
         controller
@@ -2765,7 +2779,7 @@ mod tests {
                 Ok(response)
             });
         let ingester = IngesterServiceClient::from_mock(mock_ingester);
-        ingester_pool.insert("test-ingester".into(), ingester);
+        ingester_pool.insert(NodeId::from_str("test-ingester"), ingester);
 
         // Test failed to close shard.
         controller
@@ -2995,18 +3009,18 @@ mod tests {
                 Ok(RetainShardsResponse {})
             });
         ingester_pool.insert(
-            "node-1".into(),
+            NodeId::from_str("node-1"),
             IngesterServiceClient::from_mock(mock_ingester_1),
         );
         ingester_pool.insert(
-            "node-2".into(),
+            NodeId::from_str("node-2"),
             IngesterServiceClient::from_mock(mock_ingester_2),
         );
         ingester_pool.insert(
-            "node-3".into(),
+            NodeId::from_str("node-3"),
             IngesterServiceClient::from_mock(mock_ingester_3),
         );
-        let node_id = "node-1".into();
+        let node_id: NodeId = NodeId::from_str("node-1");
         let wait_handle = controller.sync_with_ingester(&node_id, &model);
         wait_handle.wait().await;
         assert_eq!(count_calls.load(Ordering::Acquire), 1);
@@ -3106,7 +3120,7 @@ mod tests {
         let closed_shards = controller.close_shards(Vec::new()).await;
         assert_eq!(closed_shards.len(), 0);
 
-        let ingester_id_0 = NodeId::from("test-ingester-0");
+        let ingester_id_0 = NodeId::from_str("test-ingester-0");
         let mut mock_ingester_0 = MockIngesterService::new();
         mock_ingester_0
             .expect_close_shards()
@@ -3136,7 +3150,7 @@ mod tests {
         let ingester_0 = IngesterServiceClient::from_mock(mock_ingester_0);
         ingester_pool.insert(ingester_id_0.clone(), ingester_0);
 
-        let ingester_id_1 = NodeId::from("test-ingester-1");
+        let ingester_id_1 = NodeId::from_str("test-ingester-1");
         let mut mock_ingester_1 = MockIngesterService::new();
         mock_ingester_1
             .expect_close_shards()
@@ -3154,7 +3168,7 @@ mod tests {
         let ingester_1 = IngesterServiceClient::from_mock(mock_ingester_1);
         ingester_pool.insert(ingester_id_1.clone(), ingester_1);
 
-        let ingester_id_2 = NodeId::from("test-ingester-2");
+        let ingester_id_2 = NodeId::from_str("test-ingester-2");
         let mut mock_ingester_2 = MockIngesterService::new();
         mock_ingester_2.expect_close_shards().never();
 
@@ -3262,7 +3276,7 @@ mod tests {
         let progress = Progress::default();
 
         let close_shards_task_opt = controller
-            .rebalance_shards(&mut model, &control_plane_mailbox, &progress)
+            .rebalance_shards(&mut model, &control_plane_mailbox, &progress, false)
             .await
             .unwrap();
         assert!(close_shards_task_opt.is_none());
@@ -3322,7 +3336,7 @@ mod tests {
         ];
         model.insert_shards(&index_uid, &INGEST_V2_SOURCE_ID.to_string(), open_shards);
 
-        let ingester_id_0 = NodeId::from("test-ingester-0");
+        let ingester_id_0 = NodeId::from_str("test-ingester-0");
         let mut mock_ingester_0 = MockIngesterService::new();
         mock_ingester_0
             .expect_close_shards()
@@ -3343,7 +3357,7 @@ mod tests {
         let ingester_0 = IngesterServiceClient::from_mock(mock_ingester_0);
         ingester_pool.insert(ingester_id_0.clone(), ingester_0);
 
-        let ingester_id_1 = NodeId::from("test-ingester-1");
+        let ingester_id_1 = NodeId::from_str("test-ingester-1");
         let mut mock_ingester_1 = MockIngesterService::new();
         mock_ingester_1.expect_init_shards().return_once(|request| {
             assert_eq!(request.subrequests.len(), 2);
@@ -3386,7 +3400,7 @@ mod tests {
         ingester_pool.insert(ingester_id_1.clone(), ingester_1);
 
         let close_shards_task = controller
-            .rebalance_shards(&mut model, &control_plane_mailbox, &progress)
+            .rebalance_shards(&mut model, &control_plane_mailbox, &progress, false)
             .await
             .unwrap()
             .unwrap();
@@ -3470,7 +3484,7 @@ mod tests {
             .map(|i| format!("shard-{i}"))
             .collect();
         for (shard, &shard_count) in shards.into_iter().zip(shard_counts.iter()) {
-            shard_counts_map.insert(NodeId::from(shard), shard_count);
+            shard_counts_map.insert(NodeId::from_str(&shard), shard_count);
         }
         for i in 0..10 {
             test_allocate_shards_aux_aux(&shard_counts_map, i, false);
@@ -3568,7 +3582,7 @@ mod tests {
             .collect();
 
         for ingester_id in &active_ids {
-            ingester_pool.insert(NodeId::from(ingester_id.clone()), ingester_client.clone());
+            ingester_pool.insert(NodeId::from_str(ingester_id), ingester_client.clone());
         }
 
         let inactive_ids: Vec<String> = (0..unavailable_ingester_shards.len())

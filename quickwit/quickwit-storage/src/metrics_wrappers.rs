@@ -12,13 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Debug;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
+use aws_smithy_types::byte_stream::ByteStream;
+use bytes::{Bytes, BytesMut};
+use once_cell::sync::Lazy;
 use pin_project::{pin_project, pinned_drop};
+use quickwit_aws::retry::{AwsRetryable, aws_retry};
+use quickwit_common::retry::RetryParams;
+use quickwit_common::thread_pool::with_priority::{Priority, ThreadPoolWithPriority};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::STORAGE_METRICS;
@@ -80,7 +88,7 @@ pub trait AsRequestStatus<Marker> {
 /// This also records cancellations that occur when a timeout is applied to the
 /// request future.
 #[pin_project(PinnedDrop)]
-pub struct RequestMetricsWrapper<F, Marker>
+pub struct RequestMetricsWrapper<'a, F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
@@ -88,6 +96,7 @@ where
     #[pin]
     tracked: F,
     action: ActionLabel,
+    bucket: &'a str,
     start: Option<Instant>,
     uploaded_bytes: Option<u64>,
     status: RequestStatus,
@@ -95,7 +104,7 @@ where
 }
 
 #[pinned_drop]
-impl<F, Marker> PinnedDrop for RequestMetricsWrapper<F, Marker>
+impl<F, Marker> PinnedDrop for RequestMetricsWrapper<'_, F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
@@ -106,7 +115,7 @@ where
             RequestStatus::Done => return,
             RequestStatus::Ready(s) => s.as_str(),
         };
-        let label_values = [self.action.as_str(), status];
+        let label_values = [self.action.as_str(), status, self.bucket];
         STORAGE_METRICS
             .object_storage_requests_total
             .with_label_values(label_values)
@@ -126,7 +135,7 @@ where
     }
 }
 
-impl<F, Marker> Future for RequestMetricsWrapper<F, Marker>
+impl<F, Marker> Future for RequestMetricsWrapper<'_, F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
@@ -142,25 +151,33 @@ where
     }
 }
 
+/// `bucket` is the bucket (or container) the request targets: request metrics are labelled with
+/// it, as object stores usually rate limit requests per bucket.
 pub trait RequestMetricsWrapperExt<F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
 {
-    fn with_count_metric(self, action: ActionLabel) -> RequestMetricsWrapper<F, Marker>;
+    fn with_count_metric(
+        self,
+        action: ActionLabel,
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker>;
 
     /// For download requests, this should wrap the initial request future to
     /// track time to first byte (TTFB).
     fn with_count_and_duration_metrics(
         self,
         action: ActionLabel,
-    ) -> RequestMetricsWrapper<F, Marker>;
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker>;
 
     fn with_count_and_upload_metrics(
         self,
         action: ActionLabel,
+        bucket: &str,
         bytes: u64,
-    ) -> RequestMetricsWrapper<F, Marker>;
+    ) -> RequestMetricsWrapper<'_, F, Marker>;
 }
 
 impl<F, Marker> RequestMetricsWrapperExt<F, Marker> for F
@@ -168,10 +185,15 @@ where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
 {
-    fn with_count_metric(self, action: ActionLabel) -> RequestMetricsWrapper<F, Marker> {
+    fn with_count_metric(
+        self,
+        action: ActionLabel,
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker> {
         RequestMetricsWrapper {
             tracked: self,
             action,
+            bucket,
             status: RequestStatus::Pending,
             start: None,
             uploaded_bytes: None,
@@ -182,10 +204,12 @@ where
     fn with_count_and_duration_metrics(
         self,
         action: ActionLabel,
-    ) -> RequestMetricsWrapper<F, Marker> {
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker> {
         RequestMetricsWrapper {
             tracked: self,
             action,
+            bucket,
             status: RequestStatus::Pending,
             start: Some(Instant::now()),
             uploaded_bytes: None,
@@ -196,16 +220,101 @@ where
     fn with_count_and_upload_metrics(
         self,
         action: ActionLabel,
+        bucket: &str,
         bytes: u64,
-    ) -> RequestMetricsWrapper<F, Marker> {
+    ) -> RequestMetricsWrapper<'_, F, Marker> {
         RequestMetricsWrapper {
             tracked: self,
             action,
+            bucket,
             status: RequestStatus::Pending,
             start: None,
             uploaded_bytes: Some(bytes),
             _marker: PhantomData,
         }
+    }
+}
+
+/// Runs an object store operation with [`aws_retry`] and records the number of attempts it took,
+/// by outcome: `success`, `exhausted` (every attempt failed with a retryable error),
+/// `permanent_error`, `cancelled_during_attempt` or `cancelled_during_backoff`.
+///
+/// The cancellation outcomes record operations dropped by the caller, for instance on a timeout.
+/// A cancellation while waiting between two attempts is not visible in the request metrics.
+pub(crate) async fn aws_retry_with_metrics<U, E, Fut>(
+    retry_params: &RetryParams,
+    action: ActionLabel,
+    f: impl Fn() -> Fut,
+) -> Result<U, E>
+where
+    Fut: Future<Output = Result<U, E>>,
+    E: AwsRetryable + Debug + 'static,
+{
+    let mut attempts_tracker = AttemptsTracker::new(action);
+    let result = aws_retry(retry_params, || {
+        let attempts_tracker = &attempts_tracker;
+        let attempt = f();
+        async move {
+            attempts_tracker.start_attempt();
+            let result = attempt.await;
+            attempts_tracker.end_attempt();
+            result
+        }
+    })
+    .await;
+    attempts_tracker.outcome_opt = Some(match &result {
+        Ok(_) => "success",
+        Err(error) if error.is_retryable() => "exhausted",
+        Err(_) => "permanent_error",
+    });
+    result
+}
+
+/// Counts the attempts of an operation, and records them when dropped.
+struct AttemptsTracker {
+    action: ActionLabel,
+    num_attempts: AtomicUsize,
+    attempt_in_progress: AtomicBool,
+    // `None` until the operation completes: dropping the tracker before that means the operation
+    // was cancelled.
+    outcome_opt: Option<&'static str>,
+}
+
+impl AttemptsTracker {
+    fn new(action: ActionLabel) -> Self {
+        Self {
+            action,
+            num_attempts: AtomicUsize::new(0),
+            attempt_in_progress: AtomicBool::new(false),
+            outcome_opt: None,
+        }
+    }
+
+    fn start_attempt(&self) {
+        self.num_attempts.fetch_add(1, Ordering::Relaxed);
+        self.attempt_in_progress.store(true, Ordering::Relaxed);
+    }
+
+    fn end_attempt(&self) {
+        self.attempt_in_progress.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Drop for AttemptsTracker {
+    fn drop(&mut self) {
+        let num_attempts = *self.num_attempts.get_mut();
+        if num_attempts == 0 {
+            return;
+        }
+        let outcome = match self.outcome_opt {
+            Some(outcome) => outcome,
+            None if *self.attempt_in_progress.get_mut() => "cancelled_during_attempt",
+            None => "cancelled_during_backoff",
+        };
+        STORAGE_METRICS
+            .object_storage_operation_attempts
+            .with_label_values([self.action.as_str(), outcome])
+            .observe(num_attempts as f64);
     }
 }
 
@@ -276,6 +385,81 @@ pub enum DownloadStatus {
     Failed(&'static str),
 }
 
+/// Whether a download covers a whole object or just a byte range of it.
+///
+/// The two have size distributions that differ by orders of magnitude (a slice is
+/// typically a few kilobytes, a whole split is megabytes), so they are recorded
+/// under distinct label values. Aggregated together, the downloaded volume per
+/// request describes neither.
+#[derive(Clone, Copy, Debug)]
+pub enum DownloadKind {
+    /// The whole object, as fetched by `get_all` and `copy_to`.
+    Object,
+    /// A byte range of the object, as fetched by `get_slice`.
+    Slice,
+}
+
+impl DownloadKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DownloadKind::Object => "object",
+            DownloadKind::Slice => "slice",
+        }
+    }
+}
+
+/// Records the volume and the outcome of a single download when dropped.
+///
+/// Recording on drop (rather than on completion) is what makes a download that
+/// fails or is cancelled midway still report the bytes that did transit, which is
+/// the whole point of tracking downloads separately: unlike other requests, they
+/// can fail long after a successful response header.
+pub struct DownloadMetricsGuard {
+    downloaded_bytes: u64,
+    kind: DownloadKind,
+    status: DownloadStatus,
+}
+
+impl DownloadMetricsGuard {
+    pub fn new(kind: DownloadKind) -> DownloadMetricsGuard {
+        DownloadMetricsGuard {
+            downloaded_bytes: 0,
+            kind,
+            status: DownloadStatus::InProgress,
+        }
+    }
+
+    pub fn record_bytes(&mut self, num_bytes: u64) {
+        self.downloaded_bytes += num_bytes;
+    }
+
+    pub fn set_status(&mut self, status: DownloadStatus) {
+        self.status = status;
+    }
+}
+
+impl Drop for DownloadMetricsGuard {
+    fn drop(&mut self) {
+        let error_opt = match &self.status {
+            DownloadStatus::InProgress => Some("cancelled"),
+            DownloadStatus::Failed(e) => Some(*e),
+            DownloadStatus::Done => None,
+        };
+
+        STORAGE_METRICS
+            .object_storage_download_num_bytes
+            .with_label_values([error_opt.unwrap_or("success"), self.kind.as_str()])
+            .inc_by(self.downloaded_bytes);
+
+        if let Some(error) = error_opt {
+            STORAGE_METRICS
+                .object_storage_download_errors
+                .with_label_values([error, self.kind.as_str()])
+                .inc();
+        }
+    }
+}
+
 /// Track io errors during downloads.
 ///
 /// Downloads are a bit different from other requests because the request might
@@ -289,7 +473,7 @@ where
 {
     #[pin]
     tracked: copy_buf::CopyBuf<'a, R, W>,
-    status: DownloadStatus,
+    metrics_guard: DownloadMetricsGuard,
 }
 
 #[pinned_drop]
@@ -299,23 +483,11 @@ where
     W: AsyncWrite + Unpin + ?Sized,
 {
     fn drop(self: Pin<&mut Self>) {
-        let error_opt = match &self.status {
-            DownloadStatus::InProgress => Some("cancelled"),
-            DownloadStatus::Failed(e) => Some(*e),
-            DownloadStatus::Done => None,
-        };
-
-        STORAGE_METRICS
-            .object_storage_download_num_bytes
-            .with_label_values([error_opt.unwrap_or("success")])
-            .inc_by(self.tracked.amt);
-
-        if let Some(error) = error_opt {
-            STORAGE_METRICS
-                .object_storage_download_errors
-                .with_label_values([error])
-                .inc();
-        }
+        // The guard is dropped right after this returns, and that is what actually
+        // records the metrics. Here we only hand it the byte count, which lives in
+        // the copy itself.
+        let this = self.project();
+        this.metrics_guard.downloaded_bytes = this.tracked.amt;
     }
 }
 
@@ -329,7 +501,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let response = ready!(this.tracked.poll(cx));
-        *this.status = match &response {
+        this.metrics_guard.status = match &response {
             Ok(_) => DownloadStatus::Done,
             Err(e) => DownloadStatus::Failed(io_error_as_label(e.kind())),
         };
@@ -340,6 +512,7 @@ where
 pub async fn copy_with_download_metrics<'a, R, W>(
     reader: &'a mut R,
     writer: &'a mut W,
+    kind: DownloadKind,
 ) -> io::Result<u64>
 where
     R: AsyncBufRead + Unpin + ?Sized,
@@ -351,9 +524,101 @@ where
             writer,
             amt: 0,
         },
-        status: DownloadStatus::InProgress,
+        metrics_guard: DownloadMetricsGuard::new(kind),
     }
     .await
+}
+
+/// Downloads a response body into memory, recording the same metrics as
+/// [`copy_with_download_metrics`].
+///
+/// The body segments are kept as they arrive and only coalesced at the very end.
+/// When the whole body arrived as a single segment -- the common case for the small
+/// byte ranges fetched during warmup -- the payload is handed over without ever
+/// being copied. Going through an intermediate writer instead would copy every byte
+/// into a freshly allocated buffer, which is expensive well beyond the copy itself:
+/// the pages of that buffer are touched for the first time, so each one costs a
+/// minor page fault and a kernel page zeroing.
+///
+/// When `assembly_thread_pool_opt` is set, assembling a body that arrived in several
+/// segments and reaches [`ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES`] runs on that pool instead
+/// of the tokio worker that polls this future. Copying several megabytes and faulting in
+/// the pages of the destination buffer takes milliseconds, which is too long to hold a
+/// tokio worker on a node whose runtime is also serving other queries.
+pub async fn collect_with_download_metrics(
+    mut byte_stream: ByteStream,
+    kind: DownloadKind,
+    assembly_thread_pool_opt: Option<&ThreadPoolWithPriority>,
+) -> io::Result<Bytes> {
+    // Dropping this future before the body is exhausted drops the guard, which
+    // records the partial download as cancelled.
+    let mut metrics_guard = DownloadMetricsGuard::new(kind);
+    let mut segments: Vec<Bytes> = Vec::new();
+    let mut total_num_bytes: usize = 0;
+    while let Some(segment_res) = byte_stream.next().await {
+        let segment = segment_res.map_err(|error| {
+            let error = io::Error::other(error);
+            metrics_guard.set_status(DownloadStatus::Failed(io_error_as_label(error.kind())));
+            error
+        })?;
+        metrics_guard.record_bytes(segment.len() as u64);
+        total_num_bytes += segment.len();
+        segments.push(segment);
+    }
+    metrics_guard.set_status(DownloadStatus::Done);
+    coalesce_segments(segments, total_num_bytes, assembly_thread_pool_opt).await
+}
+
+/// Bodies at least this large that need an actual copy are assembled on the assembly thread pool
+/// when one is configured. Below it, the copy is short enough to run inline.
+///
+/// Configured with `QW_S3_ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES` (default: 5MiB).
+pub(crate) static ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES: Lazy<usize> = Lazy::new(|| {
+    quickwit_common::get_from_env(
+        "QW_S3_ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES",
+        5 * 1024 * 1024,
+        false,
+    )
+});
+
+/// Returns a single [`Bytes`] covering `segments`. Zero-copy when there is at most one segment;
+/// otherwise a single allocation concatenates them.
+///
+/// The copy runs on `thread_pool_opt` when one is given and the body is at least
+/// [`ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES`]; otherwise it runs inline. It is scheduled with a high
+/// priority: the copy is short and the download it completes is awaited by an ongoing request.
+/// Dropping the returned future while the copy is still queued cancels it.
+pub(crate) async fn coalesce_segments(
+    mut segments: Vec<Bytes>,
+    total_num_bytes: usize,
+    thread_pool_opt: Option<&ThreadPoolWithPriority>,
+) -> io::Result<Bytes> {
+    match segments.len() {
+        0 => return Ok(Bytes::new()),
+        1 => return Ok(segments.remove(0)),
+        _ => {}
+    }
+    match thread_pool_opt {
+        Some(thread_pool) if total_num_bytes >= *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES => {
+            thread_pool
+                .run_cpu_intensive_with_priority(
+                    Priority::High,
+                    move || concat_segments(segments, total_num_bytes),
+                    "storage_assembly",
+                )
+                .await
+                .map_err(io::Error::other)
+        }
+        _ => Ok(concat_segments(segments, total_num_bytes)),
+    }
+}
+
+fn concat_segments(segments: Vec<Bytes>, total_num_bytes: usize) -> Bytes {
+    let mut out = BytesMut::with_capacity(total_num_bytes);
+    for segment in segments {
+        out.extend_from_slice(&segment);
+    }
+    out.freeze()
 }
 
 /// This is a fork of `tokio::io::copy_buf` that enables tracking the number of
@@ -457,10 +722,10 @@ pub mod opendal_helpers {
     use super::*;
 
     /// Records a request occurrence for this action with unknown status.
-    pub fn record_request(action: ActionLabel) {
+    pub fn record_request(action: ActionLabel, bucket: &str) {
         STORAGE_METRICS
             .object_storage_requests_total
-            .with_label_values([action.as_str(), "unknown"])
+            .with_label_values([action.as_str(), "unknown", bucket])
             .inc();
     }
 
@@ -473,19 +738,257 @@ pub mod opendal_helpers {
     }
 
     /// Records an download volume for this action with unknown status.
-    pub fn record_download(bytes: u64) {
+    pub fn record_download(bytes: u64, kind: DownloadKind) {
         STORAGE_METRICS
             .object_storage_download_num_bytes
-            .with_label_values(["unknown"])
+            .with_label_values(["unknown", kind.as_str()])
             .inc_by(bytes);
     }
 
     /// Records a request occurrence for this action with unknown status.
-    pub fn record_request_with_timer(action: ActionLabel) -> HistogramTimer {
-        record_request(action);
+    pub fn record_request_with_timer(action: ActionLabel, bucket: &str) -> HistogramTimer {
+        record_request(action, bucket);
         STORAGE_METRICS
             .object_storage_request_duration
-            .with_label_values([action.as_str(), "unknown"])
+            .with_label_values([action.as_str(), "unknown", bucket])
             .start_timer()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use quickwit_common::metrics::Histogram;
+
+    use super::*;
+
+    #[derive(Debug)]
+    enum TestError {
+        Retryable,
+        Permanent,
+    }
+
+    impl AwsRetryable for TestError {
+        fn is_retryable(&self) -> bool {
+            matches!(self, TestError::Retryable)
+        }
+    }
+
+    // No other test runs an operation labelled `list_objects`, and each test below checks a
+    // distinct outcome, so they don't interfere with each other.
+    fn list_objects_attempts(outcome: &str) -> Histogram {
+        STORAGE_METRICS
+            .object_storage_operation_attempts
+            .with_label_values(["list_objects", outcome])
+    }
+
+    /// Runs `operation` and returns the number of operations and attempts recorded for `outcome`.
+    async fn record_operation(outcome: &str, operation: impl Future<Output = ()>) -> (u64, f64) {
+        let histogram = list_objects_attempts(outcome);
+        let (count_before, sum_before) = (histogram.get_sample_count(), histogram.get_sample_sum());
+        operation.await;
+        (
+            histogram.get_sample_count() - count_before,
+            histogram.get_sample_sum() - sum_before,
+        )
+    }
+
+    /// Fails with `error` on the first `num_failures` attempts, then succeeds.
+    fn fail_then_succeed(
+        num_failures: usize,
+        error: fn() -> TestError,
+    ) -> impl Fn() -> futures::future::Ready<Result<(), TestError>> {
+        let num_calls = Arc::new(AtomicUsize::new(0));
+        move || {
+            let num_previous_calls = num_calls.fetch_add(1, Ordering::Relaxed);
+            futures::future::ready(if num_previous_calls < num_failures {
+                Err(error())
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_success_after_retries() {
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("success", async {
+            aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(2, || TestError::Retryable),
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        assert_eq!(recorded, (1, 3.0));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_exhausted() {
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("exhausted", async {
+            aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(usize::MAX, || TestError::Retryable),
+            )
+            .await
+            .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, retry_params.max_attempts as f64));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_permanent_error() {
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("permanent_error", async {
+            aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(usize::MAX, || TestError::Permanent),
+            )
+            .await
+            .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, 1.0));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_cancelled_during_backoff() {
+        tokio::time::pause();
+        let retry_params = RetryParams {
+            base_delay: Duration::from_secs(10),
+            max_delay: Duration::from_secs(10),
+            max_attempts: 3,
+        };
+        let recorded = record_operation("cancelled_during_backoff", async {
+            let operation = aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(usize::MAX, || TestError::Retryable),
+            );
+            // The first attempt fails at once, and the timeout elapses during the backoff.
+            tokio::time::timeout(Duration::from_secs(1), operation)
+                .await
+                .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, 1.0));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_cancelled_during_attempt() {
+        tokio::time::pause();
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("cancelled_during_attempt", async {
+            let operation = aws_retry_with_metrics(&retry_params, ActionLabel::ListObjects, || {
+                futures::future::pending::<Result<(), TestError>>()
+            });
+            tokio::time::timeout(Duration::from_secs(1), operation)
+                .await
+                .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, 1.0));
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_segments_does_not_copy_a_single_segment() {
+        let segment = Bytes::from_static(b"warmup payload");
+        let segment_ptr = segment.as_ptr();
+        let coalesced = coalesce_segments(vec![segment], 14, None).await.unwrap();
+        assert_eq!(&coalesced[..], b"warmup payload");
+        // This is the whole point of `coalesce_segments`: a body that arrived as a
+        // single segment is handed over without copying.
+        assert_eq!(coalesced.as_ptr(), segment_ptr);
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_segments_concatenates_several_segments() {
+        let segments = vec![
+            Bytes::from_static(b"warmup"),
+            Bytes::from_static(b" "),
+            Bytes::from_static(b"payload"),
+        ];
+        let coalesced = coalesce_segments(segments, 14, None).await.unwrap();
+        assert_eq!(&coalesced[..], b"warmup payload");
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_segments_empty_body() {
+        assert!(
+            coalesce_segments(Vec::new(), 0, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_segments_large_body_uses_thread_pool() {
+        let threshold = *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES;
+        let thread_pool = ThreadPoolWithPriority::new("assembly_test", Some(1));
+        // Occupy the only thread of the pool.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking_task = thread_pool.run_cpu_intensive(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+
+        let segment_len = threshold / 2 + 1;
+        let segments = vec![
+            Bytes::from(vec![1u8; segment_len]),
+            Bytes::from(vec![2u8; segment_len]),
+        ];
+        let total_num_bytes = 2 * segment_len;
+        let mut coalesce_future = Box::pin(coalesce_segments(
+            segments,
+            total_num_bytes,
+            Some(&thread_pool),
+        ));
+        // Assembled inline, the body would be ready on the first poll. On the pool, it waits for
+        // the thread to be released.
+        assert!(futures::poll!(&mut coalesce_future).is_pending());
+
+        release_tx.send(()).unwrap();
+        blocking_task.await.unwrap();
+        let coalesced = coalesce_future.await.unwrap();
+        assert_eq!(coalesced.len(), total_num_bytes);
+        assert!(coalesced[..segment_len].iter().all(|&byte| byte == 1));
+        assert!(coalesced[segment_len..].iter().all(|&byte| byte == 2));
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_segments_single_large_segment_is_zero_copy() {
+        let threshold = *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES;
+        let thread_pool = ThreadPoolWithPriority::new("assembly_test", Some(1));
+        let segment = Bytes::from(vec![7u8; threshold + 1]);
+        let segment_ptr = segment.as_ptr();
+        let coalesced = coalesce_segments(vec![segment], threshold + 1, Some(&thread_pool))
+            .await
+            .unwrap();
+        assert_eq!(coalesced.as_ptr(), segment_ptr);
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_segments_large_body_without_thread_pool() {
+        let threshold = *ASSEMBLY_OFFLOAD_THRESHOLD_NUM_BYTES;
+        let segments = vec![
+            Bytes::from(vec![1u8; threshold]),
+            Bytes::from_static(b"tail"),
+        ];
+        let coalesced = coalesce_segments(segments, threshold + 4, None)
+            .await
+            .unwrap();
+        assert_eq!(coalesced.len(), threshold + 4);
+        assert_eq!(&coalesced[threshold..], b"tail");
     }
 }

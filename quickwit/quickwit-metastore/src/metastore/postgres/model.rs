@@ -90,6 +90,7 @@ pub enum Splits {
     IndexUid,
     NodeId,
     DeleteOpstamp,
+    SoftDeletedDocIds,
 }
 
 pub(super) struct ToTimestampFunc;
@@ -169,6 +170,14 @@ impl TryInto<Split> for PgSplit {
         // `create_timestamp` and `delete_opstamp` are duplicated in `SplitMetadata` and needs to be
         // overridden with the "true" value stored in a column.
         split_metadata.create_timestamp = self.create_timestamp.assume_utc().unix_timestamp();
+        // The secondary time range columns are what split listings filter on, and they can be
+        // set without the JSON, for splits whose secondary time range was backfilled.
+        if let (Some(start), Some(end)) = (
+            self.secondary_time_range_start,
+            self.secondary_time_range_end,
+        ) {
+            split_metadata.secondary_time_range = Some(start..=end);
+        }
         let split_state = self.split_state()?;
         let update_timestamp = self.update_timestamp.assume_utc().unix_timestamp();
         let publish_timestamp = self

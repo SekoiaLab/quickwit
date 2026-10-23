@@ -17,6 +17,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use once_cell::sync::Lazy;
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::{Protocol, Uri};
 use quickwit_config::{StorageBackend, StorageConfigs};
 
@@ -86,12 +87,34 @@ impl StorageResolver {
 
     /// Creates and returns a [`StorageResolver`].
     pub fn configured(storage_configs: &StorageConfigs) -> Self {
+        Self::configured_with_options(storage_configs, None)
+    }
+
+    /// Same as [`StorageResolver::configured`], but S3 storages assemble large multi-segment
+    /// downloads on `s3_assembly_thread_pool` instead of the tokio runtime. This is a property
+    /// of the node building the resolver, not of the storage configs: searcher-only nodes hand
+    /// over their search thread pool.
+    pub fn configured_with_s3_assembly_thread_pool(
+        storage_configs: &StorageConfigs,
+        s3_assembly_thread_pool: ThreadPoolWithPriority,
+    ) -> Self {
+        Self::configured_with_options(storage_configs, Some(s3_assembly_thread_pool))
+    }
+
+    fn configured_with_options(
+        storage_configs: &StorageConfigs,
+        s3_assembly_thread_pool_opt: Option<ThreadPoolWithPriority>,
+    ) -> Self {
+        let mut s3_storage_factory = S3CompatibleObjectStorageFactory::new(
+            storage_configs.find_s3().cloned().unwrap_or_default(),
+        );
+        if let Some(thread_pool) = s3_assembly_thread_pool_opt {
+            s3_storage_factory = s3_storage_factory.with_assembly_thread_pool(thread_pool);
+        }
         let mut builder = StorageResolver::builder()
             .register(LocalFileStorageFactory)
             .register(RamStorageFactory::default())
-            .register(S3CompatibleObjectStorageFactory::new(
-                storage_configs.find_s3().cloned().unwrap_or_default(),
-            ));
+            .register(s3_storage_factory);
         #[cfg(feature = "azure")]
         {
             builder = builder.register(AzureBlobStorageFactory::new(

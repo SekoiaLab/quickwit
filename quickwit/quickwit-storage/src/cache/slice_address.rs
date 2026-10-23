@@ -59,6 +59,11 @@ impl<'a> Borrow<dyn SliceAddressKey + 'a> for SliceAddress {
         self
     }
 }
+impl<'a> Borrow<dyn SliceAddressKey + 'a> for std::sync::Arc<SliceAddress> {
+    fn borrow(&self) -> &(dyn SliceAddressKey + 'a) {
+        &**self
+    }
+}
 impl PartialEq for dyn SliceAddressKey + '_ {
     fn eq(&self, other: &Self) -> bool {
         self.key().eq(&other.key())

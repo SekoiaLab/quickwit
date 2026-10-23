@@ -24,7 +24,8 @@ use tokio::io::{AsyncRead, AsyncWriteExt as TokioAsyncWriteExt};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use crate::metrics::object_storage_get_slice_in_flight_guards;
-use crate::metrics_wrappers::{ActionLabel, opendal_helpers};
+use crate::metrics_wrappers::{ActionLabel, DownloadKind, opendal_helpers};
+use crate::stable_deref_bytes::into_owned_bytes;
 use crate::storage::SendableAsync;
 use crate::{
     BulkDeleteError, MultiPartPolicy, OwnedBytes, PutPayload, Storage, StorageError,
@@ -34,7 +35,7 @@ use crate::{
 /// OpenDAL based storage implementation.
 /// # TODO
 ///
-/// - Implement REQUEST_SEMAPHORE to control the concurrency.
+/// - Implement the GetObject connection limit (`QW_S3_MAX_GET_OBJECT_CONNECTIONS`).
 /// - Implement STORAGE_METRICS for metrics.
 pub struct OpendalStorage {
     uri: Uri,
@@ -81,7 +82,7 @@ impl Storage for OpendalStorage {
 
     async fn put(&self, path: &Path, payload: Box<dyn PutPayload>) -> StorageResult<()> {
         // we record one put even though it may involve multiple parts
-        opendal_helpers::record_request(ActionLabel::PutObject);
+        opendal_helpers::record_request(ActionLabel::PutObject, &self.op.info().name());
         let path = path.as_os_str().to_string_lossy();
         let mut payload_reader = payload.byte_stream().await?.into_async_read();
 
@@ -108,7 +109,7 @@ impl Storage for OpendalStorage {
             .await?
             .compat();
         let num_bytes_copied = tokio::io::copy(&mut storage_reader, output).await?;
-        opendal_helpers::record_download(num_bytes_copied);
+        opendal_helpers::record_download(num_bytes_copied, DownloadKind::Object);
         output.flush().await?;
         Ok(())
     }
@@ -120,9 +121,12 @@ impl Storage for OpendalStorage {
         // Unlike other object store implementations, in flight requests are
         // recorded before issuing the query to the object store.
         let _inflight_guards = object_storage_get_slice_in_flight_guards(size);
-        opendal_helpers::record_request(ActionLabel::GetObject);
-        let storage_content = self.op.read_with(&path).range(range).await?.to_vec();
-        Ok(OwnedBytes::new(storage_content))
+        opendal_helpers::record_request(ActionLabel::GetObject, &self.op.info().name());
+        // `Buffer::to_bytes` is zero-copy when the underlying buffer is contiguous, and coalesces
+        // into a single `Bytes` otherwise — avoiding the extra `Vec<u8>` round-trip `to_vec` would
+        // perform.
+        let storage_content = self.op.read_with(&path).range(range).await?.to_bytes();
+        Ok(into_owned_bytes(storage_content))
     }
 
     async fn get_slice_stream(
@@ -144,13 +148,16 @@ impl Storage for OpendalStorage {
 
     async fn get_all(&self, path: &Path) -> StorageResult<OwnedBytes> {
         let path = path.as_os_str().to_string_lossy();
-        let storage_content = self.op.read(&path).await?.to_vec();
-        Ok(OwnedBytes::new(storage_content))
+        let storage_content = self.op.read(&path).await?.to_bytes();
+        Ok(into_owned_bytes(storage_content))
     }
 
     async fn delete(&self, path: &Path) -> StorageResult<()> {
         let path = path.as_os_str().to_string_lossy();
-        let _timer = opendal_helpers::record_request_with_timer(ActionLabel::DeleteObject);
+        let _timer = opendal_helpers::record_request_with_timer(
+            ActionLabel::DeleteObject,
+            &self.op.info().name(),
+        );
         self.op.delete(&path).await?;
         Ok(())
     }
@@ -164,8 +171,10 @@ impl Storage for OpendalStorage {
             if storage_info.name().starts_with("sample-bucket") && storage_info.scheme() == "gcs" {
                 let mut bulk_error = BulkDeleteError::default();
                 for (index, path) in paths.iter().enumerate() {
-                    let _timer =
-                        opendal_helpers::record_request_with_timer(ActionLabel::DeleteObjects);
+                    let _timer = opendal_helpers::record_request_with_timer(
+                        ActionLabel::DeleteObjects,
+                        &storage_info.name(),
+                    );
                     let result = self.op.delete(&path.as_os_str().to_string_lossy()).await;
                     if let Err(err) = result {
                         let storage_error_kind = err.kind();
