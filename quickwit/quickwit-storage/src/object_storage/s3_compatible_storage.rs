@@ -146,6 +146,19 @@ impl<T: AsyncRead + Send + Unpin> AsyncRead for S3AsyncRead<T> {
     }
 }
 
+/// Classifies an SDK error for the retry loop: transient or permanent.
+fn into_retry<E>(sdk_error: SdkError<E>) -> Retry<StorageError>
+where
+    SdkError<E>: AwsRetryable,
+    StorageError: From<SdkError<E>>,
+{
+    if sdk_error.is_retryable() {
+        Retry::Transient(StorageError::from(sdk_error))
+    } else {
+        Retry::Permanent(StorageError::from(sdk_error))
+    }
+}
+
 /// S3-compatible object storage implementation.
 pub struct S3CompatibleObjectStorage {
     s3_client: S3Client,
@@ -405,13 +418,7 @@ impl S3CompatibleObjectStorage {
             .send()
             .with_count_and_upload_metrics(ActionLabel::PutObject, bucket, len)
             .await
-            .map_err(|sdk_error| {
-                if sdk_error.is_retryable() {
-                    Retry::Transient(StorageError::from(sdk_error))
-                } else {
-                    Retry::Permanent(StorageError::from(sdk_error))
-                }
-            })?;
+            .map_err(into_retry)?;
         Ok(())
     }
 
@@ -580,13 +587,7 @@ impl S3CompatibleObjectStorage {
             .send()
             .with_count_and_upload_metrics(ActionLabel::UploadPart, &self.bucket, part.len())
             .await
-            .map_err(|s3_err| {
-                if s3_err.is_retryable() {
-                    Retry::Transient(StorageError::from(s3_err))
-                } else {
-                    Retry::Permanent(StorageError::from(s3_err))
-                }
-            })?;
+            .map_err(into_retry)?;
 
         let completed_part = CompletedPart::builder()
             .set_e_tag(upload_part_output.e_tag)
@@ -742,13 +743,7 @@ impl S3CompatibleObjectStorage {
                 let (get_object_output, _connection_permit) = self
                     .get_object(path, range_opt.clone())
                     .await
-                    .map_err(|sdk_error| {
-                        if sdk_error.is_retryable() {
-                            Retry::Transient(StorageError::from(sdk_error))
-                        } else {
-                            Retry::Permanent(StorageError::from(sdk_error))
-                        }
-                    })?;
+                    .map_err(into_retry)?;
                 // only record ranged get request as being in flight
                 let _in_flight_guards = range_opt
                     .clone()
