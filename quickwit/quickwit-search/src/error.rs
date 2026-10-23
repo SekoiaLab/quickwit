@@ -170,7 +170,8 @@ impl From<serde_json::Error> for SearchError {
 
 impl From<anyhow::Error> for SearchError {
     fn from(any_error: anyhow::Error) -> Self {
-        SearchError::Internal(any_error.to_string())
+        // The alternate format keeps the whole chain of causes, not only the outermost context.
+        SearchError::Internal(format!("{any_error:#}"))
     }
 }
 
@@ -230,6 +231,21 @@ mod tests {
         let search_error = parse_grpc_error(status, "leaf_search");
         assert!(
             matches!(&search_error, SearchError::Unavailable(msg) if msg == "node is down"),
+            "unexpected error: {search_error:?}"
+        );
+    }
+
+    #[test]
+    fn test_search_error_from_anyhow_keeps_the_causes() {
+        let any_error = anyhow::anyhow!("internal timeout on get_slice")
+            .context("failed to fetch hotcache and footer for split `split-1`");
+        let search_error = SearchError::from(any_error);
+        assert!(
+            matches!(
+                &search_error,
+                SearchError::Internal(msg) if msg == "failed to fetch hotcache and footer for split \
+                    `split-1`: internal timeout on get_slice"
+            ),
             "unexpected error: {search_error:?}"
         );
     }

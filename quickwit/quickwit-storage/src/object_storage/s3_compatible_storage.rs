@@ -403,7 +403,7 @@ impl S3CompatibleObjectStorage {
         }
         req_builder
             .send()
-            .with_count_and_upload_metrics(ActionLabel::PutObject, len)
+            .with_count_and_upload_metrics(ActionLabel::PutObject, bucket, len)
             .await
             .map_err(|sdk_error| {
                 if sdk_error.is_retryable() {
@@ -456,7 +456,7 @@ impl S3CompatibleObjectStorage {
             }
             req_builder
                 .send()
-                .with_count_metric(ActionLabel::CreateMultipartUpload)
+                .with_count_metric(ActionLabel::CreateMultipartUpload, &self.bucket)
                 .await
         })
         .await?
@@ -574,7 +574,7 @@ impl S3CompatibleObjectStorage {
         }
         let upload_part_output = req_builder
             .send()
-            .with_count_and_upload_metrics(ActionLabel::UploadPart, part.len())
+            .with_count_and_upload_metrics(ActionLabel::UploadPart, &self.bucket, part.len())
             .await
             .map_err(|s3_err| {
                 if s3_err.is_retryable() {
@@ -654,7 +654,7 @@ impl S3CompatibleObjectStorage {
                 .multipart_upload(completed_upload.clone())
                 .upload_id(upload_id)
                 .send()
-                .with_count_metric(ActionLabel::CompleteMultipartUpload)
+                .with_count_metric(ActionLabel::CompleteMultipartUpload, &self.bucket)
                 .await
         })
         .await?;
@@ -669,7 +669,7 @@ impl S3CompatibleObjectStorage {
                 .key(key)
                 .upload_id(upload_id)
                 .send()
-                .with_count_metric(ActionLabel::AbortMultipartUpload)
+                .with_count_metric(ActionLabel::AbortMultipartUpload, &self.bucket)
                 .await
         })
         .await?;
@@ -708,7 +708,7 @@ impl S3CompatibleObjectStorage {
         let connection_permit = acquire_get_object_connection_permit().await;
         let get_object_output = req_builder
             .send()
-            .with_count_and_duration_metrics(ActionLabel::GetObject)
+            .with_count_and_duration_metrics(ActionLabel::GetObject, &self.bucket)
             .await?;
         Ok((get_object_output, connection_permit))
     }
@@ -822,7 +822,7 @@ impl S3CompatibleObjectStorage {
                         .bucket(self.bucket.clone())
                         .delete(delete.clone())
                         .send()
-                        .with_count_and_duration_metrics(ActionLabel::DeleteObjects)
+                        .with_count_and_duration_metrics(ActionLabel::DeleteObjects, &self.bucket)
                         .await
                 })
                 .await
@@ -893,7 +893,7 @@ impl Storage for S3CompatibleObjectStorage {
             .bucket(self.bucket.clone())
             .max_keys(1)
             .send()
-            .with_count_metric(ActionLabel::ListObjects)
+            .with_count_metric(ActionLabel::ListObjects, &self.bucket)
             .await?;
         Ok(())
     }
@@ -936,7 +936,7 @@ impl Storage for S3CompatibleObjectStorage {
                 .bucket(&bucket)
                 .key(&key)
                 .send()
-                .with_count_and_duration_metrics(ActionLabel::DeleteObject)
+                .with_count_and_duration_metrics(ActionLabel::DeleteObject, &bucket)
                 .await
         })
         .await;
@@ -1024,7 +1024,7 @@ impl Storage for S3CompatibleObjectStorage {
             }
             req_builder
                 .send()
-                .with_count_metric(ActionLabel::HeadObject)
+                .with_count_metric(ActionLabel::HeadObject, &bucket)
                 .await
         })
         .await?;

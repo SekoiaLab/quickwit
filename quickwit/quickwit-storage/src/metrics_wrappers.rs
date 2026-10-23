@@ -84,7 +84,7 @@ pub trait AsRequestStatus<Marker> {
 /// This also records cancellations that occur when a timeout is applied to the
 /// request future.
 #[pin_project(PinnedDrop)]
-pub struct RequestMetricsWrapper<F, Marker>
+pub struct RequestMetricsWrapper<'a, F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
@@ -92,6 +92,7 @@ where
     #[pin]
     tracked: F,
     action: ActionLabel,
+    bucket: &'a str,
     start: Option<Instant>,
     uploaded_bytes: Option<u64>,
     status: RequestStatus,
@@ -99,7 +100,7 @@ where
 }
 
 #[pinned_drop]
-impl<F, Marker> PinnedDrop for RequestMetricsWrapper<F, Marker>
+impl<F, Marker> PinnedDrop for RequestMetricsWrapper<'_, F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
@@ -110,7 +111,7 @@ where
             RequestStatus::Done => return,
             RequestStatus::Ready(s) => s.as_str(),
         };
-        let label_values = [self.action.as_str(), status];
+        let label_values = [self.action.as_str(), status, self.bucket];
         STORAGE_METRICS
             .object_storage_requests_total
             .with_label_values(label_values)
@@ -130,7 +131,7 @@ where
     }
 }
 
-impl<F, Marker> Future for RequestMetricsWrapper<F, Marker>
+impl<F, Marker> Future for RequestMetricsWrapper<'_, F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
@@ -146,25 +147,33 @@ where
     }
 }
 
+/// `bucket` is the bucket (or container) the request targets: request metrics are labelled with
+/// it, as object stores usually rate limit requests per bucket.
 pub trait RequestMetricsWrapperExt<F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
 {
-    fn with_count_metric(self, action: ActionLabel) -> RequestMetricsWrapper<F, Marker>;
+    fn with_count_metric(
+        self,
+        action: ActionLabel,
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker>;
 
     /// For download requests, this should wrap the initial request future to
     /// track time to first byte (TTFB).
     fn with_count_and_duration_metrics(
         self,
         action: ActionLabel,
-    ) -> RequestMetricsWrapper<F, Marker>;
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker>;
 
     fn with_count_and_upload_metrics(
         self,
         action: ActionLabel,
+        bucket: &str,
         bytes: u64,
-    ) -> RequestMetricsWrapper<F, Marker>;
+    ) -> RequestMetricsWrapper<'_, F, Marker>;
 }
 
 impl<F, Marker> RequestMetricsWrapperExt<F, Marker> for F
@@ -172,10 +181,15 @@ where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
 {
-    fn with_count_metric(self, action: ActionLabel) -> RequestMetricsWrapper<F, Marker> {
+    fn with_count_metric(
+        self,
+        action: ActionLabel,
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker> {
         RequestMetricsWrapper {
             tracked: self,
             action,
+            bucket,
             status: RequestStatus::Pending,
             start: None,
             uploaded_bytes: None,
@@ -186,10 +200,12 @@ where
     fn with_count_and_duration_metrics(
         self,
         action: ActionLabel,
-    ) -> RequestMetricsWrapper<F, Marker> {
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker> {
         RequestMetricsWrapper {
             tracked: self,
             action,
+            bucket,
             status: RequestStatus::Pending,
             start: Some(Instant::now()),
             uploaded_bytes: None,
@@ -200,11 +216,13 @@ where
     fn with_count_and_upload_metrics(
         self,
         action: ActionLabel,
+        bucket: &str,
         bytes: u64,
-    ) -> RequestMetricsWrapper<F, Marker> {
+    ) -> RequestMetricsWrapper<'_, F, Marker> {
         RequestMetricsWrapper {
             tracked: self,
             action,
+            bucket,
             status: RequestStatus::Pending,
             start: None,
             uploaded_bytes: Some(bytes),
@@ -617,10 +635,10 @@ pub mod opendal_helpers {
     use super::*;
 
     /// Records a request occurrence for this action with unknown status.
-    pub fn record_request(action: ActionLabel) {
+    pub fn record_request(action: ActionLabel, bucket: &str) {
         STORAGE_METRICS
             .object_storage_requests_total
-            .with_label_values([action.as_str(), "unknown"])
+            .with_label_values([action.as_str(), "unknown", bucket])
             .inc();
     }
 
@@ -641,11 +659,11 @@ pub mod opendal_helpers {
     }
 
     /// Records a request occurrence for this action with unknown status.
-    pub fn record_request_with_timer(action: ActionLabel) -> HistogramTimer {
-        record_request(action);
+    pub fn record_request_with_timer(action: ActionLabel, bucket: &str) -> HistogramTimer {
+        record_request(action, bucket);
         STORAGE_METRICS
             .object_storage_request_duration
-            .with_label_values([action.as_str(), "unknown"])
+            .with_label_values([action.as_str(), "unknown", bucket])
             .start_timer()
     }
 }

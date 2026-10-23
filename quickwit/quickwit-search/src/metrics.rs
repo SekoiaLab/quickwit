@@ -151,6 +151,7 @@ pub struct SearchMetrics {
     pub leaf_search_split_duration_secs: Histogram,
     pub leaf_search_permit_wait_duration_secs: Histogram,
     pub job_assigned_total: IntCounterVec<1>,
+    pub leaf_search_split_retries_total: IntCounterVec<1>,
     pub leaf_search_single_split_tasks_pending: IntGauge,
     pub leaf_search_single_split_tasks_ongoing: IntGauge,
     pub leaf_search_single_split_warmup_num_bytes: Histogram,
@@ -283,6 +284,14 @@ impl Default for SearchMetrics {
                 "search",
                 &[],
                 ["affinity"],
+            ),
+            leaf_search_split_retries_total: new_counter_vec(
+                "leaf_search_split_retries_total",
+                "Number of splits whose leaf search failed and was retried on another searcher, \
+                 by outcome of the retry: `rescued` or `failed` again.",
+                "search",
+                &[],
+                ["outcome"],
             ),
             searcher_local_kv_store_size_bytes: new_gauge(
                 "searcher_local_kv_store_size_bytes",

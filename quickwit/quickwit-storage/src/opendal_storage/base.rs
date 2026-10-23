@@ -82,7 +82,7 @@ impl Storage for OpendalStorage {
 
     async fn put(&self, path: &Path, payload: Box<dyn PutPayload>) -> StorageResult<()> {
         // we record one put even though it may involve multiple parts
-        opendal_helpers::record_request(ActionLabel::PutObject);
+        opendal_helpers::record_request(ActionLabel::PutObject, &self.op.info().name());
         let path = path.as_os_str().to_string_lossy();
         let mut payload_reader = payload.byte_stream().await?.into_async_read();
 
@@ -121,7 +121,7 @@ impl Storage for OpendalStorage {
         // Unlike other object store implementations, in flight requests are
         // recorded before issuing the query to the object store.
         let _inflight_guards = object_storage_get_slice_in_flight_guards(size);
-        opendal_helpers::record_request(ActionLabel::GetObject);
+        opendal_helpers::record_request(ActionLabel::GetObject, &self.op.info().name());
         // `Buffer::to_bytes` is zero-copy when the underlying buffer is contiguous, and coalesces
         // into a single `Bytes` otherwise — avoiding the extra `Vec<u8>` round-trip `to_vec` would
         // perform.
@@ -154,7 +154,10 @@ impl Storage for OpendalStorage {
 
     async fn delete(&self, path: &Path) -> StorageResult<()> {
         let path = path.as_os_str().to_string_lossy();
-        let _timer = opendal_helpers::record_request_with_timer(ActionLabel::DeleteObject);
+        let _timer = opendal_helpers::record_request_with_timer(
+            ActionLabel::DeleteObject,
+            &self.op.info().name(),
+        );
         self.op.delete(&path).await?;
         Ok(())
     }
@@ -168,8 +171,10 @@ impl Storage for OpendalStorage {
             if storage_info.name().starts_with("sample-bucket") && storage_info.scheme() == "gcs" {
                 let mut bulk_error = BulkDeleteError::default();
                 for (index, path) in paths.iter().enumerate() {
-                    let _timer =
-                        opendal_helpers::record_request_with_timer(ActionLabel::DeleteObjects);
+                    let _timer = opendal_helpers::record_request_with_timer(
+                        ActionLabel::DeleteObjects,
+                        &storage_info.name(),
+                    );
                     let result = self.op.delete(&path.as_os_str().to_string_lossy()).await;
                     if let Err(err) = result {
                         let storage_error_kind = err.kind();
