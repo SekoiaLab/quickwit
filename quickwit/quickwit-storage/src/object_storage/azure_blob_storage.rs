@@ -237,7 +237,12 @@ impl AzureBlobStorage {
                 let stream = self.container_client.blob_client(&name).get().into_stream();
                 (stream, None)
             };
-            let bytes = download_all(&mut response_stream, download_kind).await?;
+            let bytes = download_all(
+                &mut response_stream,
+                download_kind,
+                self.container_client.container_name(),
+            )
+            .await?;
             Result::<_, AzureErrorWrapper>::Ok(bytes)
         })
         .await
@@ -258,7 +263,11 @@ impl AzureBlobStorage {
                 .put_block_blob(data)
                 .hash(hash)
                 .into_future()
-                .with_count_and_upload_metrics(ActionLabel::PutObject, payload.len())
+                .with_count_and_upload_metrics(
+                    ActionLabel::PutObject,
+                    self.container_client.container_name(),
+                    payload.len(),
+                )
                 .await?;
             Result::<(), AzureErrorWrapper>::Ok(())
         })
@@ -297,6 +306,7 @@ impl AzureBlobStorage {
                             .into_future()
                             .with_count_and_upload_metrics(
                                 ActionLabel::UploadPart,
+                                self.container_client.container_name(),
                                 range.end - range.start,
                             )
                             .await?;
@@ -328,7 +338,10 @@ impl AzureBlobStorage {
         blob_client
             .put_block_list(block_list)
             .into_future()
-            .with_count_metric(ActionLabel::CompleteMultipartUpload)
+            .with_count_metric(
+                ActionLabel::CompleteMultipartUpload,
+                self.container_client.container_name(),
+            )
             .await
             .map_err(AzureErrorWrapper::from)?;
 
@@ -345,7 +358,10 @@ impl Storage for AzureBlobStorage {
             .max_results(NonZeroU32::new(1u32).expect("1 is always non-zero."))
             .into_stream()
             .next()
-            .with_count_metric(ActionLabel::ListObjects)
+            .with_count_metric(
+                ActionLabel::ListObjects,
+                self.container_client.container_name(),
+            )
             .await
         {
             let _ = first_blob_result?;
@@ -377,7 +393,10 @@ impl Storage for AzureBlobStorage {
 
         while let Some(chunk_result) = output_stream
             .next()
-            .with_count_metric(ActionLabel::GetObject)
+            .with_count_metric(
+                ActionLabel::GetObject,
+                self.container_client.container_name(),
+            )
             .await
         {
             let chunk_response = chunk_result.map_err(AzureErrorWrapper::from)?;
@@ -401,7 +420,10 @@ impl Storage for AzureBlobStorage {
             .blob_client(blob_name)
             .delete()
             .into_future()
-            .with_count_metric(ActionLabel::DeleteObject)
+            .with_count_metric(
+                ActionLabel::DeleteObject,
+                self.container_client.container_name(),
+            )
             .await
             .map_err(|err| AzureErrorWrapper::from(err).into());
         ignore_error_kind!(StorageErrorKind::NotFound, delete_res)?;
@@ -524,7 +546,10 @@ impl Storage for AzureBlobStorage {
             .blob_client(name)
             .get_properties()
             .into_future()
-            .with_count_metric(ActionLabel::HeadObject)
+            .with_count_metric(
+                ActionLabel::HeadObject,
+                self.container_client.container_name(),
+            )
             .await;
         match properties_result {
             Ok(response) => Ok(response.blob.properties.content_length),
@@ -585,6 +610,7 @@ const AZURE_STREAM_ERROR: &str = "stream";
 async fn download_all(
     chunk_stream: &mut Pageable<GetBlobResponse, AzureError>,
     download_kind: DownloadKind,
+    container_name: &str,
 ) -> Result<Bytes, AzureErrorWrapper> {
     // The guard only comes into existence once a response has arrived: a
     // failure or a cancellation before that is a request failure, recorded as
@@ -595,7 +621,7 @@ async fn download_all(
     let mut total_num_bytes: usize = 0;
     while let Some(chunk_result) = chunk_stream
         .next()
-        .with_count_metric(ActionLabel::GetObject)
+        .with_count_metric(ActionLabel::GetObject, container_name)
         .await
     {
         let chunk_response = chunk_result.map_err(|error| {

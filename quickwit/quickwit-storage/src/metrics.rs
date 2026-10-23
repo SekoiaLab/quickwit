@@ -37,8 +37,9 @@ pub struct StorageMetrics {
     pub searcher_split_cache: ComponentCacheMetrics,
     pub get_slice_timeout_successes: [IntCounter; 3],
     pub get_slice_timeout_all_timeouts: IntCounter,
-    pub object_storage_requests_total: IntCounterVec<2>,
-    pub object_storage_request_duration: HistogramVec<2>,
+    pub object_storage_requests_total: IntCounterVec<3>,
+    pub object_storage_request_duration: HistogramVec<3>,
+    pub object_storage_operation_attempts: HistogramVec<2>,
     pub object_storage_get_slice_in_flight_count: IntGauge,
     pub object_storage_get_slice_in_flight_num_bytes: IntGauge,
     pub object_storage_get_object_connections_in_use: IntGauge,
@@ -79,21 +80,32 @@ impl Default for StorageMetrics {
             get_slice_timeout_all_timeouts,
             object_storage_requests_total: new_counter_vec(
                 "object_storage_requests_total",
-                "Number of requests to the object store, by action and status. Requests are \
-                 recorded when the response headers are returned, download failures will not \
+                "Number of requests to the object store, by action, status and bucket. Requests \
+                 are recorded when the response headers are returned, download failures will not \
                  appear as errors.",
                 "storage",
                 &[],
-                ["action", "status"],
+                ["action", "status", "bucket"],
             ),
             object_storage_request_duration: new_histogram_vec(
                 "object_storage_request_duration",
-                "Time to first byte (TTFB) for object store requests, by action and status. For \
-                 download requests, excludes the time to download the response body.",
+                "Time to first byte (TTFB) for object store requests, by action, status and \
+                 bucket. For download requests, excludes the time to download the response body.",
                 "storage",
                 &[],
-                ["action", "status"],
+                ["action", "status", "bucket"],
                 vec![0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
+            ),
+            object_storage_operation_attempts: new_histogram_vec(
+                "object_storage_operation_attempts",
+                "Number of attempts per object store operation (a request and its retries), by \
+                 action and outcome: `success`, `exhausted` (every attempt failed with a \
+                 retryable error), `permanent_error`, `cancelled_during_attempt` or \
+                 `cancelled_during_backoff`.",
+                "storage",
+                &[],
+                ["action", "outcome"],
+                vec![1.0, 2.0, 3.0, 4.0, 5.0],
             ),
             object_storage_get_slice_in_flight_count: new_gauge(
                 "object_storage_get_slice_in_flight_count",

@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Debug;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
@@ -22,6 +24,8 @@ use aws_smithy_types::byte_stream::ByteStream;
 use bytes::{Bytes, BytesMut};
 use once_cell::sync::Lazy;
 use pin_project::{pin_project, pinned_drop};
+use quickwit_aws::retry::{AwsRetryable, aws_retry};
+use quickwit_common::retry::RetryParams;
 use quickwit_common::thread_pool::with_priority::{Priority, ThreadPoolWithPriority};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
@@ -84,7 +88,7 @@ pub trait AsRequestStatus<Marker> {
 /// This also records cancellations that occur when a timeout is applied to the
 /// request future.
 #[pin_project(PinnedDrop)]
-pub struct RequestMetricsWrapper<F, Marker>
+pub struct RequestMetricsWrapper<'a, F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
@@ -92,6 +96,7 @@ where
     #[pin]
     tracked: F,
     action: ActionLabel,
+    bucket: &'a str,
     start: Option<Instant>,
     uploaded_bytes: Option<u64>,
     status: RequestStatus,
@@ -99,7 +104,7 @@ where
 }
 
 #[pinned_drop]
-impl<F, Marker> PinnedDrop for RequestMetricsWrapper<F, Marker>
+impl<F, Marker> PinnedDrop for RequestMetricsWrapper<'_, F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
@@ -110,7 +115,7 @@ where
             RequestStatus::Done => return,
             RequestStatus::Ready(s) => s.as_str(),
         };
-        let label_values = [self.action.as_str(), status];
+        let label_values = [self.action.as_str(), status, self.bucket];
         STORAGE_METRICS
             .object_storage_requests_total
             .with_label_values(label_values)
@@ -130,7 +135,7 @@ where
     }
 }
 
-impl<F, Marker> Future for RequestMetricsWrapper<F, Marker>
+impl<F, Marker> Future for RequestMetricsWrapper<'_, F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
@@ -146,25 +151,33 @@ where
     }
 }
 
+/// `bucket` is the bucket (or container) the request targets: request metrics are labelled with
+/// it, as object stores usually rate limit requests per bucket.
 pub trait RequestMetricsWrapperExt<F, Marker>
 where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
 {
-    fn with_count_metric(self, action: ActionLabel) -> RequestMetricsWrapper<F, Marker>;
+    fn with_count_metric(
+        self,
+        action: ActionLabel,
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker>;
 
     /// For download requests, this should wrap the initial request future to
     /// track time to first byte (TTFB).
     fn with_count_and_duration_metrics(
         self,
         action: ActionLabel,
-    ) -> RequestMetricsWrapper<F, Marker>;
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker>;
 
     fn with_count_and_upload_metrics(
         self,
         action: ActionLabel,
+        bucket: &str,
         bytes: u64,
-    ) -> RequestMetricsWrapper<F, Marker>;
+    ) -> RequestMetricsWrapper<'_, F, Marker>;
 }
 
 impl<F, Marker> RequestMetricsWrapperExt<F, Marker> for F
@@ -172,10 +185,15 @@ where
     F: Future,
     F::Output: AsRequestStatus<Marker>,
 {
-    fn with_count_metric(self, action: ActionLabel) -> RequestMetricsWrapper<F, Marker> {
+    fn with_count_metric(
+        self,
+        action: ActionLabel,
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker> {
         RequestMetricsWrapper {
             tracked: self,
             action,
+            bucket,
             status: RequestStatus::Pending,
             start: None,
             uploaded_bytes: None,
@@ -186,10 +204,12 @@ where
     fn with_count_and_duration_metrics(
         self,
         action: ActionLabel,
-    ) -> RequestMetricsWrapper<F, Marker> {
+        bucket: &str,
+    ) -> RequestMetricsWrapper<'_, F, Marker> {
         RequestMetricsWrapper {
             tracked: self,
             action,
+            bucket,
             status: RequestStatus::Pending,
             start: Some(Instant::now()),
             uploaded_bytes: None,
@@ -200,16 +220,101 @@ where
     fn with_count_and_upload_metrics(
         self,
         action: ActionLabel,
+        bucket: &str,
         bytes: u64,
-    ) -> RequestMetricsWrapper<F, Marker> {
+    ) -> RequestMetricsWrapper<'_, F, Marker> {
         RequestMetricsWrapper {
             tracked: self,
             action,
+            bucket,
             status: RequestStatus::Pending,
             start: None,
             uploaded_bytes: Some(bytes),
             _marker: PhantomData,
         }
+    }
+}
+
+/// Runs an object store operation with [`aws_retry`] and records the number of attempts it took,
+/// by outcome: `success`, `exhausted` (every attempt failed with a retryable error),
+/// `permanent_error`, `cancelled_during_attempt` or `cancelled_during_backoff`.
+///
+/// The cancellation outcomes record operations dropped by the caller, for instance on a timeout.
+/// A cancellation while waiting between two attempts is not visible in the request metrics.
+pub(crate) async fn aws_retry_with_metrics<U, E, Fut>(
+    retry_params: &RetryParams,
+    action: ActionLabel,
+    f: impl Fn() -> Fut,
+) -> Result<U, E>
+where
+    Fut: Future<Output = Result<U, E>>,
+    E: AwsRetryable + Debug + 'static,
+{
+    let mut attempts_tracker = AttemptsTracker::new(action);
+    let result = aws_retry(retry_params, || {
+        let attempts_tracker = &attempts_tracker;
+        let attempt = f();
+        async move {
+            attempts_tracker.start_attempt();
+            let result = attempt.await;
+            attempts_tracker.end_attempt();
+            result
+        }
+    })
+    .await;
+    attempts_tracker.outcome_opt = Some(match &result {
+        Ok(_) => "success",
+        Err(error) if error.is_retryable() => "exhausted",
+        Err(_) => "permanent_error",
+    });
+    result
+}
+
+/// Counts the attempts of an operation, and records them when dropped.
+struct AttemptsTracker {
+    action: ActionLabel,
+    num_attempts: AtomicUsize,
+    attempt_in_progress: AtomicBool,
+    // `None` until the operation completes: dropping the tracker before that means the operation
+    // was cancelled.
+    outcome_opt: Option<&'static str>,
+}
+
+impl AttemptsTracker {
+    fn new(action: ActionLabel) -> Self {
+        Self {
+            action,
+            num_attempts: AtomicUsize::new(0),
+            attempt_in_progress: AtomicBool::new(false),
+            outcome_opt: None,
+        }
+    }
+
+    fn start_attempt(&self) {
+        self.num_attempts.fetch_add(1, Ordering::Relaxed);
+        self.attempt_in_progress.store(true, Ordering::Relaxed);
+    }
+
+    fn end_attempt(&self) {
+        self.attempt_in_progress.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Drop for AttemptsTracker {
+    fn drop(&mut self) {
+        let num_attempts = *self.num_attempts.get_mut();
+        if num_attempts == 0 {
+            return;
+        }
+        let outcome = match self.outcome_opt {
+            Some(outcome) => outcome,
+            None if *self.attempt_in_progress.get_mut() => "cancelled_during_attempt",
+            None => "cancelled_during_backoff",
+        };
+        STORAGE_METRICS
+            .object_storage_operation_attempts
+            .with_label_values([self.action.as_str(), outcome])
+            .observe(num_attempts as f64);
     }
 }
 
@@ -617,10 +722,10 @@ pub mod opendal_helpers {
     use super::*;
 
     /// Records a request occurrence for this action with unknown status.
-    pub fn record_request(action: ActionLabel) {
+    pub fn record_request(action: ActionLabel, bucket: &str) {
         STORAGE_METRICS
             .object_storage_requests_total
-            .with_label_values([action.as_str(), "unknown"])
+            .with_label_values([action.as_str(), "unknown", bucket])
             .inc();
     }
 
@@ -641,18 +746,157 @@ pub mod opendal_helpers {
     }
 
     /// Records a request occurrence for this action with unknown status.
-    pub fn record_request_with_timer(action: ActionLabel) -> HistogramTimer {
-        record_request(action);
+    pub fn record_request_with_timer(action: ActionLabel, bucket: &str) -> HistogramTimer {
+        record_request(action, bucket);
         STORAGE_METRICS
             .object_storage_request_duration
-            .with_label_values([action.as_str(), "unknown"])
+            .with_label_values([action.as_str(), "unknown", bucket])
             .start_timer()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use quickwit_common::metrics::Histogram;
+
     use super::*;
+
+    #[derive(Debug)]
+    enum TestError {
+        Retryable,
+        Permanent,
+    }
+
+    impl AwsRetryable for TestError {
+        fn is_retryable(&self) -> bool {
+            matches!(self, TestError::Retryable)
+        }
+    }
+
+    // No other test runs an operation labelled `list_objects`, and each test below checks a
+    // distinct outcome, so they don't interfere with each other.
+    fn list_objects_attempts(outcome: &str) -> Histogram {
+        STORAGE_METRICS
+            .object_storage_operation_attempts
+            .with_label_values(["list_objects", outcome])
+    }
+
+    /// Runs `operation` and returns the number of operations and attempts recorded for `outcome`.
+    async fn record_operation(outcome: &str, operation: impl Future<Output = ()>) -> (u64, f64) {
+        let histogram = list_objects_attempts(outcome);
+        let (count_before, sum_before) = (histogram.get_sample_count(), histogram.get_sample_sum());
+        operation.await;
+        (
+            histogram.get_sample_count() - count_before,
+            histogram.get_sample_sum() - sum_before,
+        )
+    }
+
+    /// Fails with `error` on the first `num_failures` attempts, then succeeds.
+    fn fail_then_succeed(
+        num_failures: usize,
+        error: fn() -> TestError,
+    ) -> impl Fn() -> futures::future::Ready<Result<(), TestError>> {
+        let num_calls = Arc::new(AtomicUsize::new(0));
+        move || {
+            let num_previous_calls = num_calls.fetch_add(1, Ordering::Relaxed);
+            futures::future::ready(if num_previous_calls < num_failures {
+                Err(error())
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_success_after_retries() {
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("success", async {
+            aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(2, || TestError::Retryable),
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        assert_eq!(recorded, (1, 3.0));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_exhausted() {
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("exhausted", async {
+            aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(usize::MAX, || TestError::Retryable),
+            )
+            .await
+            .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, retry_params.max_attempts as f64));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_permanent_error() {
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("permanent_error", async {
+            aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(usize::MAX, || TestError::Permanent),
+            )
+            .await
+            .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, 1.0));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_cancelled_during_backoff() {
+        tokio::time::pause();
+        let retry_params = RetryParams {
+            base_delay: Duration::from_secs(10),
+            max_delay: Duration::from_secs(10),
+            max_attempts: 3,
+        };
+        let recorded = record_operation("cancelled_during_backoff", async {
+            let operation = aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(usize::MAX, || TestError::Retryable),
+            );
+            // The first attempt fails at once, and the timeout elapses during the backoff.
+            tokio::time::timeout(Duration::from_secs(1), operation)
+                .await
+                .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, 1.0));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_cancelled_during_attempt() {
+        tokio::time::pause();
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("cancelled_during_attempt", async {
+            let operation = aws_retry_with_metrics(&retry_params, ActionLabel::ListObjects, || {
+                futures::future::pending::<Result<(), TestError>>()
+            });
+            tokio::time::timeout(Duration::from_secs(1), operation)
+                .await
+                .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, 1.0));
+    }
 
     #[tokio::test]
     async fn test_coalesce_segments_does_not_copy_a_single_segment() {

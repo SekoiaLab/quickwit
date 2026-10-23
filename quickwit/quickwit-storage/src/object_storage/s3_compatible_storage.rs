@@ -36,7 +36,7 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use once_cell::sync::{Lazy, OnceCell};
 use quickwit_aws::http_client::s3_http_client;
-use quickwit_aws::retry::{AwsRetryable, aws_retry};
+use quickwit_aws::retry::AwsRetryable;
 use quickwit_aws::{aws_behavior_version, get_aws_config};
 use quickwit_common::metrics::GaugeGuard;
 use quickwit_common::retry::{Retry, RetryParams};
@@ -51,8 +51,8 @@ use tracing::{info, instrument, warn};
 
 use crate::metrics::{STORAGE_METRICS, object_storage_get_slice_in_flight_guards};
 use crate::metrics_wrappers::{
-    ActionLabel, DownloadKind, RequestMetricsWrapperExt, collect_with_download_metrics,
-    copy_with_download_metrics,
+    ActionLabel, DownloadKind, RequestMetricsWrapperExt, aws_retry_with_metrics,
+    collect_with_download_metrics, copy_with_download_metrics,
 };
 use crate::object_storage::MultiPartPolicy;
 use crate::stable_deref_bytes::into_owned_bytes;
@@ -403,7 +403,7 @@ impl S3CompatibleObjectStorage {
         }
         req_builder
             .send()
-            .with_count_and_upload_metrics(ActionLabel::PutObject, len)
+            .with_count_and_upload_metrics(ActionLabel::PutObject, bucket, len)
             .await
             .map_err(|sdk_error| {
                 if sdk_error.is_retryable() {
@@ -422,7 +422,7 @@ impl S3CompatibleObjectStorage {
         len: u64,
     ) -> StorageResult<()> {
         let bucket = &self.bucket;
-        aws_retry(&self.retry_params, || async {
+        aws_retry_with_metrics(&self.retry_params, ActionLabel::PutObject, || async {
             self.put_single_part_single_try(bucket, key, payload.clone(), len)
                 .await
         })
@@ -432,33 +432,37 @@ impl S3CompatibleObjectStorage {
     }
 
     async fn create_multipart_upload(&self, key: &str) -> StorageResult<MultipartUploadId> {
-        let upload_id = aws_retry(&self.retry_params, || async {
-            let mut req_builder = self
-                .s3_client
-                .create_multipart_upload()
-                .bucket(self.bucket.clone())
-                .key(key);
-            match &self.encryption {
-                Some(S3EncryptionConfig::SseC {
-                    key,
-                    key_md5,
-                    read_only: false,
-                }) => {
-                    req_builder = req_builder
-                        .set_sse_customer_algorithm(Some("AES256".to_string()))
-                        .set_sse_customer_key(Some(key.clone()))
-                        .set_sse_customer_key_md5(Some(key_md5.clone()));
+        let upload_id = aws_retry_with_metrics(
+            &self.retry_params,
+            ActionLabel::CreateMultipartUpload,
+            || async {
+                let mut req_builder = self
+                    .s3_client
+                    .create_multipart_upload()
+                    .bucket(self.bucket.clone())
+                    .key(key);
+                match &self.encryption {
+                    Some(S3EncryptionConfig::SseC {
+                        key,
+                        key_md5,
+                        read_only: false,
+                    }) => {
+                        req_builder = req_builder
+                            .set_sse_customer_algorithm(Some("AES256".to_string()))
+                            .set_sse_customer_key(Some(key.clone()))
+                            .set_sse_customer_key_md5(Some(key_md5.clone()));
+                    }
+                    Some(S3EncryptionConfig::SseC {
+                        read_only: true, ..
+                    }) => {}
+                    None => {}
                 }
-                Some(S3EncryptionConfig::SseC {
-                    read_only: true, ..
-                }) => {}
-                None => {}
-            }
-            req_builder
-                .send()
-                .with_count_metric(ActionLabel::CreateMultipartUpload)
-                .await
-        })
+                req_builder
+                    .send()
+                    .with_count_metric(ActionLabel::CreateMultipartUpload, &self.bucket)
+                    .await
+            },
+        )
         .await?
         .upload_id
         .ok_or_else(|| {
@@ -574,7 +578,7 @@ impl S3CompatibleObjectStorage {
         }
         let upload_part_output = req_builder
             .send()
-            .with_count_and_upload_metrics(ActionLabel::UploadPart, part.len())
+            .with_count_and_upload_metrics(ActionLabel::UploadPart, &self.bucket, part.len())
             .await
             .map_err(|s3_err| {
                 if s3_err.is_retryable() {
@@ -607,7 +611,7 @@ impl S3CompatibleObjectStorage {
             stream::iter(parts.into_iter().map(|part| {
                 let payload = payload.clone();
                 let upload_id = upload_id.clone();
-                aws_retry(&self.retry_params, move || {
+                aws_retry_with_metrics(&self.retry_params, ActionLabel::UploadPart, move || {
                     self.upload_part(upload_id.clone(), key, part.clone(), payload.clone())
                 })
             }))
@@ -646,32 +650,40 @@ impl S3CompatibleObjectStorage {
         let completed_upload = CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
             .build();
-        aws_retry(&self.retry_params, || async {
-            self.s3_client
-                .complete_multipart_upload()
-                .bucket(self.bucket.clone())
-                .key(key)
-                .multipart_upload(completed_upload.clone())
-                .upload_id(upload_id)
-                .send()
-                .with_count_metric(ActionLabel::CompleteMultipartUpload)
-                .await
-        })
+        aws_retry_with_metrics(
+            &self.retry_params,
+            ActionLabel::CompleteMultipartUpload,
+            || async {
+                self.s3_client
+                    .complete_multipart_upload()
+                    .bucket(self.bucket.clone())
+                    .key(key)
+                    .multipart_upload(completed_upload.clone())
+                    .upload_id(upload_id)
+                    .send()
+                    .with_count_metric(ActionLabel::CompleteMultipartUpload, &self.bucket)
+                    .await
+            },
+        )
         .await?;
         Ok(())
     }
 
     async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> StorageResult<()> {
-        aws_retry(&self.retry_params, || async {
-            self.s3_client
-                .abort_multipart_upload()
-                .bucket(self.bucket.clone())
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .with_count_metric(ActionLabel::AbortMultipartUpload)
-                .await
-        })
+        aws_retry_with_metrics(
+            &self.retry_params,
+            ActionLabel::AbortMultipartUpload,
+            || async {
+                self.s3_client
+                    .abort_multipart_upload()
+                    .bucket(self.bucket.clone())
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .with_count_metric(ActionLabel::AbortMultipartUpload, &self.bucket)
+                    .await
+            },
+        )
         .await?;
         Ok(())
     }
@@ -708,7 +720,7 @@ impl S3CompatibleObjectStorage {
         let connection_permit = acquire_get_object_connection_permit().await;
         let get_object_output = req_builder
             .send()
-            .with_count_and_duration_metrics(ActionLabel::GetObject)
+            .with_count_and_duration_metrics(ActionLabel::GetObject, &self.bucket)
             .await?;
         Ok((get_object_output, connection_permit))
     }
@@ -725,32 +737,33 @@ impl S3CompatibleObjectStorage {
         };
         // The body is read within the retried closure: a connection dropped or stalled while
         // streaming the body fails the attempt, and the whole GET is sent again.
-        let payload = aws_retry(&self.retry_params, || async {
-            let (get_object_output, _connection_permit) = self
-                .get_object(path, range_opt.clone())
+        let payload =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
+                let (get_object_output, _connection_permit) = self
+                    .get_object(path, range_opt.clone())
+                    .await
+                    .map_err(|sdk_error| {
+                        if sdk_error.is_retryable() {
+                            Retry::Transient(StorageError::from(sdk_error))
+                        } else {
+                            Retry::Permanent(StorageError::from(sdk_error))
+                        }
+                    })?;
+                // only record ranged get request as being in flight
+                let _in_flight_guards = range_opt
+                    .clone()
+                    .map(|range| object_storage_get_slice_in_flight_guards(range.len()));
+                collect_with_download_metrics(
+                    get_object_output.body,
+                    download_kind,
+                    self.assembly_thread_pool.as_ref(),
+                )
                 .await
-                .map_err(|sdk_error| {
-                    if sdk_error.is_retryable() {
-                        Retry::Transient(StorageError::from(sdk_error))
-                    } else {
-                        Retry::Permanent(StorageError::from(sdk_error))
-                    }
-                })?;
-            // only record ranged get request as being in flight
-            let _in_flight_guards = range_opt
-                .clone()
-                .map(|range| object_storage_get_slice_in_flight_guards(range.len()));
-            collect_with_download_metrics(
-                get_object_output.body,
-                download_kind,
-                self.assembly_thread_pool.as_ref(),
-            )
+                // GET requests are idempotent, and a body error is a transport failure.
+                .map_err(|io_error| Retry::Transient(StorageError::from(io_error)))
+            })
             .await
-            // GET requests are idempotent, and a body error is a transport failure.
-            .map_err(|io_error| Retry::Transient(StorageError::from(io_error)))
-        })
-        .await
-        .map_err(Retry::into_inner)?;
+            .map_err(Retry::into_inner)?;
         Ok(payload)
     }
 
@@ -816,13 +829,13 @@ impl S3CompatibleObjectStorage {
 
         for (path_chunk, delete) in &mut delete_requests_it {
             let delete_objects_res: StorageResult<DeleteObjectsOutput> =
-                aws_retry(&self.retry_params, || async {
+                aws_retry_with_metrics(&self.retry_params, ActionLabel::DeleteObjects, || async {
                     self.s3_client
                         .delete_objects()
                         .bucket(self.bucket.clone())
                         .delete(delete.clone())
                         .send()
-                        .with_count_and_duration_metrics(ActionLabel::DeleteObjects)
+                        .with_count_and_duration_metrics(ActionLabel::DeleteObjects, &self.bucket)
                         .await
                 })
                 .await
@@ -893,7 +906,7 @@ impl Storage for S3CompatibleObjectStorage {
             .bucket(self.bucket.clone())
             .max_keys(1)
             .send()
-            .with_count_metric(ActionLabel::ListObjects)
+            .with_count_metric(ActionLabel::ListObjects, &self.bucket)
             .await?;
         Ok(())
     }
@@ -917,7 +930,10 @@ impl Storage for S3CompatibleObjectStorage {
 
     async fn copy_to(&self, path: &Path, output: &mut dyn SendableAsync) -> StorageResult<()> {
         let (get_object_output, connection_permit) =
-            aws_retry(&self.retry_params, || self.get_object(path, None)).await?;
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || {
+                self.get_object(path, None)
+            })
+            .await?;
         let mut body_read = BufReader::new(get_object_output.body.into_async_read());
         copy_with_download_metrics(&mut body_read, output, DownloadKind::Object).await?;
         // The body has been fully read: release the connection before flushing the output.
@@ -930,16 +946,17 @@ impl Storage for S3CompatibleObjectStorage {
     async fn delete(&self, path: &Path) -> StorageResult<()> {
         let bucket = self.bucket.clone();
         let key = self.key(path);
-        let delete_res = aws_retry(&self.retry_params, || async {
-            self.s3_client
-                .delete_object()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .with_count_and_duration_metrics(ActionLabel::DeleteObject)
-                .await
-        })
-        .await;
+        let delete_res =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::DeleteObject, || async {
+                self.s3_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .with_count_and_duration_metrics(ActionLabel::DeleteObject, &bucket)
+                    .await
+            })
+            .await;
 
         match delete_res {
             Ok(_) => Ok(()),
@@ -977,10 +994,11 @@ impl Storage for S3CompatibleObjectStorage {
         path: &Path,
         range: Range<usize>,
     ) -> crate::StorageResult<Box<dyn AsyncRead + Send + Unpin>> {
-        let (get_object_output, connection_permit) = aws_retry(&self.retry_params, || {
-            self.get_object(path, Some(range.clone()))
-        })
-        .await?;
+        let (get_object_output, connection_permit) =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || {
+                self.get_object(path, Some(range.clone()))
+            })
+            .await?;
         Ok(Box::new(S3AsyncRead {
             read: get_object_output.body.into_async_read(),
             _connection_permit: connection_permit,
@@ -1007,27 +1025,28 @@ impl Storage for S3CompatibleObjectStorage {
     async fn file_num_bytes(&self, path: &Path) -> StorageResult<u64> {
         let bucket = self.bucket.clone();
         let key = self.key(path);
-        let head_object_output = aws_retry(&self.retry_params, || async {
-            let mut req_builder = self.s3_client.head_object().bucket(&bucket).key(&key);
-            match &self.encryption {
-                Some(S3EncryptionConfig::SseC {
-                    key,
-                    key_md5,
-                    read_only: _,
-                }) => {
-                    req_builder = req_builder
-                        .set_sse_customer_algorithm(Some("AES256".to_string()))
-                        .set_sse_customer_key(Some(key.clone()))
-                        .set_sse_customer_key_md5(Some(key_md5.clone()));
+        let head_object_output =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::HeadObject, || async {
+                let mut req_builder = self.s3_client.head_object().bucket(&bucket).key(&key);
+                match &self.encryption {
+                    Some(S3EncryptionConfig::SseC {
+                        key,
+                        key_md5,
+                        read_only: _,
+                    }) => {
+                        req_builder = req_builder
+                            .set_sse_customer_algorithm(Some("AES256".to_string()))
+                            .set_sse_customer_key(Some(key.clone()))
+                            .set_sse_customer_key_md5(Some(key_md5.clone()));
+                    }
+                    None => {}
                 }
-                None => {}
-            }
-            req_builder
-                .send()
-                .with_count_metric(ActionLabel::HeadObject)
-                .await
-        })
-        .await?;
+                req_builder
+                    .send()
+                    .with_count_metric(ActionLabel::HeadObject, &bucket)
+                    .await
+            })
+            .await?;
 
         Ok(head_object_output.content_length().unwrap_or(0) as u64)
     }
