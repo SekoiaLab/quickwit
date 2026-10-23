@@ -726,39 +726,46 @@ impl S3CompatibleObjectStorage {
         Ok((get_object_output, connection_permit))
     }
 
-    async fn get_to_bytes(
+    /// A single attempt of [`Self::get_to_bytes`]. The body is read within the attempt: a
+    /// connection dropped or stalled while streaming the body fails it, and the whole GET is sent
+    /// again.
+    async fn get_to_bytes_attempt(
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
-    ) -> StorageResult<Bytes> {
+    ) -> Result<Bytes, Retry<StorageError>> {
         let download_kind = if range_opt.is_some() {
             DownloadKind::Slice
         } else {
             DownloadKind::Object
         };
-        // The body is read within the retried closure: a connection dropped or stalled while
-        // streaming the body fails the attempt, and the whole GET is sent again.
-        let payload =
-            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
-                let (get_object_output, _connection_permit) = self
-                    .get_object(path, range_opt.clone())
-                    .await
-                    .map_err(into_retry)?;
-                // only record ranged get request as being in flight
-                let _in_flight_guards = range_opt
-                    .clone()
-                    .map(|range| object_storage_get_slice_in_flight_guards(range.len()));
-                collect_with_download_metrics(
-                    get_object_output.body,
-                    download_kind,
-                    self.assembly_thread_pool.as_ref(),
-                )
-                .await
-                // GET requests are idempotent, and a body error is a transport failure.
-                .map_err(|io_error| Retry::Transient(StorageError::from(io_error)))
-            })
+        let (get_object_output, _connection_permit) = self
+            .get_object(path, range_opt.clone())
             .await
-            .map_err(Retry::into_inner)?;
+            .map_err(into_retry)?;
+        // only record ranged get request as being in flight
+        let _in_flight_guards =
+            range_opt.map(|range| object_storage_get_slice_in_flight_guards(range.len()));
+        collect_with_download_metrics(
+            get_object_output.body,
+            download_kind,
+            self.assembly_thread_pool.as_ref(),
+        )
+        .await
+        // GET requests are idempotent, and a body error is a transport failure.
+        .map_err(|io_error| Retry::Transient(StorageError::from(io_error)))
+    }
+
+    async fn get_to_bytes(
+        &self,
+        path: &Path,
+        range_opt: Option<Range<usize>>,
+    ) -> StorageResult<Bytes> {
+        let payload = aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || {
+            self.get_to_bytes_attempt(path, range_opt.clone())
+        })
+        .await
+        .map_err(Retry::into_inner)?;
         Ok(payload)
     }
 
