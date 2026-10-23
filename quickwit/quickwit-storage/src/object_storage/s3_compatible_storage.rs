@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{fmt, io};
@@ -43,7 +44,7 @@ use quickwit_common::retry::{Retry, RetryParams};
 use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
 use quickwit_common::{chunk_range, into_u64_range};
-use quickwit_config::{S3EncryptionConfig, S3StorageConfig};
+use quickwit_config::{S3EncryptionConfig, S3StorageConfig, StorageTimeoutPolicy};
 use regex::Regex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::Semaphore;
@@ -146,6 +147,32 @@ impl<T: AsyncRead + Send + Unpin> AsyncRead for S3AsyncRead<T> {
     }
 }
 
+/// Classifies an SDK error for the retry loop: throttled, transient or permanent.
+fn into_retry<E>(sdk_error: SdkError<E>) -> Retry<StorageError>
+where
+    SdkError<E>: AwsRetryable,
+    StorageError: From<SdkError<E>>,
+{
+    if sdk_error.is_throttling() {
+        Retry::Throttled(StorageError::from(sdk_error))
+    } else if sdk_error.is_retryable() {
+        Retry::Transient(StorageError::from(sdk_error))
+    } else {
+        Retry::Permanent(StorageError::from(sdk_error))
+    }
+}
+
+/// Records the outcome of a `get_slice` subject to a timeout policy, in the same metric as
+/// [`crate::TimeoutAndRetryStorage`]: either it gave up because its last attempt timed out, or it
+/// completed, successfully or not, after `num_timeouts` timed-out attempts.
+fn record_get_slice_timeout_outcome(num_timeouts: usize, gave_up_on_timeout: bool) {
+    if gave_up_on_timeout {
+        STORAGE_METRICS.get_slice_timeout_all_timeouts.inc();
+    } else {
+        STORAGE_METRICS.get_slice_timeout_successes[num_timeouts.min(2)].inc();
+    }
+}
+
 /// S3-compatible object storage implementation.
 pub struct S3CompatibleObjectStorage {
     s3_client: S3Client,
@@ -162,6 +189,9 @@ pub struct S3CompatibleObjectStorage {
     /// config: it is set by the node that builds the storage (see
     /// [`Self::with_assembly_thread_pool`]).
     assembly_thread_pool: Option<ThreadPoolWithPriority>,
+    /// Timeout of each attempt to download a slice. Like the assembly thread pool, it is set by
+    /// the node that builds the storage (see [`Self::with_timeout_policy`]).
+    timeout_policy: Option<StorageTimeoutPolicy>,
 }
 
 impl fmt::Debug for S3CompatibleObjectStorage {
@@ -272,6 +302,7 @@ impl S3CompatibleObjectStorage {
             disable_multipart_upload,
             encryption: s3_storage_config.encryption.clone(),
             assembly_thread_pool: None,
+            timeout_policy: None,
         })
     }
 
@@ -289,6 +320,16 @@ impl S3CompatibleObjectStorage {
     pub fn with_assembly_thread_pool(self, thread_pool: ThreadPoolWithPriority) -> Self {
         Self {
             assembly_thread_pool: Some(thread_pool),
+            ..self
+        }
+    }
+
+    /// Applies `timeout_policy` to each attempt to download a slice, response body included. A
+    /// timed-out attempt is retried, `max_num_retries` times at most, like any transient error:
+    /// the delays between attempts are not counted in the timeout.
+    pub fn with_timeout_policy(self, timeout_policy: StorageTimeoutPolicy) -> Self {
+        Self {
+            timeout_policy: Some(timeout_policy),
             ..self
         }
     }
@@ -405,13 +446,7 @@ impl S3CompatibleObjectStorage {
             .send()
             .with_count_and_upload_metrics(ActionLabel::PutObject, bucket, len)
             .await
-            .map_err(|sdk_error| {
-                if sdk_error.is_retryable() {
-                    Retry::Transient(StorageError::from(sdk_error))
-                } else {
-                    Retry::Permanent(StorageError::from(sdk_error))
-                }
-            })?;
+            .map_err(into_retry)?;
         Ok(())
     }
 
@@ -580,13 +615,7 @@ impl S3CompatibleObjectStorage {
             .send()
             .with_count_and_upload_metrics(ActionLabel::UploadPart, &self.bucket, part.len())
             .await
-            .map_err(|s3_err| {
-                if s3_err.is_retryable() {
-                    Retry::Transient(StorageError::from(s3_err))
-                } else {
-                    Retry::Permanent(StorageError::from(s3_err))
-                }
-            })?;
+            .map_err(into_retry)?;
 
         let completed_part = CompletedPart::builder()
             .set_e_tag(upload_part_output.e_tag)
@@ -725,45 +754,72 @@ impl S3CompatibleObjectStorage {
         Ok((get_object_output, connection_permit))
     }
 
-    async fn get_to_bytes(
+    /// A single attempt of [`Self::get_to_bytes`]. The body is read within the attempt: a
+    /// connection dropped or stalled while streaming the body fails it, and the whole GET is sent
+    /// again.
+    async fn get_to_bytes_attempt(
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
-    ) -> StorageResult<Bytes> {
+    ) -> Result<Bytes, Retry<StorageError>> {
         let download_kind = if range_opt.is_some() {
             DownloadKind::Slice
         } else {
             DownloadKind::Object
         };
-        // The body is read within the retried closure: a connection dropped or stalled while
-        // streaming the body fails the attempt, and the whole GET is sent again.
-        let payload =
-            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
-                let (get_object_output, _connection_permit) = self
-                    .get_object(path, range_opt.clone())
-                    .await
-                    .map_err(|sdk_error| {
-                        if sdk_error.is_retryable() {
-                            Retry::Transient(StorageError::from(sdk_error))
-                        } else {
-                            Retry::Permanent(StorageError::from(sdk_error))
-                        }
-                    })?;
-                // only record ranged get request as being in flight
-                let _in_flight_guards = range_opt
-                    .clone()
-                    .map(|range| object_storage_get_slice_in_flight_guards(range.len()));
-                collect_with_download_metrics(
-                    get_object_output.body,
-                    download_kind,
-                    self.assembly_thread_pool.as_ref(),
-                )
-                .await
-                // GET requests are idempotent, and a body error is a transport failure.
-                .map_err(|io_error| Retry::Transient(StorageError::from(io_error)))
-            })
+        let (get_object_output, _connection_permit) = self
+            .get_object(path, range_opt.clone())
             .await
-            .map_err(Retry::into_inner)?;
+            .map_err(into_retry)?;
+        // only record ranged get request as being in flight
+        let _in_flight_guards =
+            range_opt.map(|range| object_storage_get_slice_in_flight_guards(range.len()));
+        collect_with_download_metrics(
+            get_object_output.body,
+            download_kind,
+            self.assembly_thread_pool.as_ref(),
+        )
+        .await
+        // GET requests are idempotent, and a body error is a transport failure.
+        .map_err(|io_error| Retry::Transient(StorageError::from(io_error)))
+    }
+
+    async fn get_to_bytes(
+        &self,
+        path: &Path,
+        range_opt: Option<Range<usize>>,
+    ) -> StorageResult<Bytes> {
+        // The timeout policy only applies to slices, whose size is known.
+        let slice_timeout_policy_opt = range_opt.as_ref().zip(self.timeout_policy.as_ref());
+        let num_timeouts = AtomicUsize::new(0);
+        let last_attempt_timed_out = AtomicBool::new(false);
+        let payload_res =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
+                let attempt = self.get_to_bytes_attempt(path, range_opt.clone());
+                let Some((range, timeout_policy)) = slice_timeout_policy_opt else {
+                    return attempt.await;
+                };
+                let attempt_res =
+                    tokio::time::timeout(timeout_policy.timeout(range.len()), attempt).await;
+                last_attempt_timed_out.store(attempt_res.is_err(), Ordering::Relaxed);
+                attempt_res.unwrap_or_else(|_elapsed| {
+                    let error = StorageErrorKind::Timeout
+                        .with_error(anyhow!("internal timeout on get_slice"));
+                    // Timed-out attempts are retried `max_num_retries` times at most.
+                    if num_timeouts.fetch_add(1, Ordering::Relaxed) < timeout_policy.max_num_retries
+                    {
+                        Err(Retry::Transient(error))
+                    } else {
+                        Err(Retry::Permanent(error))
+                    }
+                })
+            })
+            .await;
+        if slice_timeout_policy_opt.is_some() {
+            let gave_up_on_timeout = payload_res.is_err() && last_attempt_timed_out.into_inner();
+            record_get_slice_timeout_outcome(num_timeouts.into_inner(), gave_up_on_timeout);
+        }
+        let payload = payload_res.map_err(Retry::into_inner)?;
         Ok(payload)
     }
 
@@ -1054,6 +1110,10 @@ impl Storage for S3CompatibleObjectStorage {
     fn uri(&self) -> &Uri {
         &self.uri
     }
+
+    fn timeout_policy(&self) -> Option<StorageTimeoutPolicy> {
+        self.timeout_policy.clone()
+    }
 }
 
 #[cfg(test)]
@@ -1067,6 +1127,7 @@ mod tests {
     use hyper::http;
     use quickwit_aws::aws_behavior_version;
     use quickwit_common::chunk_range;
+    use quickwit_common::retry::THROTTLING_EXTRA_ATTEMPTS;
     use quickwit_common::uri::Uri;
 
     use super::*;
@@ -1164,6 +1225,7 @@ mod tests {
             disable_multipart_upload: false,
             encryption: None,
             assembly_thread_pool: None,
+            timeout_policy: None,
         };
         assert_eq!(
             s3_storage.relative_path("indexes/foo"),
@@ -1213,6 +1275,7 @@ mod tests {
             disable_multipart_upload: false,
             encryption: None,
             assembly_thread_pool: None,
+            timeout_policy: None,
         };
         let _ = s3_storage
             .bulk_delete(&[Path::new("foo"), Path::new("bar")])
@@ -1252,6 +1315,7 @@ mod tests {
             disable_multipart_upload: false,
             encryption: None,
             assembly_thread_pool: None,
+            timeout_policy: None,
         };
         let _ = s3_storage
             .bulk_delete(&[Path::new("foo"), Path::new("bar")])
@@ -1336,6 +1400,7 @@ mod tests {
             disable_multipart_upload: false,
             encryption: None,
             assembly_thread_pool: None,
+            timeout_policy: None,
         };
         let bulk_delete_error = s3_storage
             .bulk_delete(&[
@@ -1429,6 +1494,7 @@ mod tests {
             disable_multipart_upload: false,
             encryption: None,
             assembly_thread_pool: None,
+            timeout_policy: None,
         };
         s3_storage
             .put(Path::new("my-path"), Box::new(vec![1, 2, 3]))
@@ -1473,6 +1539,7 @@ mod tests {
             disable_multipart_upload: false,
             encryption: None,
             assembly_thread_pool: None,
+            timeout_policy: None,
         }
     }
 
@@ -1516,6 +1583,130 @@ mod tests {
         assert_eq!(client.actual_requests().count(), retry_params.max_attempts);
     }
 
+    fn get_object_event(status: u16, body: SdkBody) -> ReplayEvent {
+        ReplayEvent::new(
+            http::Request::builder().body(SdkBody::empty()).unwrap(),
+            http::Response::builder().status(status).body(body).unwrap(),
+        )
+    }
+
+    fn get_object_error_event(status: u16, code: &str) -> ReplayEvent {
+        let body = format!("<Error><Code>{code}</Code><Message>message</Message></Error>");
+        get_object_event(status, SdkBody::from(body))
+    }
+
+    /// A response whose body never arrives: only a timeout can end the attempt.
+    fn get_object_event_with_pending_body() -> ReplayEvent {
+        let pending_body = http_body_util::StreamBody::new(futures::stream::pending::<
+            Result<hyper::body::Frame<Bytes>, io::Error>,
+        >());
+        get_object_event(206, SdkBody::from_body_1_x(pending_body))
+    }
+
+    fn timeout_policy(timeout: Duration, max_num_retries: usize) -> StorageTimeoutPolicy {
+        StorageTimeoutPolicy {
+            min_throughtput_bytes_per_secs: 0,
+            timeout_millis: timeout.as_millis() as u64,
+            max_num_retries,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_retries_timed_out_attempt() {
+        tokio::time::pause();
+        let client = StaticReplayClient::new(vec![
+            get_object_event_with_pending_body(),
+            get_object_event(206, SdkBody::from("abcd")),
+        ]);
+        let s3_storage = s3_storage_for_get_test(client.clone())
+            .with_timeout_policy(timeout_policy(Duration::from_secs(2), 1));
+
+        let slice = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap();
+        assert_eq!(slice.as_slice(), b"abcd");
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_timeout_without_retries() {
+        tokio::time::pause();
+        let client = StaticReplayClient::new(vec![
+            get_object_event_with_pending_body(),
+            get_object_event(206, SdkBody::from("abcd")),
+        ]);
+        let s3_storage = s3_storage_for_get_test(client.clone())
+            .with_timeout_policy(timeout_policy(Duration::from_secs(2), 0));
+
+        let error = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        assert_eq!(client.actual_requests().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_timeout_excludes_backoff() {
+        tokio::time::pause();
+        let client = StaticReplayClient::new(vec![
+            get_object_error_event(503, "SlowDown"),
+            get_object_event(206, SdkBody::from("abcd")),
+        ]);
+        // The backoff after the throttling error, 1 to 2s, exceeds the 1s timeout: only the
+        // attempts are timed.
+        let s3_storage = S3CompatibleObjectStorage {
+            retry_params: RetryParams {
+                base_delay: Duration::from_secs(2),
+                max_delay: Duration::from_secs(10),
+                max_attempts: 3,
+            },
+            ..s3_storage_for_get_test(client.clone())
+        }
+        .with_timeout_policy(timeout_policy(Duration::from_secs(1), 0));
+
+        let slice = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap();
+        assert_eq!(slice.as_slice(), b"abcd");
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_retries_throttling_longer() {
+        let max_attempts = RetryParams::for_test().max_attempts;
+        // A throttled slice gets extra attempts...
+        let client = StaticReplayClient::new(
+            (0..max_attempts + THROTTLING_EXTRA_ATTEMPTS - 1)
+                .map(|_| get_object_error_event(503, "SlowDown"))
+                .chain([get_object_event(206, SdkBody::from("abcd"))])
+                .collect(),
+        );
+        let slice = s3_storage_for_get_test(client.clone())
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap();
+        assert_eq!(slice.as_slice(), b"abcd");
+        assert_eq!(
+            client.actual_requests().count(),
+            max_attempts + THROTTLING_EXTRA_ATTEMPTS
+        );
+
+        // ... that other transient errors don't get.
+        let client = StaticReplayClient::new(
+            (0..max_attempts)
+                .map(|_| get_object_error_event(500, "InternalError"))
+                .collect(),
+        );
+        s3_storage_for_get_test(client.clone())
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap_err();
+        assert_eq!(client.actual_requests().count(), max_attempts);
+    }
+
     #[tokio::test]
     async fn test_sse_c_headers_in_regular_put() {
         for read_only in [false, true] {
@@ -1553,6 +1744,7 @@ mod tests {
                     read_only,
                 }),
                 assembly_thread_pool: None,
+                timeout_policy: None,
             };
 
             let small_payload = vec![1u8; 100];
@@ -1655,6 +1847,7 @@ mod tests {
                     read_only,
                 }),
                 assembly_thread_pool: None,
+                timeout_policy: None,
             };
 
             // Test multipart upload with large payload that triggers multipart (15MB > 10MB

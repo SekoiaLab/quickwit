@@ -16,7 +16,7 @@
 
 use aws_config::retry::ErrorKind;
 use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
@@ -30,7 +30,7 @@ use aws_sdk_s3::operation::upload_part::UploadPartError;
 use crate::retry::AwsRetryable;
 
 impl<E> AwsRetryable for SdkError<E>
-where E: AwsRetryable
+where E: AwsRetryable + ProvideErrorMetadata
 {
     fn is_retryable(&self) -> bool {
         match self {
@@ -54,6 +54,10 @@ where E: AwsRetryable
             SdkError::ServiceError(error) => error.err().is_retryable(),
             _ => false,
         }
+    }
+
+    fn is_throttling(&self) -> bool {
+        matches!(self.code(), Some(code) if THROTTLING_ERRORS.contains(&code))
     }
 }
 

@@ -23,6 +23,7 @@ use fnv::FnvHashMap;
 use futures::future::{BoxFuture, WeakShared};
 use futures::{Future, FutureExt};
 use quickwit_common::uri::Uri;
+use quickwit_config::StorageTimeoutPolicy;
 use tantivy::directory::OwnedBytes;
 use tokio::io::AsyncRead;
 
@@ -189,6 +190,10 @@ impl<T: Storage> Storage for DebouncedStorage<T> {
 
     fn uri(&self) -> &Uri {
         self.underlying.uri()
+    }
+
+    fn timeout_policy(&self) -> Option<StorageTimeoutPolicy> {
+        self.underlying.timeout_policy()
     }
 
     async fn file_num_bytes(&self, path: &Path) -> StorageResult<u64> {
