@@ -287,8 +287,9 @@ impl Default for SearchMetrics {
             ),
             leaf_search_split_retries_total: new_counter_vec(
                 "leaf_search_split_retries_total",
-                "Number of splits whose leaf search failed and was retried on another searcher, \
-                 by outcome of the retry: `rescued` or `failed` again.",
+                "Number of splits whose leaf search failed and was retried once (on another \
+                 searcher when one is available), by outcome of the retry: `rescued` or `failed` \
+                 again.",
                 "search",
                 &[],
                 ["outcome"],
