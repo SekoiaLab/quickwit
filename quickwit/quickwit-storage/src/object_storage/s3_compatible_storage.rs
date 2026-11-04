@@ -160,6 +160,11 @@ where
     }
 }
 
+/// A `get_slice` subject to a timeout policy gives up after this many times the timeout of a single
+/// attempt, whatever the number of attempts and including the waits between them: until it
+/// completes, it holds resources of its caller, for instance a search permit.
+const TOTAL_TIMEOUT_FACTOR: u32 = 5;
+
 /// Records the outcome of a `get_slice` subject to a timeout policy, in the same metric as
 /// [`crate::TimeoutAndRetryStorage`]: either it gave up because its last attempt timed out, or it
 /// completed, successfully or not, after `num_timeouts` timed-out attempts.
@@ -325,7 +330,7 @@ impl S3CompatibleObjectStorage {
     /// Applies `timeout_policy` to each attempt to download a slice, response body included. A
     /// timed-out attempt is retried, `max_num_retries` times at most, like any transient error:
     /// waiting for a connection permit and the delays between attempts are not counted in the
-    /// timeout.
+    /// timeout. The whole download gives up after [`TOTAL_TIMEOUT_FACTOR`] times the timeout.
     pub fn with_timeout_policy(self, timeout_policy: StorageTimeoutPolicy) -> Self {
         Self {
             timeout_policy: Some(timeout_policy),
@@ -802,7 +807,7 @@ impl S3CompatibleObjectStorage {
         let slice_timeout_policy_opt = range_opt.as_ref().zip(self.timeout_policy.as_ref());
         let num_timeouts = AtomicUsize::new(0);
         let last_attempt_timed_out = AtomicBool::new(false);
-        let payload_res =
+        let retry_fut =
             aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
                 // Waiting for a connection permit is local queueing: the attempt timeout starts
                 // once the permit is acquired.
@@ -825,8 +830,21 @@ impl S3CompatibleObjectStorage {
                         Err(Retry::Permanent(error))
                     }
                 })
-            })
-            .await;
+            });
+        let payload_res = match slice_timeout_policy_opt {
+            None => retry_fut.await,
+            Some((range, timeout_policy)) => {
+                let total_timeout = timeout_policy.timeout(range.len()) * TOTAL_TIMEOUT_FACTOR;
+                tokio::time::timeout(total_timeout, retry_fut)
+                    .await
+                    .unwrap_or_else(|_elapsed| {
+                        last_attempt_timed_out.store(true, Ordering::Relaxed);
+                        let error = StorageErrorKind::Timeout
+                            .with_error(anyhow!("internal timeout on get_slice, all attempts"));
+                        Err(Retry::Permanent(error))
+                    })
+            }
+        };
         if slice_timeout_policy_opt.is_some() {
             let gave_up_on_timeout = payload_res.is_err() && last_attempt_timed_out.into_inner();
             record_get_slice_timeout_outcome(num_timeouts.into_inner(), gave_up_on_timeout);
@@ -1683,6 +1701,42 @@ mod tests {
             .unwrap();
         assert_eq!(slice.as_slice(), b"abcd");
         assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_total_timeout() {
+        tokio::time::pause();
+        let max_attempts = 20;
+        let client = StaticReplayClient::new(
+            (0..max_attempts)
+                .map(|_| get_object_error_event(503, "SlowDown"))
+                .collect(),
+        );
+        // Attempts never time out, but the throttling lasts longer than the total timeout: 5 x 1s.
+        let s3_storage = S3CompatibleObjectStorage {
+            retry_params: RetryParams {
+                base_delay: Duration::from_secs(2),
+                max_delay: Duration::from_secs(10),
+                max_attempts,
+            },
+            ..s3_storage_for_get_test(client.clone())
+        }
+        .with_timeout_policy(timeout_policy(Duration::from_secs(1), 0));
+
+        let start = tokio::time::Instant::now();
+        let error = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        // Tokio timers have a millisecond granularity.
+        let elapsed = start.elapsed();
+        assert!(
+            Duration::from_secs(5) <= elapsed && elapsed < Duration::from_millis(5_010),
+            "{elapsed:?}"
+        );
+        // Backoffs of 1 to 2s, then 2 to 4s: at most 3 attempts fit in 5s.
+        assert!(client.actual_requests().count() <= 3);
     }
 
     #[tokio::test]
