@@ -148,8 +148,8 @@ pub(crate) async fn open_split_bundle(
 ///
 /// The goal here is too ensure a low latency.
 ///
-/// Storages that already apply this policy themselves, to each attempt of a request, are left as
-/// is (see [`Storage::timeout_policy`]).
+/// Storages that apply a timeout policy themselves, to each attempt of a request, are left as is
+/// (see [`Storage::timeout_policy`]).
 fn configure_storage_retries(
     searcher_context: &SearcherContext,
     index_storage: Arc<dyn Storage>,
@@ -158,7 +158,7 @@ fn configure_storage_retries(
     else {
         return index_storage;
     };
-    if index_storage.timeout_policy().as_ref() == Some(storage_timeout_policy) {
+    if index_storage.timeout_policy().is_some() {
         return index_storage;
     }
     Arc::new(TimeoutAndRetryStorage::new(
@@ -1750,7 +1750,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_configure_storage_retries_skips_storages_applying_the_policy() {
+    async fn test_configure_storage_retries_skips_storages_applying_a_policy() {
         let timeout_policy = StorageTimeoutPolicy {
             min_throughtput_bytes_per_secs: 100_000,
             timeout_millis: 2_000,
@@ -1770,15 +1770,10 @@ mod tests {
             let configured_storage = configure_storage_retries(&searcher_context, storage.clone());
             !std::ptr::addr_eq(Arc::as_ptr(&configured_storage), Arc::as_ptr(&storage))
         };
-        // The storage applies the searcher's policy itself.
-        assert!(!is_wrapped(storage_applying(Some(timeout_policy.clone()))));
-        // The storage applies no policy, or another one.
+        // The storage applies a timeout policy itself.
+        assert!(!is_wrapped(storage_applying(Some(timeout_policy))));
+        // The storage applies no timeout policy.
         assert!(is_wrapped(storage_applying(None)));
-        let other_policy = StorageTimeoutPolicy {
-            max_num_retries: 0,
-            ..timeout_policy
-        };
-        assert!(is_wrapped(storage_applying(Some(other_policy))));
     }
 
     fn bool_filter(ast: impl Into<QueryAst>) -> QueryAst {
