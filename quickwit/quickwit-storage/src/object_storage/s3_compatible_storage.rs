@@ -324,7 +324,8 @@ impl S3CompatibleObjectStorage {
 
     /// Applies `timeout_policy` to each attempt to download a slice, response body included. A
     /// timed-out attempt is retried, `max_num_retries` times at most, like any transient error:
-    /// the delays between attempts are not counted in the timeout.
+    /// waiting for a connection permit and the delays between attempts are not counted in the
+    /// timeout.
     pub fn with_timeout_policy(self, timeout_policy: StorageTimeoutPolicy) -> Self {
         Self {
             timeout_policy: Some(timeout_policy),
@@ -722,6 +723,17 @@ impl S3CompatibleObjectStorage {
         path: &Path,
         range_opt: Option<Range<usize>>,
     ) -> Result<(GetObjectOutput, GetObjectConnectionPermit), SdkError<GetObjectError>> {
+        let connection_permit = acquire_get_object_connection_permit().await;
+        let get_object_output = self.send_get_object(path, range_opt).await?;
+        Ok((get_object_output, connection_permit))
+    }
+
+    /// Sends a single GetObject request, on a connection permit acquired by the caller.
+    async fn send_get_object(
+        &self,
+        path: &Path,
+        range_opt: Option<Range<usize>>,
+    ) -> Result<GetObjectOutput, SdkError<GetObjectError>> {
         let key = self.key(path);
         let range_str = range_opt.map(|range| format!("bytes={}-{}", range.start, range.end - 1));
 
@@ -744,12 +756,10 @@ impl S3CompatibleObjectStorage {
             }
             None => {}
         }
-        let connection_permit = acquire_get_object_connection_permit().await;
-        let get_object_output = req_builder
+        req_builder
             .send()
             .with_count_and_duration_metrics(ActionLabel::GetObject, &self.bucket)
-            .await?;
-        Ok((get_object_output, connection_permit))
+            .await
     }
 
     /// A single attempt of [`Self::get_to_bytes`]. The body is read within the attempt: a
@@ -759,14 +769,15 @@ impl S3CompatibleObjectStorage {
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
+        _connection_permit: GetObjectConnectionPermit,
     ) -> Result<Bytes, Retry<StorageError>> {
         let download_kind = if range_opt.is_some() {
             DownloadKind::Slice
         } else {
             DownloadKind::Object
         };
-        let (get_object_output, _connection_permit) = self
-            .get_object(path, range_opt.clone())
+        let get_object_output = self
+            .send_get_object(path, range_opt.clone())
             .await
             .map_err(into_retry)?;
         // only record ranged get request as being in flight
@@ -793,7 +804,10 @@ impl S3CompatibleObjectStorage {
         let last_attempt_timed_out = AtomicBool::new(false);
         let payload_res =
             aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
-                let attempt = self.get_to_bytes_attempt(path, range_opt.clone());
+                // Waiting for a connection permit is local queueing: the attempt timeout starts
+                // once the permit is acquired.
+                let connection_permit = acquire_get_object_connection_permit().await;
+                let attempt = self.get_to_bytes_attempt(path, range_opt.clone(), connection_permit);
                 let Some((range, timeout_policy)) = slice_timeout_policy_opt else {
                     return attempt.await;
                 };

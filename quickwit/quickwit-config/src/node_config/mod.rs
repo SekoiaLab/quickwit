@@ -415,8 +415,9 @@ impl std::fmt::Display for CachePolicy {
 /// `timeout_offset + num_bytes_get_request / min_throughtput`
 ///
 /// S3-compatible storages apply this timeout to each attempt of a request, response body
-/// included, inside their own retry loop: the delays between attempts, for instance after a
-/// throttling error, are not counted. Other storages apply it to the whole `get_slice` call.
+/// included, inside their own retry loop: waiting for a connection and the delays between
+/// attempts, for instance after a throttling error, are not counted. Other storages apply it to
+/// the whole `get_slice` call.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StorageTimeoutPolicy {
     pub min_throughtput_bytes_per_secs: u64,
