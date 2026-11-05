@@ -18,13 +18,30 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
 use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
-use quickwit_config::{S3StorageConfig, StorageBackend};
+use quickwit_config::{S3StorageConfig, StorageBackend, StorageTimeoutPolicy};
 use tokio::sync::OnceCell;
 
 use super::s3_compatible_storage::create_s3_client;
 use crate::{
     DebouncedStorage, S3CompatibleObjectStorage, Storage, StorageFactory, StorageResolverError,
 };
+
+/// Settings of the S3 storages that belong to the node building them rather than to the S3
+/// storage config.
+#[derive(Clone, Default)]
+pub struct S3NodeOptions {
+    /// See [`S3CompatibleObjectStorage::with_assembly_thread_pool`].
+    pub assembly_thread_pool: Option<ThreadPoolWithPriority>,
+    /// See [`S3CompatibleObjectStorage::with_timeout_policy`].
+    pub timeout_policy: Option<StorageTimeoutPolicy>,
+}
+
+impl S3NodeOptions {
+    /// Whether no option is set.
+    pub fn is_empty(&self) -> bool {
+        self.assembly_thread_pool.is_none() && self.timeout_policy.is_none()
+    }
+}
 
 /// S3 compatible object storage resolver.
 pub struct S3CompatibleObjectStorageFactory {
@@ -35,8 +52,7 @@ pub struct S3CompatibleObjectStorageFactory {
     // end up being used, or if something like azure, gcs, or even local files, will be used
     // instead.
     s3_client: OnceCell<S3Client>,
-    /// See [`S3CompatibleObjectStorage::with_assembly_thread_pool`].
-    assembly_thread_pool: Option<ThreadPoolWithPriority>,
+    node_options: S3NodeOptions,
 }
 
 impl S3CompatibleObjectStorageFactory {
@@ -45,15 +61,14 @@ impl S3CompatibleObjectStorageFactory {
         Self {
             storage_config,
             s3_client: OnceCell::new(),
-            assembly_thread_pool: None,
+            node_options: S3NodeOptions::default(),
         }
     }
 
-    /// Every storage resolved by this factory assembles large multi-segment response bodies on
-    /// `thread_pool`. See [`S3CompatibleObjectStorage::with_assembly_thread_pool`].
-    pub fn with_assembly_thread_pool(self, thread_pool: ThreadPoolWithPriority) -> Self {
+    /// Applies `node_options` to every storage resolved by this factory.
+    pub fn with_node_options(self, node_options: S3NodeOptions) -> Self {
         Self {
-            assembly_thread_pool: Some(thread_pool),
+            node_options,
             ..self
         }
     }
@@ -74,8 +89,11 @@ impl StorageFactory for S3CompatibleObjectStorageFactory {
         let mut storage =
             S3CompatibleObjectStorage::from_uri_and_client(&self.storage_config, uri, s3_client)
                 .await?;
-        if let Some(thread_pool) = &self.assembly_thread_pool {
+        if let Some(thread_pool) = &self.node_options.assembly_thread_pool {
             storage = storage.with_assembly_thread_pool(thread_pool.clone());
+        }
+        if let Some(timeout_policy) = &self.node_options.timeout_policy {
+            storage = storage.with_timeout_policy(timeout_policy.clone());
         }
         Ok(Arc::new(DebouncedStorage::new(storage)))
     }

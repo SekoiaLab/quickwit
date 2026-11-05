@@ -55,7 +55,7 @@ use quickwit_search::{SearchResponseRest, single_node_search};
 use quickwit_serve::{
     BodyFormat, SearchRequestQueryString, SortBy, search_request_from_api_request,
 };
-use quickwit_storage::{BundleStorage, Storage};
+use quickwit_storage::{BundleStorage, S3NodeOptions, Storage};
 use tantivy::Index;
 use tantivy::directory::FileSlice;
 use tantivy::schema::FieldType;
@@ -65,7 +65,7 @@ use tracing::{debug, info};
 use crate::checklist::{GREEN_COLOR, RED_COLOR};
 use crate::{
     THROUGHPUT_WINDOW_SIZE, config_cli_arg, get_resolvers, load_node_config, run_index_checklist,
-    start_actor_runtimes,
+    s3_node_options, start_actor_runtimes,
 };
 
 pub fn build_tool_command() -> Command {
@@ -585,8 +585,11 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
     println!("❯ Ingesting documents locally...");
 
     let config = load_node_config(&args.config_uri).await?;
-    let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
+    let (storage_resolver, metastore_resolver) = get_resolvers(
+        &config.storage_configs,
+        &config.metastore_configs,
+        S3NodeOptions::default(),
+    );
     let mut metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
 
     let source_params = if let Some(uri) = args.input_path_opt.as_ref() {
@@ -715,8 +718,11 @@ pub async fn local_search_cli(args: LocalSearchArgs) -> anyhow::Result<()> {
     debug!(args=?args, "local-search");
     println!("❯ Searching directly on the index storage (without calling REST API)...");
     let config = load_node_config(&args.config_uri).await?;
-    let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
+    let (storage_resolver, metastore_resolver) = get_resolvers(
+        &config.storage_configs,
+        &config.metastore_configs,
+        s3_node_options(&config),
+    );
     let metastore: MetastoreServiceClient =
         metastore_resolver.resolve(&config.metastore_uri).await?;
     let aggs = args
@@ -754,8 +760,11 @@ pub async fn merge_cli(args: MergeArgs) -> anyhow::Result<()> {
     debug!(args=?args, "run-merge-operations");
     println!("❯ Merging splits locally...");
     let config = load_node_config(&args.config_uri).await?;
-    let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
+    let (storage_resolver, metastore_resolver) = get_resolvers(
+        &config.storage_configs,
+        &config.metastore_configs,
+        S3NodeOptions::default(),
+    );
     let mut metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
     run_index_checklist(&mut metastore, &storage_resolver, &args.index_id, None).await?;
     // The indexing service needs to update its cluster chitchat state so that the control plane is
@@ -842,8 +851,11 @@ pub async fn merge_mature_cli(args: MatureMergeArgs) -> anyhow::Result<()> {
     info!(merge_config=?args.merge_config, "merge-mature configuration");
     println!("❯ Scanning all indexes for mature merge opportunities...");
     let config = load_node_config(&args.config_uri).await?;
-    let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
+    let (storage_resolver, metastore_resolver) = get_resolvers(
+        &config.storage_configs,
+        &config.metastore_configs,
+        S3NodeOptions::default(),
+    );
     let metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
 
     let runtimes_config = RuntimesConfig::default();
@@ -874,8 +886,11 @@ pub async fn garbage_collect_index_cli(args: GarbageCollectIndexArgs) -> anyhow:
     println!("❯ Garbage collecting index...");
 
     let config = load_node_config(&args.config_uri).await?;
-    let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
+    let (storage_resolver, metastore_resolver) = get_resolvers(
+        &config.storage_configs,
+        &config.metastore_configs,
+        S3NodeOptions::default(),
+    );
     let metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
     let mut index_service = IndexService::new(metastore, storage_resolver);
     let removal_info = index_service
@@ -939,8 +954,11 @@ async fn extract_split_cli(args: ExtractSplitArgs) -> anyhow::Result<()> {
     println!("❯ Extracting split...");
 
     let config = load_node_config(&args.config_uri).await?;
-    let (storage_resolver, metastore_resolver) =
-        get_resolvers(&config.storage_configs, &config.metastore_configs, None);
+    let (storage_resolver, metastore_resolver) = get_resolvers(
+        &config.storage_configs,
+        &config.metastore_configs,
+        S3NodeOptions::default(),
+    );
     let metastore = metastore_resolver.resolve(&config.metastore_uri).await?;
     let index_metadata = metastore
         .index_metadata(IndexMetadataRequest::for_index_id(args.index_id))

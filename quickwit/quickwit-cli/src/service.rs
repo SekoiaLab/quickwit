@@ -30,8 +30,7 @@ use tracing::{debug, info};
 
 use crate::checklist::{BLUE_COLOR, RED_COLOR};
 use crate::{
-    config_cli_arg, get_resolvers, load_node_config, s3_assembly_thread_pool_for_services,
-    start_actor_runtimes,
+    config_cli_arg, get_resolvers, load_node_config, s3_node_options, start_actor_runtimes,
 };
 
 pub fn build_run_command() -> Command {
@@ -118,7 +117,7 @@ impl RunCliCommand {
         let (storage_resolver, metastore_resolver) = get_resolvers(
             &node_config.storage_configs,
             &node_config.metastore_configs,
-            s3_assembly_thread_pool_for_services(&node_config.enabled_services),
+            s3_node_options(&node_config),
         );
         crate::busy_detector::set_enabled(true);
         // TODO move in serve quickwit?

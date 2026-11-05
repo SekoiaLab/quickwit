@@ -37,6 +37,7 @@ pub struct StorageMetrics {
     pub searcher_split_cache: ComponentCacheMetrics,
     pub get_slice_timeout_successes: [IntCounter; 3],
     pub get_slice_timeout_all_timeouts: IntCounter,
+    pub get_slice_timeout_deadlines_exceeded: IntCounter,
     pub object_storage_requests_total: IntCounterVec<3>,
     pub object_storage_request_duration: HistogramVec<3>,
     pub object_storage_operation_attempts: HistogramVec<2>,
@@ -66,6 +67,8 @@ impl Default for StorageMetrics {
         ];
         let get_slice_timeout_all_timeouts =
             get_slice_timeout_outcome_total_vec.with_label_values(["all_timeouts"]);
+        let get_slice_timeout_deadlines_exceeded =
+            get_slice_timeout_outcome_total_vec.with_label_values(["deadline_exceeded"]);
 
         StorageMetrics {
             fast_field_cache: ComponentCacheMetrics::for_component("fastfields"),
@@ -78,6 +81,7 @@ impl Default for StorageMetrics {
             split_footer_disk_cache: ComponentCacheMetrics::for_component("splitfooter_disk"),
             get_slice_timeout_successes,
             get_slice_timeout_all_timeouts,
+            get_slice_timeout_deadlines_exceeded,
             object_storage_requests_total: new_counter_vec(
                 "object_storage_requests_total",
                 "Number of requests to the object store, by action, status and bucket. Requests \

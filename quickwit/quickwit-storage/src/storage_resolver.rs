@@ -17,7 +17,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use once_cell::sync::Lazy;
-use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::{Protocol, Uri};
 use quickwit_config::{StorageBackend, StorageConfigs};
 
@@ -27,7 +26,9 @@ use crate::AzureBlobStorageFactory;
 use crate::GoogleCloudStorageFactory;
 use crate::local_file_storage::LocalFileStorageFactory;
 use crate::ram_storage::RamStorageFactory;
-use crate::{S3CompatibleObjectStorageFactory, Storage, StorageFactory, StorageResolverError};
+use crate::{
+    S3CompatibleObjectStorageFactory, S3NodeOptions, Storage, StorageFactory, StorageResolverError,
+};
 
 /// Returns the [`Storage`] instance associated with the protocol of a URI. The actual creation of
 /// storage objects is delegated to pre-registered [`StorageFactory`]. The resolver is only
@@ -87,30 +88,19 @@ impl StorageResolver {
 
     /// Creates and returns a [`StorageResolver`].
     pub fn configured(storage_configs: &StorageConfigs) -> Self {
-        Self::configured_with_options(storage_configs, None)
+        Self::configured_with_s3_node_options(storage_configs, S3NodeOptions::default())
     }
 
-    /// Same as [`StorageResolver::configured`], but S3 storages assemble large multi-segment
-    /// downloads on `s3_assembly_thread_pool` instead of the tokio runtime. This is a property
-    /// of the node building the resolver, not of the storage configs: searcher-only nodes hand
-    /// over their search thread pool.
-    pub fn configured_with_s3_assembly_thread_pool(
+    /// Same as [`StorageResolver::configured`], with S3 storage settings that are properties of
+    /// the node building the resolver rather than of the storage configs.
+    pub fn configured_with_s3_node_options(
         storage_configs: &StorageConfigs,
-        s3_assembly_thread_pool: ThreadPoolWithPriority,
+        s3_node_options: S3NodeOptions,
     ) -> Self {
-        Self::configured_with_options(storage_configs, Some(s3_assembly_thread_pool))
-    }
-
-    fn configured_with_options(
-        storage_configs: &StorageConfigs,
-        s3_assembly_thread_pool_opt: Option<ThreadPoolWithPriority>,
-    ) -> Self {
-        let mut s3_storage_factory = S3CompatibleObjectStorageFactory::new(
+        let s3_storage_factory = S3CompatibleObjectStorageFactory::new(
             storage_configs.find_s3().cloned().unwrap_or_default(),
-        );
-        if let Some(thread_pool) = s3_assembly_thread_pool_opt {
-            s3_storage_factory = s3_storage_factory.with_assembly_thread_pool(thread_pool);
-        }
+        )
+        .with_node_options(s3_node_options);
         let mut builder = StorageResolver::builder()
             .register(LocalFileStorageFactory)
             .register(RamStorageFactory::default())
