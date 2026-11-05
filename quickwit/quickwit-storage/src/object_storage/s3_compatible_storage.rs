@@ -165,7 +165,10 @@ where
 /// The deadline of a `get_slice` subject to a timeout policy is this many times the timeout of a
 /// single attempt, whatever the number of attempts and including the waits between them: until it
 /// completes, it holds resources of its caller, for instance a search permit.
-const DEADLINE_FACTOR: u32 = 2;
+///
+/// With [`RetryParams::aggressive`], the throttling backoff between the 5 attempts lasts 5.85s at
+/// most, so it fits in the deadline as long as the attempt timeout is at least 2s.
+const DEADLINE_FACTOR: u32 = 3;
 
 /// Records the outcome of a `get_slice` subject to a timeout policy, in the same metric as
 /// [`crate::TimeoutAndRetryStorage`]: either it gave up because its last attempt timed out, or it
@@ -1679,7 +1682,7 @@ mod tests {
             get_object_event(206, SdkBody::from("abcd")),
         ]);
         // The backoff after the throttling error, 1 to 1.999s (jittered), is at least the 1s
-        // attempt timeout, yet under the 2s deadline: only the attempts are timed.
+        // attempt timeout, yet under the deadline (at least 2s): only the attempts are timed.
         let s3_storage = S3CompatibleObjectStorage {
             retry_params: RetryParams {
                 base_delay: Duration::from_millis(1_999),
@@ -1776,7 +1779,8 @@ mod tests {
                 .map(|_| get_object_error_event(503, "SlowDown"))
                 .collect(),
         );
-        // Attempts never time out, but the throttling lasts longer than the deadline: 2 x 1s.
+        // Attempts never time out, but the throttling lasts longer than the deadline.
+        let deadline = Duration::from_secs(1) * DEADLINE_FACTOR;
         let s3_storage = S3CompatibleObjectStorage {
             retry_params: RetryParams {
                 base_delay: Duration::from_secs(2),
@@ -1798,11 +1802,11 @@ mod tests {
         // Tokio timers have a millisecond granularity.
         let elapsed = start.elapsed();
         assert!(
-            Duration::from_secs(2) <= elapsed && elapsed < Duration::from_millis(2_010),
+            deadline <= elapsed && elapsed < deadline + Duration::from_millis(10),
             "{elapsed:?}"
         );
-        // A throttling backoff of 1 to 2s: at most 2 attempts fit in 2s.
-        assert!(client.actual_requests().count() <= 2);
+        // A throttling backoff of 1 to 2s: at most one attempt per second fits in the deadline.
+        assert!(client.actual_requests().count() <= DEADLINE_FACTOR as usize);
     }
 
     #[tokio::test]

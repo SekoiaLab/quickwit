@@ -96,7 +96,7 @@ impl RetryParams {
             max_delay: Duration::from_secs(20),
             max_attempts: 5,
             throttling_base_delay: Duration::from_millis(750),
-            throttling_max_delay: Duration::from_secs(1),
+            throttling_max_delay: Duration::from_millis(1_800),
         }
     }
 
