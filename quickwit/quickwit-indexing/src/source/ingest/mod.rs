@@ -69,6 +69,8 @@ impl TypedSourceFactory for IngestSourceFactory {
             max_attempts: usize::MAX,
             base_delay: Duration::from_secs(5),
             max_delay: Duration::from_secs(10 * 60), // 10 minutes
+            throttling_base_delay: Duration::from_secs(5),
+            throttling_max_delay: Duration::from_secs(10 * 60),
         };
         IngestSource::try_new(source_runtime, retry_params).await
     }
@@ -358,6 +360,8 @@ impl IngestSource {
                     base_delay: Duration::from_secs(1),
                     max_delay: Duration::from_secs(10),
                     max_attempts: 5,
+                    throttling_base_delay: Duration::from_secs(1),
+                    throttling_max_delay: Duration::from_secs(10),
                 };
                 for num_attempts in 1..=retry_params.max_attempts {
                     let Err(error) = ingester

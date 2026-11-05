@@ -24,12 +24,19 @@ pub trait Retryable {
     fn is_retryable(&self) -> bool {
         false
     }
+
+    /// Whether the error signals that the service is throttling requests. Such errors are retried
+    /// after longer delays, see [`RetryParams::compute_throttling_delay`].
+    fn is_throttling(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Retry<E> {
     Permanent(E),
     Transient(E),
+    Throttled(E),
 }
 
 impl<E> Retry<E> {
@@ -37,6 +44,7 @@ impl<E> Retry<E> {
         match self {
             Self::Transient(error) => error,
             Self::Permanent(error) => error,
+            Self::Throttled(error) => error,
         }
     }
 }
@@ -45,8 +53,12 @@ impl<E> Retryable for Retry<E> {
     fn is_retryable(&self) -> bool {
         match self {
             Retry::Permanent(_) => false,
-            Retry::Transient(_) => true,
+            Retry::Transient(_) | Retry::Throttled(_) => true,
         }
+    }
+
+    fn is_throttling(&self) -> bool {
+        matches!(self, Retry::Throttled(_))
     }
 }
 
@@ -55,6 +67,8 @@ pub struct RetryParams {
     pub base_delay: Duration,
     pub max_delay: Duration,
     pub max_attempts: usize,
+    pub throttling_base_delay: Duration,
+    pub throttling_max_delay: Duration,
 }
 
 impl RetryParams {
@@ -65,17 +79,24 @@ impl RetryParams {
             base_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(20),
             max_attempts: 3,
+            throttling_base_delay: Duration::from_secs(1),
+            throttling_max_delay: Duration::from_secs(20),
         }
     }
 
     /// Creates a new [`RetryParams`] instance using settings that are more aggressive than those of
     /// the standard policy for services that are more resilient to retries, usually managed
     /// cloud services.
+    ///
+    /// Throttled requests are retried later: a throttled request
+    /// is often throttled again if retried right away.
     pub fn aggressive() -> Self {
         Self {
             base_delay: Duration::from_millis(250),
             max_delay: Duration::from_secs(20),
             max_attempts: 5,
+            throttling_base_delay: Duration::from_millis(750),
+            throttling_max_delay: Duration::from_secs(1),
         }
     }
 
@@ -85,6 +106,8 @@ impl RetryParams {
             base_delay: Duration::ZERO,
             max_delay: Duration::ZERO,
             max_attempts: 1,
+            throttling_base_delay: Duration::ZERO,
+            throttling_max_delay: Duration::ZERO,
         }
     }
 
@@ -99,15 +122,21 @@ impl RetryParams {
     ///
     /// Panics if `num_attempts` is zero.
     pub fn compute_delay(&self, num_attempts: usize) -> Duration {
-        assert!(num_attempts > 0, "num_attempts should be greater than zero");
-        let num_attempts = num_attempts.min(32);
-        let delay_ms = (self.base_delay.as_millis() as u64)
-            .saturating_mul(2u64.saturating_pow(num_attempts as u32 - 1));
-        let capped_delay_ms = delay_ms.min(self.max_delay.as_millis() as u64);
-        let half_delay_ms = capped_delay_ms.div_ceil(2);
-        let jitter_range = half_delay_ms..capped_delay_ms + 1;
-        let jittered_delay_ms = rand::rng().random_range(jitter_range);
-        Duration::from_millis(jittered_delay_ms)
+        exponential_backoff_delay(self.base_delay, self.max_delay, num_attempts)
+    }
+
+    /// Computes the delay before a new attempt after a throttling error: same as
+    /// [`Self::compute_delay`], with the throttling base and maximum delays.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_attempts` is zero.
+    pub fn compute_throttling_delay(&self, num_attempts: usize) -> Duration {
+        exponential_backoff_delay(
+            self.throttling_base_delay,
+            self.throttling_max_delay,
+            num_attempts,
+        )
     }
 
     #[cfg(any(test, feature = "testsuite"))]
@@ -116,8 +145,28 @@ impl RetryParams {
             base_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(2),
             max_attempts: 3,
+            throttling_base_delay: Duration::from_millis(1),
+            throttling_max_delay: Duration::from_millis(2),
         }
     }
+}
+
+/// Delay of an exponential backoff with full jitter: between half and all of
+/// `base_delay * 2^(num_attempts - 1)`, capped at `max_delay`. See [`RetryParams::compute_delay`].
+fn exponential_backoff_delay(
+    base_delay: Duration,
+    max_delay: Duration,
+    num_attempts: usize,
+) -> Duration {
+    assert!(num_attempts > 0, "num_attempts should be greater than zero");
+    let num_attempts = num_attempts.min(32);
+    let delay_ms = (base_delay.as_millis() as u64)
+        .saturating_mul(2u64.saturating_pow(num_attempts as u32 - 1));
+    let capped_delay_ms = delay_ms.min(max_delay.as_millis() as u64);
+    let half_delay_ms = capped_delay_ms.div_ceil(2);
+    let jitter_range = half_delay_ms..capped_delay_ms + 1;
+    let jittered_delay_ms = rand::rng().random_range(jitter_range);
+    Duration::from_millis(jittered_delay_ms)
 }
 
 #[async_trait]
@@ -166,7 +215,11 @@ where
             );
             return Err(error);
         }
-        let delay = retry_params.compute_delay(num_attempts);
+        let delay = if error.is_throttling() {
+            retry_params.compute_throttling_delay(num_attempts)
+        } else {
+            retry_params.compute_delay(num_attempts)
+        };
         debug!(
             num_attempts=%num_attempts,
             delay_ms=%delay.as_millis(),
@@ -187,7 +240,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::RwLock;
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
 
     use futures::future::ready;
@@ -226,6 +279,8 @@ mod tests {
                 base_delay: Duration::from_millis(1),
                 max_delay: Duration::from_millis(2),
                 max_attempts: 30,
+                throttling_base_delay: Duration::from_millis(1),
+                throttling_max_delay: Duration::from_millis(2),
             },
             || ready(values_it.write().unwrap().next().unwrap()),
             noop_mock,
@@ -266,6 +321,51 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingSleep(Arc<Mutex<Vec<Duration>>>);
+
+    #[async_trait::async_trait]
+    impl MockableSleep for RecordingSleep {
+        async fn sleep(&self, duration: Duration) {
+            self.0.lock().unwrap().push(duration);
+        }
+    }
+
+    /// Returns the delays slept before each attempt of an operation that fails with `errors`, in
+    /// order, then succeeds.
+    async fn record_delays(errors: Vec<super::Retry<()>>) -> Vec<u128> {
+        let retry_params = RetryParams {
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            max_attempts: 10,
+            throttling_base_delay: Duration::from_millis(300),
+            throttling_max_delay: Duration::from_millis(800),
+        };
+        let attempts = RwLock::new(errors.into_iter().map(Err).chain([Ok(())]));
+        let recording_sleep = RecordingSleep::default();
+        retry_with_mockable_sleep(
+            &retry_params,
+            || ready(attempts.write().unwrap().next().unwrap()),
+            recording_sleep.clone(),
+        )
+        .await
+        .unwrap();
+        let delays = recording_sleep.0.lock().unwrap();
+        delays.iter().map(|delay| delay.as_millis()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_retry_waits_longer_after_throttling_errors() {
+        let delays = record_delays((0..3).map(|_| super::Retry::Throttled(())).collect()).await;
+        // Jittered delays: 300ms, then 600ms, then capped at 800ms.
+        assert!((150..=300).contains(&delays[0]), "{delays:?}");
+        assert!((300..=600).contains(&delays[1]), "{delays:?}");
+        assert!((400..=800).contains(&delays[2]), "{delays:?}");
+
+        let delays = record_delays(vec![super::Retry::Transient(())]).await;
+        assert!((50..=100).contains(&delays[0]), "{delays:?}");
+    }
+
     #[tokio::test]
     async fn test_retry_retries_up_to_max_attempts_times() {
         let retry_sequence: Vec<_> = (0..29)
@@ -296,6 +396,8 @@ mod tests {
                 max_attempts,
                 base_delay: Duration::from_millis(base_delay),
                 max_delay: Duration::from_millis(max_delay),
+                throttling_base_delay: Duration::from_millis(base_delay),
+                throttling_max_delay: Duration::from_millis(max_delay),
             };
             test_retry_delay_does_not_overflow_aux(retry_params);
         }
