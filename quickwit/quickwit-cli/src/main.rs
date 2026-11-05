@@ -23,6 +23,7 @@ use quickwit_cli::cli::{CliCommand, build_cli};
 #[cfg(feature = "jemalloc")]
 use quickwit_cli::jemalloc::start_jemalloc_metrics_loop;
 use quickwit_cli::logger::setup_logging_and_tracing;
+use quickwit_cli::sentry_integration::{flush_sentry, init_sentry};
 use quickwit_cli::{busy_detector, install_default_crypto_ring_provider};
 use quickwit_common::runtimes::scrape_tokio_runtime_metrics;
 use quickwit_common::slow_poll::configure_s3_task_poll_attribution;
@@ -41,6 +42,11 @@ fn get_main_runtime_num_threads() -> usize {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Sentry's transport uses the process-wide rustls provider, so install it first. Init
+    // before the Tokio runtime so its threads bind to the main hub.
+    install_default_crypto_ring_provider();
+    let _sentry_guard = init_sentry(BuildInfo::get());
+
     let main_runtime_num_threads: usize = get_main_runtime_num_threads();
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     configure_s3_task_poll_attribution(&mut runtime_builder);
@@ -123,6 +129,7 @@ async fn main_impl() -> anyhow::Result<()> {
             .context("failed to shutdown OpenTelemetry tracer provider")?;
     }
 
+    flush_sentry();
     std::process::exit(return_code)
 }
 

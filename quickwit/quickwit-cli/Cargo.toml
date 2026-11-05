@@ -42,6 +42,7 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+sentry = { workspace = true }
 serde_json = { workspace = true }
 tabled = { workspace = true }
 tempfile = { workspace = true }
@@ -75,6 +76,7 @@ tantivy = { workspace = true }
 
 [dev-dependencies]
 predicates = { workspace = true }
+sentry = { workspace = true, features = ["test"] }
 reqwest = { workspace = true }
 
 quickwit-actors = { workspace = true, features = ["testsuite"] }

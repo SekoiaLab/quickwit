@@ -90,6 +90,8 @@ pub fn setup_logging_and_tracing(
         reloadable_env_filter,
     )?;
 
+    let registry = registry.with(crate::sentry_integration::sentry_layer());
+
     // Note on disabling ANSI characters: setting the ansi boolean on event format is insufficient.
     // It is thus set on layers, see https://github.com/tokio-rs/tracing/issues/1817
     let provider_opt = if get_bool_from_env(QW_ENABLE_OPENTELEMETRY_OTLP_EXPORTER_ENV_KEY, false) {

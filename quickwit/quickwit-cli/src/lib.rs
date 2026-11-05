@@ -53,6 +53,7 @@ pub mod jemalloc;
 pub mod logger;
 pub mod maintenance;
 pub mod metrics;
+pub mod sentry_integration;
 pub mod service;
 pub mod source;
 pub mod split;
