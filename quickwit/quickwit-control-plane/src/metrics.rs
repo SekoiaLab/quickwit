@@ -42,6 +42,7 @@ pub struct ControlPlaneMetrics {
     // Indexing plan metrics.
     pub local_shards: IntGauge,
     pub remote_shards: IntGauge,
+    pub unassigned_pipelines: IntGauge,
 
     // Maintenance mode.
     pub maintenance_mode: IntGauge,
@@ -131,6 +132,13 @@ impl Default for ControlPlaneMetrics {
             ),
             local_shards,
             remote_shards,
+            unassigned_pipelines: new_gauge(
+                "unassigned_pipelines",
+                "Number of indexing pipelines (shards for ingest v2 sources) left out of the \
+                 indexing plan because all indexers reached their maximum number of pipelines.",
+                "control_plane",
+                &[],
+            ),
             maintenance_mode: new_gauge(
                 "maintenance_mode",
                 "Whether the control plane is in maintenance mode (1 = enabled, 0 = disabled).",
