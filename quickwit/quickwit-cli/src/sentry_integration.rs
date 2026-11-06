@@ -81,9 +81,7 @@ fn release_name(build_info: &BuildInfo) -> String {
 /// Tracing layer forwarding events to Sentry. Spans are ignored: tracing is exported with
 /// OpenTelemetry, and creating a Sentry span for each tracing span would cost on hot paths.
 pub fn sentry_layer<S>() -> SentryLayer<S>
-where
-    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-{
+where S: tracing::Subscriber + for<'a> LookupSpan<'a> {
     sentry::integrations::tracing::layer()
         .event_filter(event_filter)
         .span_filter(|_| false)
@@ -92,9 +90,7 @@ where
 /// The Sentry layer, or `None` when the client is disabled (no `SENTRY_DSN`), so that a disabled
 /// Sentry adds no work to each event. `init_sentry` must run first.
 pub fn sentry_layer_if_enabled<S>() -> Option<SentryLayer<S>>
-where
-    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-{
+where S: tracing::Subscriber + for<'a> LookupSpan<'a> {
     let is_enabled = match sentry::Hub::main().client() {
         Some(client) => client.is_enabled(),
         None => false,
