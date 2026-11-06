@@ -37,6 +37,11 @@ service SearchService {
   /// This methods takes `PartialHit`s and returns `Hit`s.
   rpc FetchDocs(FetchDocsRequest) returns (FetchDocsResponse);
 
+  // Streams document contents from the document store.
+  // This method takes `PartialHit`s and streams back `LeafHit`s in batches
+  // to avoid hitting gRPC message size limits.
+  rpc StreamFetchDocs(FetchDocsRequest) returns (stream FetchDocsResponse);
+
   // Root list terms API.
   // This RPC identifies the set of splits on which the query should run on,
   // and dispatches the several calls to `LeafListTerms`.
@@ -102,6 +107,8 @@ message ReportSplit {
   string split_id = 2;
   // The storage uri. This URI does NOT include the split id.
   string storage_uri = 1;
+  // The size of the split file, in bytes.
+  uint64 num_bytes = 3;
 }
 
 message ReportSplitsRequest {
@@ -249,6 +256,9 @@ message SearchRequest {
   bool ignore_missing_indexes = 18;
 
   optional string split_id = 19;
+
+  // The user agent of the client that initiated the search request.
+  optional string user_agent = 20;
 }
 
 enum CountHits {
@@ -264,7 +274,7 @@ message SortField {
   SortOrder sort_order = 2;
   // Optional sort value format for datetime field only.
   // If none, the default output format for datetime field is
-  // unix_timestamp_nanos.
+  // unix_timestamp_millis.
   optional SortDatetimeFormat sort_datetime_format = 3;
 }
 
@@ -292,8 +302,8 @@ message SearchResponse {
   // server-side and expressed in microseconds.
   uint64 elapsed_time_micros = 3;
 
-  // The searcherrors that occurred formatted as string.
-  repeated string errors = 4;
+  // deprecated `errors` field
+  reserved 4;
 
   // used to be json-encoded aggregation
   reserved 5;
@@ -314,6 +324,9 @@ message SearchResponse {
 
   // Total number of successful splits searched.
   uint64 num_successful_splits = 8;
+
+  // Statistics on the split outcomes
+  SplitsByOutcome splits_by_outcome = 10;
 }
 
 message SearchPlanResponse {
@@ -351,6 +364,24 @@ message LeafSearchRequest {
   repeated string index_uris = 9;
 }
 
+// Split outcome counters
+message SplitsByOutcome {
+    uint64 pruned_before_warmup = 1;
+    uint64 pruned_after_warmup = 2;
+    // Cancelled before warmup started (error or timeout)
+    uint64 cancel_before_warmup = 3;
+    uint64 processed = 4;
+    uint64 processed_from_metadata = 5;
+    // Resolved by the partial request cache
+    uint64 cache_hit = 6;
+    // Cancelled during warmup (error or timeout)
+    uint64 cancel_warmup = 7;
+    // Cancelled while waiting in the CPU thread pool queue
+    uint64 cancel_cpu_queue = 8;
+    // Cancelled during CPU processing (error or timeout)
+    uint64 cancel_cpu = 9;
+}
+
 message ResourceStats {
     uint64 short_lived_cache_num_bytes = 1;
     uint64 split_num_docs = 2;
@@ -386,6 +417,8 @@ message SplitIdAndFooterOffsets {
   optional int64 timestamp_end = 5;
   // The number of docs in the split
   uint64 num_docs = 6;
+  // Tantivy doc IDs that have been soft-deleted from this split
+  repeated uint32 soft_deleted_doc_ids = 7;
 }
 
 // Hits returned by a FetchDocRequest.
@@ -461,9 +494,11 @@ message SortByValue {
   int64 i64 = 2;
   double f64 = 3;
   bool boolean = 4;
+  string str = 5;
+  int64 datetime = 6;
   }
   // Room for eventual future sorted key types.
-  reserved 5 to 20;
+  reserved 7 to 20;
 }
 
 message LeafSearchResponse {
@@ -493,6 +528,9 @@ message LeafSearchResponse {
   optional bytes intermediate_aggregation_result = 6;
 
   ResourceStats resource_stats = 8;
+
+  // Split outcome counters for all splits targeted by this leaf request.
+  optional SplitsByOutcome splits_by_outcome = 9;
 }
 
 message SnippetRequest {

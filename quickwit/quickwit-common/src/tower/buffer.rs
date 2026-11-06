@@ -214,11 +214,9 @@ mod tests {
 
         fn call(&mut self, (dividend, divisor): (usize, usize)) -> Self::Future {
             let fut = async move {
-                if divisor == 0 {
-                    Err(MyServiceError::ZeroDivision)
-                } else {
-                    Ok(dividend / divisor)
-                }
+                dividend
+                    .checked_div(divisor)
+                    .ok_or(MyServiceError::ZeroDivision)
             };
             Box::pin(fut)
         }

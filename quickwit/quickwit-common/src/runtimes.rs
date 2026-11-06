@@ -176,7 +176,7 @@ pub fn scrape_tokio_runtime_metrics(handle: &tokio::runtime::Handle, label: &'st
 
 struct PrometheusRuntimeMetrics {
     scheduled_tasks: IntGauge,
-    worker_busy_duration_milliseconds_total: IntCounter,
+    worker_busy_duration_microsecs_total: IntCounter,
     worker_busy_ratio: Gauge,
     worker_threads: IntGauge,
 }
@@ -190,9 +190,9 @@ impl PrometheusRuntimeMetrics {
                 "runtime",
                 &[("runtime_type", label)],
             ),
-            worker_busy_duration_milliseconds_total: new_counter(
-                "tokio_worker_busy_duration_milliseconds_total",
-                " The total amount of time worker threads were busy.",
+            worker_busy_duration_microsecs_total: new_counter(
+                "tokio_worker_busy_duration_microsecs_total",
+                "The total amount of time worker threads were busy.",
                 "runtime",
                 &[("runtime_type", label)],
             ),
@@ -215,8 +215,8 @@ impl PrometheusRuntimeMetrics {
     pub fn update(&mut self, runtime_metrics: &RuntimeMetrics) {
         self.scheduled_tasks
             .set(runtime_metrics.total_local_queue_depth as i64);
-        self.worker_busy_duration_milliseconds_total
-            .inc_by(runtime_metrics.total_busy_duration.as_millis() as u64);
+        self.worker_busy_duration_microsecs_total
+            .inc_by(runtime_metrics.total_busy_duration.as_micros() as u64);
         self.worker_busy_ratio.set(runtime_metrics.busy_ratio());
         self.worker_threads
             .set(runtime_metrics.workers_count as i64);

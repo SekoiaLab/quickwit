@@ -361,6 +361,24 @@ impl IndexMetadataRequest {
     }
 }
 
+impl GetSourceCheckpointRequest {
+    pub fn for_index_id(index_id: IndexId, source_id: SourceId) -> Self {
+        Self {
+            index_id: Some(index_id),
+            index_uid: None,
+            source_id,
+        }
+    }
+
+    pub fn for_index_uid(index_uid: IndexUid, source_id: SourceId) -> Self {
+        Self {
+            index_id: None,
+            index_uid: Some(index_uid),
+            source_id,
+        }
+    }
+}
+
 impl MarkSplitsForDeletionRequest {
     pub fn new(index_uid: IndexUid, split_ids: Vec<String>) -> Self {
         Self {

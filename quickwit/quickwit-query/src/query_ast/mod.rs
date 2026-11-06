@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use serde::{Deserialize, Serialize};
+use tantivy::Term;
 use tantivy::query::BoostQuery as TantivyBoostQuery;
-use tantivy::schema::Schema as TantivySchema;
+use tantivy::schema::{Field, Schema as TantivySchema};
 
 use crate::tokenizers::TokenizerManager;
 
@@ -325,8 +326,46 @@ pub fn query_ast_from_user_text(user_text: &str, default_fields: Option<Vec<Stri
     .into()
 }
 
+/// Serialized binary JSON-path prefix used to scope automaton queries (regex,
+/// wildcard) to a particular sub-field of a JSON field. The bytes encode the
+/// tantivy path with `\x01` segment separators and a trailing `\x00<type>`
+/// marker.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct JsonPath(Vec<u8>);
+
+impl std::ops::Deref for JsonPath {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl JsonPath {
+    /// Builds the serialized JSON-path prefix using the Tantivy encoding.
+    pub fn from_json_path(json_path: &str, expand_dots_enabled: bool) -> Self {
+        let mut term =
+            Term::from_field_json_path(Field::from_field_id(0), json_path, expand_dots_enabled);
+        term.append_type_and_str("");
+        // Skip the first byte: it is a JSON-field marker that is not stored in the dictionary.
+        JsonPath(term.value().as_serialized()[1..].to_owned())
+    }
+}
+
+impl std::fmt::Display for JsonPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        let path = &self.0;
+        let path_bytes = &path[..path.iter().position(|&b| b == 0).unwrap_or(path.len())];
+        for ch in String::from_utf8_lossy(path_bytes).chars() {
+            f.write_char(if ch == '\x01' { '.' } else { ch })?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::JsonPath;
     use crate::query_ast::tantivy_query_ast::TantivyQueryAst;
     use crate::query_ast::{
         BoolQuery, BuildTantivyAst, BuildTantivyAstContext, QueryAst, UserInputQuery,
@@ -439,5 +478,53 @@ mod tests {
             panic!()
         };
         assert_eq!(input_query.default_operator, BooleanOperand::And);
+    }
+
+    #[test]
+    fn test_json_path_display() {
+        #[rustfmt::skip]
+        let cases: &[(&str, bool, &str)] = &[
+            // (json_path_input, expand_dots_enabled, expected_display)
+
+            // empty path (field with no sub-key)
+            ("",                   false, ""),
+            ("",                   true,  ""),
+
+            // single-segment paths
+            ("foo",                false, "foo"),
+            ("foo",                true,  "foo"),
+            ("_my_field",          false, "_my_field"),
+            ("field123",           false, "field123"),
+
+            // two-level paths
+            ("foo.bar",            false, "foo.bar"),
+            ("foo.bar",            true,  "foo.bar"),
+            ("process.executable", false, "process.executable"),
+
+            // three-level and deeper
+            ("a.b.c",              false, "a.b.c"),
+            ("a.b.c.d.e",          false, "a.b.c.d.e"),
+
+            // escaped dot: `split_json_path` treats `\.` as a literal dot in
+            // the segment name, so it becomes a single segment "k8s.node".
+            // With expand_dots=false the writer stores it as literal bytes "k8s.node";
+            // with expand_dots=true the writer re-expands the dot into \x01.
+            // In both cases Display renders it as "k8s.node".
+            ("k8s\\.node",         false, "k8s.node"),
+            ("k8s\\.node",         true,  "k8s.node"),
+
+            // escaped dot in the middle of a longer path
+            ("ns.k8s\\.node.id",   false, "ns.k8s.node.id"),
+            ("ns.k8s\\.node.id",   true,  "ns.k8s.node.id"),
+        ];
+
+        for &(input, expand_dots, expected) in cases {
+            let path = JsonPath::from_json_path(input, expand_dots);
+            assert_eq!(
+                path.to_string(),
+                expected,
+                "from_json_path({input:?}, expand_dots={expand_dots})"
+            );
+        }
     }
 }

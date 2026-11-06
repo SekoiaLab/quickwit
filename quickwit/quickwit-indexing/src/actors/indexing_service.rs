@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -115,6 +116,7 @@ pub struct IndexingService {
     cooperative_indexing_permits: Option<Arc<Semaphore>>,
     merge_io_throughput_limiter_opt: Option<Limiter>,
     event_broker: EventBroker,
+    is_delete_task_service_disabled: bool,
 }
 
 impl Debug for IndexingService {
@@ -142,6 +144,7 @@ impl IndexingService {
         ingester_pool: IngesterPool,
         storage_resolver: StorageResolver,
         event_broker: EventBroker,
+        is_delete_task_service_disabled: bool,
     ) -> anyhow::Result<IndexingService> {
         let split_store_space_quota = SplitStoreQuota::try_new(
             indexer_config.split_store_max_num_splits,
@@ -178,6 +181,7 @@ impl IndexingService {
             merge_io_throughput_limiter_opt,
             cooperative_indexing_permits,
             event_broker,
+            is_delete_task_service_disabled,
         })
     }
 
@@ -379,6 +383,7 @@ impl IndexingService {
             params_fingerprint,
 
             event_broker: self.event_broker.clone(),
+            is_delete_task_service_disabled: self.is_delete_task_service_disabled,
         };
         let pipeline = IndexingPipeline::new(pipeline_params);
         let (pipeline_mailbox, pipeline_handle) = ctx.spawn_actor().spawn(pipeline);
@@ -402,7 +407,10 @@ impl IndexingService {
         let index_metadata_response = self
             .metastore
             .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
-            .await?;
+            .await
+            .inspect_err(|error| {
+                error!(%error, index_id, "failed to fetch index metadata from the metastore");
+            })?;
         let index_metadata = index_metadata_response.deserialize_index_metadata()?;
         Ok(index_metadata)
     }
@@ -429,7 +437,10 @@ impl IndexingService {
         let indexes_metadata_response = self
             .metastore
             .indexes_metadata(indexes_metadata_request)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                error!(%error, "failed to fetch indexes metadata from the metastore");
+            })?;
         let indexes_metadata = indexes_metadata_response
             .deserialize_indexes_metadata()
             .await?;
@@ -468,7 +479,10 @@ impl IndexingService {
 
         let mut immature_splits_stream = ctx
             .protect_future(self.metastore.list_splits(list_splits_request))
-            .await?;
+            .await
+            .inspect_err(|error| {
+                error!(%error, "failed to list immature splits from the metastore");
+            })?;
 
         let mut per_merge_pipeline_immature_splits: HashMap<MergePipelineId, Vec<SplitMetadata>> =
             indexing_pipeline_ids
@@ -478,7 +492,14 @@ impl IndexingService {
 
         let mut num_immature_splits = 0usize;
 
-        while let Some(list_splits_response) = immature_splits_stream.try_next().await? {
+        while let Some(list_splits_response) =
+            immature_splits_stream
+                .try_next()
+                .await
+                .inspect_err(|error| {
+                    error!(%error, "failed to fetch a batch of immature splits from the metastore");
+                })?
+        {
             for split_metadata in list_splits_response.deserialize_splits_metadata().await? {
                 num_immature_splits += 1;
 
@@ -847,7 +868,10 @@ impl IndexingService {
         let indexes_metadata = self
             .metastore
             .list_indexes_metadata(ListIndexesMetadataRequest::all())
-            .await?
+            .await
+            .inspect_err(|error| {
+                error!(%error, "failed to list indexes metadata from the metastore");
+            })?
             .deserialize_indexes_metadata()
             .await?;
         let index_ids: HashSet<String> = indexes_metadata
@@ -895,6 +919,7 @@ impl Handler<ObservePipeline> for IndexingService {
         msg: ObservePipeline,
         _ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
+        let _slow_handler_guard = SlowHandlerGuard::new("observe_pipeline");
         let pipeline_uid = msg.pipeline_id.pipeline_uid;
         let observation = self.observe_pipeline(&pipeline_uid).await;
         Ok(observation)
@@ -910,6 +935,7 @@ impl Handler<DetachIndexingPipeline> for IndexingService {
         msg: DetachIndexingPipeline,
         _ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
+        let _slow_handler_guard = SlowHandlerGuard::new("detach_indexing_pipeline");
         let pipeline_uid = msg.pipeline_id.pipeline_uid;
         let detach_pipeline_result = self.detach_indexing_pipeline(&pipeline_uid).await;
         Ok(detach_pipeline_result)
@@ -925,6 +951,7 @@ impl Handler<DetachMergePipeline> for IndexingService {
         msg: DetachMergePipeline,
         _ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
+        let _slow_handler_guard = SlowHandlerGuard::new("detach_merge_pipeline");
         Ok(self.detach_merge_pipeline(&msg.pipeline_id).await)
     }
 }
@@ -941,6 +968,7 @@ impl Handler<SuperviseLoop> for IndexingService {
         _message: SuperviseLoop,
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
+        let _slow_handler_guard = SlowHandlerGuard::new("supervise_loop");
         self.handle_supervise().await?;
         ctx.schedule_self_msg(*quickwit_actors::HEARTBEAT, SuperviseLoop);
         Ok(())
@@ -969,6 +997,7 @@ impl Handler<SpawnPipeline> for IndexingService {
         message: SpawnPipeline,
         ctx: &ActorContext<Self>,
     ) -> Result<Result<IndexingPipelineId, IndexingError>, ActorExitStatus> {
+        let _slow_handler_guard = SlowHandlerGuard::new("spawn_pipeline");
         Ok(self
             .spawn_pipeline(
                 ctx,
@@ -989,6 +1018,7 @@ impl Handler<ApplyIndexingPlanRequest> for IndexingService {
         plan_request: ApplyIndexingPlanRequest,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
+        let _slow_handler_guard = SlowHandlerGuard::new("apply_indexing_plan");
         Ok(self
             .apply_indexing_plan(&plan_request.indexing_tasks, ctx)
             .await
@@ -1014,6 +1044,32 @@ impl Handler<Healthz> for IndexingService {
 struct IndexingPipelineDiff {
     pipelines_to_shutdown: Vec<PipelineUid>,
     pipelines_to_spawn: Vec<IndexingTask>,
+}
+
+/// Logs a warning every 5 seconds until dropped. Useful to identify slow
+/// handlers that might compromise liveness checks.
+pub struct SlowHandlerGuard {
+    _cancel_tx: oneshot::Sender<()>,
+}
+
+impl SlowHandlerGuard {
+    pub fn new(handler_name: &'static str) -> Self {
+        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        let start = Instant::now();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        warn!(handler=handler_name, elapsed_secs=start.elapsed().as_secs(), "slow indexing service handler");
+                    }
+                    _ = &mut cancel_rx => { break; }
+                }
+            }
+        });
+        Self {
+            _cancel_tx: cancel_tx,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1050,6 +1106,7 @@ mod tests {
         universe: &Universe,
         metastore: MetastoreServiceClient,
         cluster: Cluster,
+        is_delete_task_service_disabled: bool,
     ) -> (Mailbox<IndexingService>, ActorHandle<IndexingService>) {
         let indexer_config = IndexerConfig::for_test().unwrap();
         let num_blocking_threads = 1;
@@ -1061,7 +1118,7 @@ mod tests {
                 .unwrap();
         let merge_scheduler_mailbox: Mailbox<MergeSchedulerService> = universe.get_or_spawn_one();
         let indexing_server = IndexingService::new(
-            NodeId::from("test-node"),
+            NodeId::from_str("test-node"),
             data_dir_path.to_path_buf(),
             indexer_config,
             num_blocking_threads,
@@ -1072,6 +1129,7 @@ mod tests {
             IngesterPool::default(),
             storage_resolver.clone(),
             EventBroker::default(),
+            is_delete_task_service_disabled,
         )
         .await
         .unwrap();
@@ -1109,7 +1167,8 @@ mod tests {
         let universe = Universe::with_accelerated_time();
         let temp_dir = tempfile::tempdir().unwrap();
         let (indexing_service, indexing_service_handle) =
-            spawn_indexing_service_for_test(temp_dir.path(), &universe, metastore, cluster).await;
+            spawn_indexing_service_for_test(temp_dir.path(), &universe, metastore, cluster, false)
+                .await;
         let observation = indexing_service_handle.observe().await;
         assert_eq!(observation.num_running_pipelines, 0);
         assert_eq!(observation.num_failed_pipelines, 0);
@@ -1215,7 +1274,8 @@ mod tests {
         let universe = Universe::new();
         let temp_dir = tempfile::tempdir().unwrap();
         let (indexing_service, indexing_server_handle) =
-            spawn_indexing_service_for_test(temp_dir.path(), &universe, metastore, cluster).await;
+            spawn_indexing_service_for_test(temp_dir.path(), &universe, metastore, cluster, false)
+                .await;
 
         indexing_service
             .ask_for_res(SpawnPipeline {
@@ -1275,6 +1335,7 @@ mod tests {
             &universe,
             metastore.clone(),
             cluster.clone(),
+            false,
         )
         .await;
         let metadata = metastore
@@ -1574,7 +1635,7 @@ mod tests {
                 .unwrap();
         let merge_scheduler_service = universe.get_or_spawn_one();
         let indexing_server = IndexingService::new(
-            NodeId::from("test-node"),
+            NodeId::from_str("test-node"),
             data_dir_path,
             indexer_config,
             num_blocking_threads,
@@ -1585,6 +1646,7 @@ mod tests {
             IngesterPool::default(),
             storage_resolver.clone(),
             EventBroker::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1702,6 +1764,7 @@ mod tests {
             &universe,
             MetastoreServiceClient::from_mock(mock_metastore),
             cluster,
+            false,
         )
         .await;
         let _pipeline_id = indexing_service
@@ -1776,7 +1839,7 @@ mod tests {
         let storage_resolver = StorageResolver::unconfigured();
         let merge_scheduler_service: Mailbox<MergeSchedulerService> = universe.get_or_spawn_one();
         let mut indexing_server = IndexingService::new(
-            NodeId::from("test-ingest-api-gc-node"),
+            NodeId::from_str("test-ingest-api-gc-node"),
             data_dir_path,
             indexer_config,
             num_blocking_threads,
@@ -1787,6 +1850,7 @@ mod tests {
             IngesterPool::default(),
             storage_resolver.clone(),
             EventBroker::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1885,6 +1949,7 @@ mod tests {
             &universe,
             MetastoreServiceClient::from_mock(mock_metastore),
             cluster,
+            false,
         )
         .await;
 
