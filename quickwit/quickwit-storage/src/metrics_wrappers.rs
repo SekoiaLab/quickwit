@@ -866,6 +866,8 @@ mod tests {
             base_delay: Duration::from_secs(10),
             max_delay: Duration::from_secs(10),
             max_attempts: 3,
+            throttling_base_delay: Duration::from_secs(10),
+            throttling_max_delay: Duration::from_secs(10),
         };
         let recorded = record_operation("cancelled_during_backoff", async {
             let operation = aws_retry_with_metrics(

@@ -147,13 +147,15 @@ impl<T: AsyncRead + Send + Unpin> AsyncRead for S3AsyncRead<T> {
     }
 }
 
-/// Classifies an SDK error for the retry loop: transient or permanent.
+/// Classifies an SDK error for the retry loop: throttled, transient or permanent.
 fn into_retry<E>(sdk_error: SdkError<E>) -> Retry<StorageError>
 where
     SdkError<E>: AwsRetryable,
     StorageError: From<SdkError<E>>,
 {
-    if sdk_error.is_retryable() {
+    if sdk_error.is_throttling() {
+        Retry::Throttled(StorageError::from(sdk_error))
+    } else if sdk_error.is_retryable() {
         Retry::Transient(StorageError::from(sdk_error))
     } else {
         Retry::Permanent(StorageError::from(sdk_error))
@@ -163,7 +165,10 @@ where
 /// The deadline of a `get_slice` subject to a timeout policy is this many times the timeout of a
 /// single attempt, whatever the number of attempts and including the waits between them: until it
 /// completes, it holds resources of its caller, for instance a search permit.
-const DEADLINE_FACTOR: u32 = 2;
+///
+/// With [`RetryParams::aggressive`], the throttling backoff between the 5 attempts lasts 5.85s at
+/// most, so it fits in the deadline as long as the attempt timeout is at least 2s.
+const DEADLINE_FACTOR: u32 = 3;
 
 /// Records the outcome of a `get_slice` subject to a timeout policy, in the same metric as
 /// [`crate::TimeoutAndRetryStorage`]: either it gave up because its last attempt timed out, or it
@@ -1677,12 +1682,14 @@ mod tests {
             get_object_event(206, SdkBody::from("abcd")),
         ]);
         // The backoff after the throttling error, 1 to 1.999s (jittered), is at least the 1s
-        // attempt timeout, yet under the 2s deadline: only the attempts are timed.
+        // attempt timeout, yet under the deadline (at least 2s): only the attempts are timed.
         let s3_storage = S3CompatibleObjectStorage {
             retry_params: RetryParams {
                 base_delay: Duration::from_millis(1_999),
                 max_delay: Duration::from_secs(10),
                 max_attempts: 3,
+                throttling_base_delay: Duration::from_millis(1_999),
+                throttling_max_delay: Duration::from_secs(10),
             },
             ..s3_storage_for_get_test(client.clone())
         }
@@ -1696,6 +1703,73 @@ mod tests {
         assert_eq!(client.actual_requests().count(), 2);
     }
 
+    /// Returns how long `read` waited before retrying after an error response with `code`.
+    /// Time must be paused.
+    async fn retry_delay(
+        status: u16,
+        code: &str,
+        read: impl AsyncFn(&S3CompatibleObjectStorage),
+    ) -> Duration {
+        let client = StaticReplayClient::new(vec![
+            get_object_error_event(status, code),
+            get_object_event(206, SdkBody::from("abcd")),
+        ]);
+        let s3_storage = S3CompatibleObjectStorage {
+            retry_params: RetryParams {
+                base_delay: Duration::from_millis(100),
+                max_delay: Duration::from_secs(10),
+                max_attempts: 2,
+                throttling_base_delay: Duration::from_millis(300),
+                throttling_max_delay: Duration::from_secs(10),
+            },
+            ..s3_storage_for_get_test(client)
+        };
+        let start = tokio::time::Instant::now();
+        read(&s3_storage).await;
+        start.elapsed()
+    }
+
+    /// Checks that `read` waits for the throttling delay after a `SlowDown`, and for the base delay
+    /// after another transient error.
+    async fn assert_waits_longer_after_throttling(read: impl AsyncFn(&S3CompatibleObjectStorage)) {
+        tokio::time::pause();
+        // Throttling: 300ms, jittered.
+        let throttled_delay = retry_delay(503, "SlowDown", &read).await;
+        assert!(
+            (150..=301).contains(&throttled_delay.as_millis()),
+            "{throttled_delay:?}"
+        );
+        // Other transient error: 100ms, jittered.
+        let transient_delay = retry_delay(500, "InternalError", &read).await;
+        assert!(
+            (50..=101).contains(&transient_delay.as_millis()),
+            "{transient_delay:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_waits_longer_after_throttling() {
+        assert_waits_longer_after_throttling(async |s3_storage: &S3CompatibleObjectStorage| {
+            s3_storage
+                .get_slice(Path::new("my-path"), 0..4)
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
+    /// `copy_to` retries the SDK errors as they are, without `into_retry`.
+    #[tokio::test]
+    async fn test_s3_compatible_storage_copy_to_waits_longer_after_throttling() {
+        assert_waits_longer_after_throttling(async |s3_storage: &S3CompatibleObjectStorage| {
+            s3_storage
+                .copy_to(Path::new("my-path"), &mut Vec::new())
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn test_s3_compatible_storage_get_slice_deadline_exceeded() {
         tokio::time::pause();
@@ -1705,12 +1779,15 @@ mod tests {
                 .map(|_| get_object_error_event(503, "SlowDown"))
                 .collect(),
         );
-        // Attempts never time out, but the throttling lasts longer than the deadline: 2 x 1s.
+        // Attempts never time out, but the throttling lasts longer than the deadline.
+        let deadline = Duration::from_secs(1) * DEADLINE_FACTOR;
         let s3_storage = S3CompatibleObjectStorage {
             retry_params: RetryParams {
                 base_delay: Duration::from_secs(2),
                 max_delay: Duration::from_secs(10),
                 max_attempts,
+                throttling_base_delay: Duration::from_secs(2),
+                throttling_max_delay: Duration::from_secs(10),
             },
             ..s3_storage_for_get_test(client.clone())
         }
@@ -1725,11 +1802,11 @@ mod tests {
         // Tokio timers have a millisecond granularity.
         let elapsed = start.elapsed();
         assert!(
-            Duration::from_secs(2) <= elapsed && elapsed < Duration::from_millis(2_010),
+            deadline <= elapsed && elapsed < deadline + Duration::from_millis(10),
             "{elapsed:?}"
         );
-        // A backoff of 1 to 2s: at most 2 attempts fit in 2s.
-        assert!(client.actual_requests().count() <= 2);
+        // A throttling backoff of 1 to 2s: at most one attempt per second fits in the deadline.
+        assert!(client.actual_requests().count() <= DEADLINE_FACTOR as usize);
     }
 
     #[tokio::test]

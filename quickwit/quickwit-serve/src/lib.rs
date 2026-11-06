@@ -169,6 +169,8 @@ fn stack_metastore_retry_layer(
         max_delay: Duration::from_secs(20),
         // adding just 2 more retries bumps the retry duration from ~2s to ~12s
         max_attempts: 5,
+        throttling_base_delay: Duration::from_secs(1),
+        throttling_max_delay: Duration::from_secs(20),
     };
     tower.stage_splits_layers = vec![BoxLayer::new(RetryLayer::new(RetryPolicy::from(
         harder_retry_params,
