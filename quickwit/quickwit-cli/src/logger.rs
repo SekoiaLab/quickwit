@@ -91,12 +91,14 @@ pub fn setup_logging_and_tracing(
     )?;
 
     #[cfg(not(feature = "jemalloc-profiled"))]
-    let registry = registry.with(crate::sentry_integration::sentry_layer());
+    let registry = registry.with(crate::sentry_integration::sentry_layer_if_enabled());
 
     // Here the env filter is per layer, so Sentry needs its own to honor `RUST_LOG`.
     #[cfg(feature = "jemalloc-profiled")]
-    let registry = registry
-        .with(crate::sentry_integration::sentry_layer().with_filter(startup_env_filter(level)?));
+    let registry = registry.with(
+        crate::sentry_integration::sentry_layer_if_enabled()
+            .with_filter(startup_env_filter(level)?),
+    );
 
     // Note on disabling ANSI characters: setting the ansi boolean on event format is insufficient.
     // It is thus set on layers, see https://github.com/tokio-rs/tracing/issues/1817
