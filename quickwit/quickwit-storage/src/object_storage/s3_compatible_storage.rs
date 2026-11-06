@@ -39,11 +39,11 @@ use once_cell::sync::{Lazy, OnceCell};
 use quickwit_aws::http_client::s3_http_client;
 use quickwit_aws::retry::AwsRetryable;
 use quickwit_aws::{aws_behavior_version, get_aws_config};
-use quickwit_common::metrics::GaugeGuard;
+use quickwit_common::metrics::OwnedGaugeGuard;
 use quickwit_common::retry::{Retry, RetryParams};
 use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
-use quickwit_common::{chunk_range, into_u64_range};
+use quickwit_common::{chunk_range, into_u64_range, rate_limited_warn};
 use quickwit_config::{S3EncryptionConfig, S3StorageConfig, StorageTimeoutPolicy};
 use regex::Regex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
@@ -108,20 +108,28 @@ static GET_OBJECT_CONNECTION_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| {
 /// has been fully read or dropped.
 struct GetObjectConnectionPermit {
     _permit: tokio::sync::SemaphorePermit<'static>,
-    _in_use_guard: GaugeGuard<'static>,
+    _in_use_guard: OwnedGaugeGuard,
 }
 
-async fn acquire_get_object_connection_permit() -> GetObjectConnectionPermit {
-    let mut waiting_guard =
-        GaugeGuard::from_gauge(&STORAGE_METRICS.object_storage_get_object_connections_waiting);
+/// Acquires a connection permit for a GetObject request to `bucket`. The permits are shared by
+/// all buckets; the gauges are labelled by bucket to tell which ones hold or wait for them.
+async fn acquire_get_object_connection_permit(bucket: &str) -> GetObjectConnectionPermit {
+    let mut waiting_guard = OwnedGaugeGuard::from_gauge(
+        STORAGE_METRICS
+            .object_storage_get_object_connections_waiting
+            .with_label_values([bucket]),
+    );
     waiting_guard.add(1);
     let permit = GET_OBJECT_CONNECTION_SEMAPHORE
         .acquire()
         .await
         .expect("the semaphore should never be closed");
     drop(waiting_guard);
-    let mut in_use_guard =
-        GaugeGuard::from_gauge(&STORAGE_METRICS.object_storage_get_object_connections_in_use);
+    let mut in_use_guard = OwnedGaugeGuard::from_gauge(
+        STORAGE_METRICS
+            .object_storage_get_object_connections_in_use
+            .with_label_values([bucket]),
+    );
     in_use_guard.add(1);
     GetObjectConnectionPermit {
         _permit: permit,
@@ -733,7 +741,7 @@ impl S3CompatibleObjectStorage {
         path: &Path,
         range_opt: Option<Range<usize>>,
     ) -> Result<(GetObjectOutput, GetObjectConnectionPermit), SdkError<GetObjectError>> {
-        let connection_permit = acquire_get_object_connection_permit().await;
+        let connection_permit = acquire_get_object_connection_permit(&self.bucket).await;
         let get_object_output = self.send_get_object(path, range_opt).await?;
         Ok((get_object_output, connection_permit))
     }
@@ -816,7 +824,7 @@ impl S3CompatibleObjectStorage {
             aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
                 // Waiting for a connection permit is local queueing: the attempt timeout starts
                 // once the permit is acquired.
-                let connection_permit = acquire_get_object_connection_permit().await;
+                let connection_permit = acquire_get_object_connection_permit(&self.bucket).await;
                 let attempt = self.get_to_bytes_attempt(path, range_opt.clone(), connection_permit);
                 let Some((range, timeout_policy)) = slice_timeout_policy_opt else {
                     return attempt.await;
@@ -842,11 +850,16 @@ impl S3CompatibleObjectStorage {
         let deadline = timeout_policy.timeout(range.len()) * DEADLINE_FACTOR;
         let Ok(payload_res) = tokio::time::timeout(deadline, retry_fut).await else {
             STORAGE_METRICS.get_slice_timeout_deadlines_exceeded.inc();
+            rate_limited_warn!(limit_per_min=60, bucket=%self.bucket, key=%self.key(path), num_bytes=range.len(), deadline_secs=deadline.as_secs_f32(), "get_slice deadline exceeded");
             return Err(StorageErrorKind::Timeout
                 .with_error(anyhow!("internal timeout on get_slice, deadline exceeded")));
         };
+        let num_timeouts = num_timeouts.into_inner();
         let gave_up_on_timeout = payload_res.is_err() && last_attempt_timed_out.into_inner();
-        record_get_slice_timeout_outcome(num_timeouts.into_inner(), gave_up_on_timeout);
+        if gave_up_on_timeout {
+            rate_limited_warn!(limit_per_min=60, bucket=%self.bucket, key=%self.key(path), num_bytes=range.len(), num_timeouts, "get_slice gave up after a timed-out attempt");
+        }
+        record_get_slice_timeout_outcome(num_timeouts, gave_up_on_timeout);
         let payload = payload_res.map_err(Retry::into_inner)?;
         Ok(payload)
     }
@@ -1186,6 +1199,22 @@ mod tests {
         for invalid_value in ["0", "-1", "", "abc", "1.5", too_many_permits.as_str()] {
             parse_max_get_object_connections(Some(invalid_value)).unwrap_err();
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_object_connection_permit_gauges_by_bucket() {
+        // Buckets of their own: the gauges are shared with the other tests.
+        let in_use = |bucket| {
+            STORAGE_METRICS
+                .object_storage_get_object_connections_in_use
+                .with_label_values([bucket])
+                .get()
+        };
+        let permit = acquire_get_object_connection_permit("test-permit-gauges-a").await;
+        assert_eq!(in_use("test-permit-gauges-a"), 1);
+        assert_eq!(in_use("test-permit-gauges-b"), 0);
+        drop(permit);
+        assert_eq!(in_use("test-permit-gauges-a"), 0);
     }
 
     #[test]
