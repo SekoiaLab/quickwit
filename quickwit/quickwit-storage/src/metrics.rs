@@ -20,8 +20,8 @@ use std::sync::RwLock;
 use bytesize::ByteSize;
 use once_cell::sync::Lazy;
 use quickwit_common::metrics::{
-    GaugeGuard, HistogramVec, IntCounter, IntCounterVec, IntGauge, new_counter, new_counter_vec,
-    new_gauge, new_histogram_vec,
+    GaugeGuard, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, new_counter,
+    new_counter_vec, new_gauge, new_gauge_vec, new_histogram_vec,
 };
 use quickwit_config::CachePolicy;
 
@@ -43,8 +43,8 @@ pub struct StorageMetrics {
     pub object_storage_operation_attempts: HistogramVec<2>,
     pub object_storage_get_slice_in_flight_count: IntGauge,
     pub object_storage_get_slice_in_flight_num_bytes: IntGauge,
-    pub object_storage_get_object_connections_in_use: IntGauge,
-    pub object_storage_get_object_connections_waiting: IntGauge,
+    pub object_storage_get_object_connections_in_use: IntGaugeVec<1>,
+    pub object_storage_get_object_connections_waiting: IntGaugeVec<1>,
     pub object_storage_download_num_bytes: IntCounterVec<2>,
     pub object_storage_download_errors: IntCounterVec<2>,
     pub object_storage_upload_num_bytes: IntCounterVec<1>,
@@ -124,19 +124,21 @@ impl Default for StorageMetrics {
                 "storage",
                 &[],
             ),
-            object_storage_get_object_connections_in_use: new_gauge(
+            object_storage_get_object_connections_in_use: new_gauge_vec(
                 "object_storage_get_object_connections_in_use",
                 "Number of GetObject attempts holding a connection permit (see \
                  QW_S3_MAX_GET_OBJECT_CONNECTIONS), from sending the request until the body is \
-                 fully read or dropped. Retry backoff is not included.",
+                 fully read or dropped, by bucket. Retry backoff is not included.",
                 "storage",
                 &[],
+                ["bucket"],
             ),
-            object_storage_get_object_connections_waiting: new_gauge(
+            object_storage_get_object_connections_waiting: new_gauge_vec(
                 "object_storage_get_object_connections_waiting",
-                "Number of GetObject attempts waiting for a connection permit.",
+                "Number of GetObject attempts waiting for a connection permit, by bucket.",
                 "storage",
                 &[],
+                ["bucket"],
             ),
             object_storage_download_num_bytes: new_counter_vec(
                 "object_storage_download_num_bytes",
