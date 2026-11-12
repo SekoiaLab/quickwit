@@ -165,4 +165,55 @@ mod tests {
         assert!(stream.token().text.chars().all(|c| !c.is_uppercase()));
         assert!(!stream.advance());
     }
+
+    #[test]
+    fn test_raw_fast_field_normalizer_drops_long_values() {
+        use tantivy::schema::{JsonObjectOptions, Schema, TextOptions};
+        use tantivy::{Index, IndexWriter, TantivyDocument, doc};
+
+        use super::{DEFAULT_REMOVE_TOKEN_LENGTH, RAW_TOKENIZER_NAME};
+
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder
+            .add_text_field("text", TextOptions::default().set_fast(RAW_TOKENIZER_NAME));
+        let json_field = schema_builder.add_json_field(
+            "json",
+            JsonObjectOptions::default().set_fast(RAW_TOKENIZER_NAME),
+        );
+        // Same fast field tokenizers as the indexer and the merge executor.
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .fast_field_tokenizers(
+                super::get_quickwit_fastfield_normalizer_manager()
+                    .tantivy_manager()
+                    .clone(),
+            )
+            .create_in_ram()
+            .unwrap();
+        let mut index_writer: IndexWriter<TantivyDocument> =
+            index.writer_with_num_threads(1, 15_000_000).unwrap();
+        // Tokens are kept only if they are strictly shorter than the limit.
+        let longest_kept = "a".repeat(DEFAULT_REMOVE_TOKEN_LENGTH - 1);
+        let shortest_dropped = "b".repeat(DEFAULT_REMOVE_TOKEN_LENGTH);
+        for value in [&longest_kept, &shortest_dropped] {
+            index_writer
+                .add_document(doc!(
+                    text_field => value.as_str(),
+                    json_field => serde_json::json!({"key": value}),
+                ))
+                .unwrap();
+        }
+        index_writer.commit().unwrap();
+
+        let searcher = index.reader().unwrap().searcher();
+        let fast_fields = searcher.segment_reader(0).fast_fields();
+        for column_name in ["text", "json.key"] {
+            let column = fast_fields.str(column_name).unwrap().unwrap();
+            assert_eq!(column.num_terms(), 1, "{column_name}");
+            let mut value = String::new();
+            column.ord_to_str(0, &mut value).unwrap();
+            assert_eq!(value, longest_kept, "{column_name}");
+            assert!(column.term_ords(1).next().is_none(), "{column_name}");
+        }
+    }
 }
