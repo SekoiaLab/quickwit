@@ -120,6 +120,10 @@ impl CacheKey {
         // it doesn't matter whether or not we count all hits at the scale of a
         // single split: either we did process it and got everything, or we didn't.
         search_request.count_hits = CountHits::CountAll.into();
+        // A split id already identifies its index.
+        search_request.index_id_patterns.clear();
+        // The user agent only identifies the caller.
+        search_request.user_agent = None;
 
         CacheKey {
             split_id: split_info.split_id,
@@ -326,12 +330,17 @@ mod tests {
                 aggregation_request: Some(String::new()),
                 ..base.clone()
             },
+            // removed from the key, so equal to `base`
             SearchRequest {
                 user_agent: Some("agent".to_string()),
                 ..base.clone()
             },
             SearchRequest {
-                index_id_patterns: vec!["test".to_string(), "-idx".to_string()],
+                index_id_patterns: vec!["test-idx".to_string(), "other-idx".to_string()],
+                ..base.clone()
+            },
+            SearchRequest {
+                index_id_patterns: Vec::new(),
                 ..base.clone()
             },
         ];
@@ -339,6 +348,8 @@ mod tests {
             request.start_timestamp = None;
             request.end_timestamp = None;
             request.count_hits = CountHits::CountAll.into();
+            request.index_id_patterns.clear();
+            request.user_agent = None;
             request
         };
         for left in &variants {
@@ -424,6 +435,44 @@ mod tests {
         assert_eq!(cache.get(split_1.clone(), query_1.clone()).unwrap(), result);
         assert!(cache.get(split_2, query_1).is_none());
         assert!(cache.get(split_1, query_2).is_none());
+    }
+
+    #[test]
+    fn test_leaf_search_cache_ignores_index_list_and_user_agent() {
+        let cache = LeafSearchCache::new(&ByteSize::mb(64).into());
+
+        let split = SplitIdAndFooterOffsets {
+            split_id: "split_1".to_string(),
+            split_footer_start: 0,
+            split_footer_end: 100,
+            ..Default::default()
+        };
+        // A multi-index request: the root lists the indexes of the splits it assigned to this
+        // searcher, so the same split can come with a different list on the next request.
+        let request = SearchRequest {
+            index_id_patterns: vec!["idx-a".to_string(), "idx-b".to_string()],
+            query_ast: "test".to_string(),
+            aggregation_request: Some(r#"{"count":{"value_count":{"field":"f"}}}"#.to_string()),
+            user_agent: Some("agent-1".to_string()),
+            ..Default::default()
+        };
+        let same_request_other_placement = SearchRequest {
+            index_id_patterns: vec!["idx-a".to_string(), "idx-c".to_string()],
+            user_agent: Some("agent-2".to_string()),
+            ..request.clone()
+        };
+        let result = LeafSearchResponse {
+            num_hits: 1234,
+            num_attempted_splits: 1,
+            num_successful_splits: 1,
+            ..Default::default()
+        };
+
+        cache.put(split.clone(), request, result.clone());
+        assert_eq!(
+            cache.get(split, same_request_other_placement).unwrap(),
+            result
+        );
     }
 
     #[test]
