@@ -120,9 +120,7 @@ impl CacheKey {
         // it doesn't matter whether or not we count all hits at the scale of a
         // single split: either we did process it and got everything, or we didn't.
         search_request.count_hits = CountHits::CountAll.into();
-        // The root fills this with the indexes of the splits it assigned to this searcher for
-        // this request, which changes with split placement from one request to the next. A
-        // split id already identifies its index.
+        // A split id already identifies its index.
         search_request.index_id_patterns.clear();
         // The user agent only identifies the caller.
         search_request.user_agent = None;
