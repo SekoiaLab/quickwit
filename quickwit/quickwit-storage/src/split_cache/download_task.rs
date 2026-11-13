@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_common::split_file;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -32,6 +33,7 @@ async fn download_split(
         split_ulid,
         storage_uri,
         living_token: _,
+        num_bytes: _,
     } = candidate_split;
     let split_filename = split_file(*split_ulid);
     let target_filepath = root_path.join(&split_filename);
@@ -72,26 +74,32 @@ pub(crate) fn spawn_download_task(
     num_concurrent_downloads: NonZeroU32,
 ) {
     let semaphore = Arc::new(Semaphore::new(num_concurrent_downloads.get() as usize));
-    tokio::task::spawn(async move {
-        loop {
-            let download_permit = Semaphore::acquire_owned(semaphore.clone()).await.unwrap();
-            let download_opportunity_opt = split_cache
-                .split_table
-                .lock()
-                .unwrap()
-                .find_download_opportunity();
-            if let Some(download_opportunity) = download_opportunity_opt {
-                let split_cache_clone = split_cache.clone();
-                tokio::task::spawn(perform_eviction_and_download(
-                    download_opportunity,
-                    split_cache_clone,
-                    storage_resolver.clone(),
-                    download_permit,
-                ));
-            } else {
-                // We wait 1 sec before retrying, to avoid wasting CPU.
-                tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::task::spawn(
+        async move {
+            loop {
+                let download_permit = Semaphore::acquire_owned(semaphore.clone()).await.unwrap();
+                let download_opportunity_opt = split_cache
+                    .split_table
+                    .lock()
+                    .unwrap()
+                    .find_download_opportunity();
+                if let Some(download_opportunity) = download_opportunity_opt {
+                    let split_cache_clone = split_cache.clone();
+                    tokio::task::spawn(
+                        perform_eviction_and_download(
+                            download_opportunity,
+                            split_cache_clone,
+                            storage_resolver.clone(),
+                            download_permit,
+                        )
+                        .detect_slow_poll("split_cache_download"),
+                    );
+                } else {
+                    // We wait 1 sec before retrying, to avoid wasting CPU.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
-    });
+        .detect_slow_poll("split_cache_download_loop"),
+    );
 }

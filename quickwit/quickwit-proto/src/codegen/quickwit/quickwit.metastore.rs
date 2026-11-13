@@ -210,6 +210,28 @@ pub struct DeleteSplitsRequest {
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SplitDocIds {
+    #[prost(string, tag = "1")]
+    pub split_id: ::prost::alloc::string::String,
+    #[prost(uint32, repeated, tag = "2")]
+    pub doc_ids: ::prost::alloc::vec::Vec<u32>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SoftDeleteDocumentsRequest {
+    #[prost(message, optional, tag = "1")]
+    pub index_uid: ::core::option::Option<crate::types::IndexUid>,
+    #[prost(message, repeated, tag = "2")]
+    pub split_doc_ids: ::prost::alloc::vec::Vec<SplitDocIds>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SoftDeleteDocumentsResponse {
+    #[prost(uint64, tag = "1")]
+    pub num_soft_deleted_doc_ids: u64,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AddSourceRequest {
     #[prost(message, optional, tag = "1")]
     pub index_uid: ::core::option::Option<crate::types::IndexUid>,
@@ -249,6 +271,30 @@ pub struct ResetSourceCheckpointRequest {
     pub index_uid: ::core::option::Option<crate::types::IndexUid>,
     #[prost(string, tag = "2")]
     pub source_id: ::prost::alloc::string::String,
+}
+/// Request the checkpoint of a source.
+/// Either `index_uid` or `index_id` must be specified.
+///
+/// If both are supplied, `index_uid` is used.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetSourceCheckpointRequest {
+    #[prost(string, optional, tag = "1")]
+    pub index_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub index_uid: ::core::option::Option<crate::types::IndexUid>,
+    #[prost(string, tag = "3")]
+    pub source_id: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetSourceCheckpointResponse {
+    /// Map of partition ID to the last processed position.
+    #[prost(map = "string, string", tag = "1")]
+    pub checkpoint: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -524,6 +570,33 @@ pub struct DeleteIndexTemplatesRequest {
     pub template_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetKvRequest {
+    #[prost(string, tag = "1")]
+    pub key: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetKvResponse {
+    /// Empty if the key does not exist.
+    #[prost(string, optional, tag = "1")]
+    pub value: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetKvRequest {
+    #[prost(string, tag = "1")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub value: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteKvRequest {
+    #[prost(string, tag = "1")]
+    pub key: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetClusterIdentityRequest {}
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -693,6 +766,11 @@ impl RpcName for DeleteSplitsRequest {
         "delete_splits"
     }
 }
+impl RpcName for SoftDeleteDocumentsRequest {
+    fn rpc_name() -> &'static str {
+        "soft_delete_documents"
+    }
+}
 impl RpcName for AddSourceRequest {
     fn rpc_name() -> &'static str {
         "add_source"
@@ -716,6 +794,11 @@ impl RpcName for DeleteSourceRequest {
 impl RpcName for ResetSourceCheckpointRequest {
     fn rpc_name() -> &'static str {
         "reset_source_checkpoint"
+    }
+}
+impl RpcName for GetSourceCheckpointRequest {
+    fn rpc_name() -> &'static str {
+        "get_source_checkpoint"
     }
 }
 impl RpcName for LastDeleteOpstampRequest {
@@ -793,6 +876,21 @@ impl RpcName for DeleteIndexTemplatesRequest {
         "delete_index_templates"
     }
 }
+impl RpcName for GetKvRequest {
+    fn rpc_name() -> &'static str {
+        "get_kv"
+    }
+}
+impl RpcName for SetKvRequest {
+    fn rpc_name() -> &'static str {
+        "set_kv"
+    }
+}
+impl RpcName for DeleteKvRequest {
+    fn rpc_name() -> &'static str {
+        "delete_kv"
+    }
+}
 impl RpcName for GetClusterIdentityRequest {
     fn rpc_name() -> &'static str {
         "get_cluster_identity"
@@ -867,6 +965,11 @@ pub trait MetastoreService: std::fmt::Debug + Send + Sync + 'static {
         &self,
         request: DeleteSplitsRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse>;
+    ///Soft-deletes individual documents within published splits.
+    async fn soft_delete_documents(
+        &self,
+        request: SoftDeleteDocumentsRequest,
+    ) -> crate::metastore::MetastoreResult<SoftDeleteDocumentsResponse>;
     ///Adds a source.
     async fn add_source(
         &self,
@@ -892,6 +995,11 @@ pub trait MetastoreService: std::fmt::Debug + Send + Sync + 'static {
         &self,
         request: ResetSourceCheckpointRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse>;
+    ///Gets source checkpoint.
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse>;
     ///Gets last opstamp for a given `index_id`.
     async fn last_delete_opstamp(
         &self,
@@ -979,6 +1087,21 @@ pub trait MetastoreService: std::fmt::Debug + Send + Sync + 'static {
     async fn delete_index_templates(
         &self,
         request: DeleteIndexTemplatesRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse>;
+    ///Gets a value by key from the cluster-wide key-value store.
+    async fn get_kv(
+        &self,
+        request: GetKvRequest,
+    ) -> crate::metastore::MetastoreResult<GetKvResponse>;
+    ///Sets a key-value pair in the cluster-wide key-value store.
+    async fn set_kv(
+        &self,
+        request: SetKvRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse>;
+    ///Deletes a key from the cluster-wide key-value store.
+    async fn delete_kv(
+        &self,
+        request: DeleteKvRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse>;
     ///Get cluster identity
     async fn get_cluster_identity(
@@ -1167,6 +1290,12 @@ impl MetastoreService for MetastoreServiceClient {
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.inner.0.delete_splits(request).await
     }
+    async fn soft_delete_documents(
+        &self,
+        request: SoftDeleteDocumentsRequest,
+    ) -> crate::metastore::MetastoreResult<SoftDeleteDocumentsResponse> {
+        self.inner.0.soft_delete_documents(request).await
+    }
     async fn add_source(
         &self,
         request: AddSourceRequest,
@@ -1196,6 +1325,12 @@ impl MetastoreService for MetastoreServiceClient {
         request: ResetSourceCheckpointRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.inner.0.reset_source_checkpoint(request).await
+    }
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse> {
+        self.inner.0.get_source_checkpoint(request).await
     }
     async fn last_delete_opstamp(
         &self,
@@ -1286,6 +1421,24 @@ impl MetastoreService for MetastoreServiceClient {
         request: DeleteIndexTemplatesRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.inner.0.delete_index_templates(request).await
+    }
+    async fn get_kv(
+        &self,
+        request: GetKvRequest,
+    ) -> crate::metastore::MetastoreResult<GetKvResponse> {
+        self.inner.0.get_kv(request).await
+    }
+    async fn set_kv(
+        &self,
+        request: SetKvRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.inner.0.set_kv(request).await
+    }
+    async fn delete_kv(
+        &self,
+        request: DeleteKvRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.inner.0.delete_kv(request).await
     }
     async fn get_cluster_identity(
         &self,
@@ -1383,6 +1536,12 @@ pub mod mock_metastore_service {
         ) -> crate::metastore::MetastoreResult<super::EmptyResponse> {
             self.inner.lock().await.delete_splits(request).await
         }
+        async fn soft_delete_documents(
+            &self,
+            request: super::SoftDeleteDocumentsRequest,
+        ) -> crate::metastore::MetastoreResult<super::SoftDeleteDocumentsResponse> {
+            self.inner.lock().await.soft_delete_documents(request).await
+        }
         async fn add_source(
             &self,
             request: super::AddSourceRequest,
@@ -1412,6 +1571,12 @@ pub mod mock_metastore_service {
             request: super::ResetSourceCheckpointRequest,
         ) -> crate::metastore::MetastoreResult<super::EmptyResponse> {
             self.inner.lock().await.reset_source_checkpoint(request).await
+        }
+        async fn get_source_checkpoint(
+            &self,
+            request: super::GetSourceCheckpointRequest,
+        ) -> crate::metastore::MetastoreResult<super::GetSourceCheckpointResponse> {
+            self.inner.lock().await.get_source_checkpoint(request).await
         }
         async fn last_delete_opstamp(
             &self,
@@ -1504,6 +1669,24 @@ pub mod mock_metastore_service {
             request: super::DeleteIndexTemplatesRequest,
         ) -> crate::metastore::MetastoreResult<super::EmptyResponse> {
             self.inner.lock().await.delete_index_templates(request).await
+        }
+        async fn get_kv(
+            &self,
+            request: super::GetKvRequest,
+        ) -> crate::metastore::MetastoreResult<super::GetKvResponse> {
+            self.inner.lock().await.get_kv(request).await
+        }
+        async fn set_kv(
+            &self,
+            request: super::SetKvRequest,
+        ) -> crate::metastore::MetastoreResult<super::EmptyResponse> {
+            self.inner.lock().await.set_kv(request).await
+        }
+        async fn delete_kv(
+            &self,
+            request: super::DeleteKvRequest,
+        ) -> crate::metastore::MetastoreResult<super::EmptyResponse> {
+            self.inner.lock().await.delete_kv(request).await
         }
         async fn get_cluster_identity(
             &self,
@@ -1714,6 +1897,22 @@ impl tower::Service<DeleteSplitsRequest> for InnerMetastoreServiceClient {
         Box::pin(fut)
     }
 }
+impl tower::Service<SoftDeleteDocumentsRequest> for InnerMetastoreServiceClient {
+    type Response = SoftDeleteDocumentsResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: SoftDeleteDocumentsRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.soft_delete_documents(request).await };
+        Box::pin(fut)
+    }
+}
 impl tower::Service<AddSourceRequest> for InnerMetastoreServiceClient {
     type Response = EmptyResponse;
     type Error = crate::metastore::MetastoreError;
@@ -1791,6 +1990,22 @@ impl tower::Service<ResetSourceCheckpointRequest> for InnerMetastoreServiceClien
     fn call(&mut self, request: ResetSourceCheckpointRequest) -> Self::Future {
         let svc = self.clone();
         let fut = async move { svc.0.reset_source_checkpoint(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<GetSourceCheckpointRequest> for InnerMetastoreServiceClient {
+    type Response = GetSourceCheckpointResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: GetSourceCheckpointRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.get_source_checkpoint(request).await };
         Box::pin(fut)
     }
 }
@@ -2034,6 +2249,54 @@ impl tower::Service<DeleteIndexTemplatesRequest> for InnerMetastoreServiceClient
         Box::pin(fut)
     }
 }
+impl tower::Service<GetKvRequest> for InnerMetastoreServiceClient {
+    type Response = GetKvResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: GetKvRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.get_kv(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<SetKvRequest> for InnerMetastoreServiceClient {
+    type Response = EmptyResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: SetKvRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.set_kv(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<DeleteKvRequest> for InnerMetastoreServiceClient {
+    type Response = EmptyResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: DeleteKvRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.delete_kv(request).await };
+        Box::pin(fut)
+    }
+}
 impl tower::Service<GetClusterIdentityRequest> for InnerMetastoreServiceClient {
     type Response = GetClusterIdentityResponse;
     type Error = crate::metastore::MetastoreError;
@@ -2115,6 +2378,11 @@ struct MetastoreServiceTowerServiceStack {
         EmptyResponse,
         crate::metastore::MetastoreError,
     >,
+    soft_delete_documents_svc: quickwit_common::tower::BoxService<
+        SoftDeleteDocumentsRequest,
+        SoftDeleteDocumentsResponse,
+        crate::metastore::MetastoreError,
+    >,
     add_source_svc: quickwit_common::tower::BoxService<
         AddSourceRequest,
         EmptyResponse,
@@ -2138,6 +2406,11 @@ struct MetastoreServiceTowerServiceStack {
     reset_source_checkpoint_svc: quickwit_common::tower::BoxService<
         ResetSourceCheckpointRequest,
         EmptyResponse,
+        crate::metastore::MetastoreError,
+    >,
+    get_source_checkpoint_svc: quickwit_common::tower::BoxService<
+        GetSourceCheckpointRequest,
+        GetSourceCheckpointResponse,
         crate::metastore::MetastoreError,
     >,
     last_delete_opstamp_svc: quickwit_common::tower::BoxService<
@@ -2212,6 +2485,21 @@ struct MetastoreServiceTowerServiceStack {
     >,
     delete_index_templates_svc: quickwit_common::tower::BoxService<
         DeleteIndexTemplatesRequest,
+        EmptyResponse,
+        crate::metastore::MetastoreError,
+    >,
+    get_kv_svc: quickwit_common::tower::BoxService<
+        GetKvRequest,
+        GetKvResponse,
+        crate::metastore::MetastoreError,
+    >,
+    set_kv_svc: quickwit_common::tower::BoxService<
+        SetKvRequest,
+        EmptyResponse,
+        crate::metastore::MetastoreError,
+    >,
+    delete_kv_svc: quickwit_common::tower::BoxService<
+        DeleteKvRequest,
         EmptyResponse,
         crate::metastore::MetastoreError,
     >,
@@ -2295,6 +2583,12 @@ impl MetastoreService for MetastoreServiceTowerServiceStack {
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.delete_splits_svc.clone().ready().await?.call(request).await
     }
+    async fn soft_delete_documents(
+        &self,
+        request: SoftDeleteDocumentsRequest,
+    ) -> crate::metastore::MetastoreResult<SoftDeleteDocumentsResponse> {
+        self.soft_delete_documents_svc.clone().ready().await?.call(request).await
+    }
     async fn add_source(
         &self,
         request: AddSourceRequest,
@@ -2324,6 +2618,12 @@ impl MetastoreService for MetastoreServiceTowerServiceStack {
         request: ResetSourceCheckpointRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.reset_source_checkpoint_svc.clone().ready().await?.call(request).await
+    }
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse> {
+        self.get_source_checkpoint_svc.clone().ready().await?.call(request).await
     }
     async fn last_delete_opstamp(
         &self,
@@ -2414,6 +2714,24 @@ impl MetastoreService for MetastoreServiceTowerServiceStack {
         request: DeleteIndexTemplatesRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.delete_index_templates_svc.clone().ready().await?.call(request).await
+    }
+    async fn get_kv(
+        &self,
+        request: GetKvRequest,
+    ) -> crate::metastore::MetastoreResult<GetKvResponse> {
+        self.get_kv_svc.clone().ready().await?.call(request).await
+    }
+    async fn set_kv(
+        &self,
+        request: SetKvRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.set_kv_svc.clone().ready().await?.call(request).await
+    }
+    async fn delete_kv(
+        &self,
+        request: DeleteKvRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.delete_kv_svc.clone().ready().await?.call(request).await
     }
     async fn get_cluster_identity(
         &self,
@@ -2548,6 +2866,16 @@ type DeleteSplitsLayer = quickwit_common::tower::BoxLayer<
     EmptyResponse,
     crate::metastore::MetastoreError,
 >;
+type SoftDeleteDocumentsLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        SoftDeleteDocumentsRequest,
+        SoftDeleteDocumentsResponse,
+        crate::metastore::MetastoreError,
+    >,
+    SoftDeleteDocumentsRequest,
+    SoftDeleteDocumentsResponse,
+    crate::metastore::MetastoreError,
+>;
 type AddSourceLayer = quickwit_common::tower::BoxLayer<
     quickwit_common::tower::BoxService<
         AddSourceRequest,
@@ -2596,6 +2924,16 @@ type ResetSourceCheckpointLayer = quickwit_common::tower::BoxLayer<
     >,
     ResetSourceCheckpointRequest,
     EmptyResponse,
+    crate::metastore::MetastoreError,
+>;
+type GetSourceCheckpointLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        GetSourceCheckpointRequest,
+        GetSourceCheckpointResponse,
+        crate::metastore::MetastoreError,
+    >,
+    GetSourceCheckpointRequest,
+    GetSourceCheckpointResponse,
     crate::metastore::MetastoreError,
 >;
 type LastDeleteOpstampLayer = quickwit_common::tower::BoxLayer<
@@ -2748,6 +3086,36 @@ type DeleteIndexTemplatesLayer = quickwit_common::tower::BoxLayer<
     EmptyResponse,
     crate::metastore::MetastoreError,
 >;
+type GetKvLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        GetKvRequest,
+        GetKvResponse,
+        crate::metastore::MetastoreError,
+    >,
+    GetKvRequest,
+    GetKvResponse,
+    crate::metastore::MetastoreError,
+>;
+type SetKvLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        SetKvRequest,
+        EmptyResponse,
+        crate::metastore::MetastoreError,
+    >,
+    SetKvRequest,
+    EmptyResponse,
+    crate::metastore::MetastoreError,
+>;
+type DeleteKvLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        DeleteKvRequest,
+        EmptyResponse,
+        crate::metastore::MetastoreError,
+    >,
+    DeleteKvRequest,
+    EmptyResponse,
+    crate::metastore::MetastoreError,
+>;
 type GetClusterIdentityLayer = quickwit_common::tower::BoxLayer<
     quickwit_common::tower::BoxService<
         GetClusterIdentityRequest,
@@ -2760,39 +3128,44 @@ type GetClusterIdentityLayer = quickwit_common::tower::BoxLayer<
 >;
 #[derive(Debug, Default)]
 pub struct MetastoreServiceTowerLayerStack {
-    create_index_layers: Vec<CreateIndexLayer>,
-    update_index_layers: Vec<UpdateIndexLayer>,
-    index_metadata_layers: Vec<IndexMetadataLayer>,
-    indexes_metadata_layers: Vec<IndexesMetadataLayer>,
-    list_indexes_metadata_layers: Vec<ListIndexesMetadataLayer>,
-    delete_index_layers: Vec<DeleteIndexLayer>,
-    list_index_stats_layers: Vec<ListIndexStatsLayer>,
-    list_splits_layers: Vec<ListSplitsLayer>,
-    stage_splits_layers: Vec<StageSplitsLayer>,
-    publish_splits_layers: Vec<PublishSplitsLayer>,
-    mark_splits_for_deletion_layers: Vec<MarkSplitsForDeletionLayer>,
-    delete_splits_layers: Vec<DeleteSplitsLayer>,
-    add_source_layers: Vec<AddSourceLayer>,
-    update_source_layers: Vec<UpdateSourceLayer>,
-    toggle_source_layers: Vec<ToggleSourceLayer>,
-    delete_source_layers: Vec<DeleteSourceLayer>,
-    reset_source_checkpoint_layers: Vec<ResetSourceCheckpointLayer>,
-    last_delete_opstamp_layers: Vec<LastDeleteOpstampLayer>,
-    create_delete_task_layers: Vec<CreateDeleteTaskLayer>,
-    update_splits_delete_opstamp_layers: Vec<UpdateSplitsDeleteOpstampLayer>,
-    list_delete_tasks_layers: Vec<ListDeleteTasksLayer>,
-    list_stale_splits_layers: Vec<ListStaleSplitsLayer>,
-    open_shards_layers: Vec<OpenShardsLayer>,
-    acquire_shards_layers: Vec<AcquireShardsLayer>,
-    delete_shards_layers: Vec<DeleteShardsLayer>,
-    prune_shards_layers: Vec<PruneShardsLayer>,
-    list_shards_layers: Vec<ListShardsLayer>,
-    create_index_template_layers: Vec<CreateIndexTemplateLayer>,
-    get_index_template_layers: Vec<GetIndexTemplateLayer>,
-    find_index_template_matches_layers: Vec<FindIndexTemplateMatchesLayer>,
-    list_index_templates_layers: Vec<ListIndexTemplatesLayer>,
-    delete_index_templates_layers: Vec<DeleteIndexTemplatesLayer>,
-    get_cluster_identity_layers: Vec<GetClusterIdentityLayer>,
+    pub create_index_layers: Vec<CreateIndexLayer>,
+    pub update_index_layers: Vec<UpdateIndexLayer>,
+    pub index_metadata_layers: Vec<IndexMetadataLayer>,
+    pub indexes_metadata_layers: Vec<IndexesMetadataLayer>,
+    pub list_indexes_metadata_layers: Vec<ListIndexesMetadataLayer>,
+    pub delete_index_layers: Vec<DeleteIndexLayer>,
+    pub list_index_stats_layers: Vec<ListIndexStatsLayer>,
+    pub list_splits_layers: Vec<ListSplitsLayer>,
+    pub stage_splits_layers: Vec<StageSplitsLayer>,
+    pub publish_splits_layers: Vec<PublishSplitsLayer>,
+    pub mark_splits_for_deletion_layers: Vec<MarkSplitsForDeletionLayer>,
+    pub delete_splits_layers: Vec<DeleteSplitsLayer>,
+    pub soft_delete_documents_layers: Vec<SoftDeleteDocumentsLayer>,
+    pub add_source_layers: Vec<AddSourceLayer>,
+    pub update_source_layers: Vec<UpdateSourceLayer>,
+    pub toggle_source_layers: Vec<ToggleSourceLayer>,
+    pub delete_source_layers: Vec<DeleteSourceLayer>,
+    pub reset_source_checkpoint_layers: Vec<ResetSourceCheckpointLayer>,
+    pub get_source_checkpoint_layers: Vec<GetSourceCheckpointLayer>,
+    pub last_delete_opstamp_layers: Vec<LastDeleteOpstampLayer>,
+    pub create_delete_task_layers: Vec<CreateDeleteTaskLayer>,
+    pub update_splits_delete_opstamp_layers: Vec<UpdateSplitsDeleteOpstampLayer>,
+    pub list_delete_tasks_layers: Vec<ListDeleteTasksLayer>,
+    pub list_stale_splits_layers: Vec<ListStaleSplitsLayer>,
+    pub open_shards_layers: Vec<OpenShardsLayer>,
+    pub acquire_shards_layers: Vec<AcquireShardsLayer>,
+    pub delete_shards_layers: Vec<DeleteShardsLayer>,
+    pub prune_shards_layers: Vec<PruneShardsLayer>,
+    pub list_shards_layers: Vec<ListShardsLayer>,
+    pub create_index_template_layers: Vec<CreateIndexTemplateLayer>,
+    pub get_index_template_layers: Vec<GetIndexTemplateLayer>,
+    pub find_index_template_matches_layers: Vec<FindIndexTemplateMatchesLayer>,
+    pub list_index_templates_layers: Vec<ListIndexTemplatesLayer>,
+    pub delete_index_templates_layers: Vec<DeleteIndexTemplatesLayer>,
+    pub get_kv_layers: Vec<GetKvLayer>,
+    pub set_kv_layers: Vec<SetKvLayer>,
+    pub delete_kv_layers: Vec<DeleteKvLayer>,
+    pub get_cluster_identity_layers: Vec<GetClusterIdentityLayer>,
 }
 impl MetastoreServiceTowerLayerStack {
     pub fn stack_layer<L>(mut self, layer: L) -> Self
@@ -3103,6 +3476,33 @@ impl MetastoreServiceTowerLayerStack {
         >>::Service as tower::Service<DeleteSplitsRequest>>::Future: Send + 'static,
         L: tower::Layer<
                 quickwit_common::tower::BoxService<
+                    SoftDeleteDocumentsRequest,
+                    SoftDeleteDocumentsResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                SoftDeleteDocumentsRequest,
+                SoftDeleteDocumentsResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                SoftDeleteDocumentsRequest,
+                Response = SoftDeleteDocumentsResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                SoftDeleteDocumentsRequest,
+                SoftDeleteDocumentsResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<
+            SoftDeleteDocumentsRequest,
+        >>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
                     AddSourceRequest,
                     EmptyResponse,
                     crate::metastore::MetastoreError,
@@ -3227,6 +3627,33 @@ impl MetastoreServiceTowerLayerStack {
             >,
         >>::Service as tower::Service<
             ResetSourceCheckpointRequest,
+        >>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    GetSourceCheckpointRequest,
+                    GetSourceCheckpointResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                GetSourceCheckpointRequest,
+                GetSourceCheckpointResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                GetSourceCheckpointRequest,
+                Response = GetSourceCheckpointResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                GetSourceCheckpointRequest,
+                GetSourceCheckpointResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<
+            GetSourceCheckpointRequest,
         >>::Future: Send + 'static,
         L: tower::Layer<
                 quickwit_common::tower::BoxService<
@@ -3615,6 +4042,81 @@ impl MetastoreServiceTowerLayerStack {
         >>::Future: Send + 'static,
         L: tower::Layer<
                 quickwit_common::tower::BoxService<
+                    GetKvRequest,
+                    GetKvResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                GetKvRequest,
+                GetKvResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                GetKvRequest,
+                Response = GetKvResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                GetKvRequest,
+                GetKvResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<GetKvRequest>>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    SetKvRequest,
+                    EmptyResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                SetKvRequest,
+                EmptyResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                SetKvRequest,
+                Response = EmptyResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                SetKvRequest,
+                EmptyResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<SetKvRequest>>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    DeleteKvRequest,
+                    EmptyResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                DeleteKvRequest,
+                EmptyResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                DeleteKvRequest,
+                Response = EmptyResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                DeleteKvRequest,
+                EmptyResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<DeleteKvRequest>>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
                     GetClusterIdentityRequest,
                     GetClusterIdentityResponse,
                     crate::metastore::MetastoreError,
@@ -3665,6 +4167,8 @@ impl MetastoreServiceTowerLayerStack {
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.delete_splits_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.soft_delete_documents_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.add_source_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.update_source_layers
@@ -3674,6 +4178,8 @@ impl MetastoreServiceTowerLayerStack {
         self.delete_source_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.reset_source_checkpoint_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.get_source_checkpoint_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.last_delete_opstamp_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
@@ -3705,6 +4211,9 @@ impl MetastoreServiceTowerLayerStack {
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.delete_index_templates_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.get_kv_layers.push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.set_kv_layers.push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.delete_kv_layers.push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.get_cluster_identity_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self
@@ -3943,6 +4452,28 @@ impl MetastoreServiceTowerLayerStack {
         self.delete_splits_layers.push(quickwit_common::tower::BoxLayer::new(layer));
         self
     }
+    pub fn stack_soft_delete_documents_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    SoftDeleteDocumentsRequest,
+                    SoftDeleteDocumentsResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                SoftDeleteDocumentsRequest,
+                Response = SoftDeleteDocumentsResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<
+            SoftDeleteDocumentsRequest,
+        >>::Future: Send + 'static,
+    {
+        self.soft_delete_documents_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
     pub fn stack_add_source_layer<L>(mut self, layer: L) -> Self
     where
         L: tower::Layer<
@@ -4038,6 +4569,28 @@ impl MetastoreServiceTowerLayerStack {
         >>::Future: Send + 'static,
     {
         self.reset_source_checkpoint_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_get_source_checkpoint_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    GetSourceCheckpointRequest,
+                    GetSourceCheckpointResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                GetSourceCheckpointRequest,
+                Response = GetSourceCheckpointResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<
+            GetSourceCheckpointRequest,
+        >>::Future: Send + 'static,
+    {
+        self.get_source_checkpoint_layers
             .push(quickwit_common::tower::BoxLayer::new(layer));
         self
     }
@@ -4344,6 +4897,63 @@ impl MetastoreServiceTowerLayerStack {
             .push(quickwit_common::tower::BoxLayer::new(layer));
         self
     }
+    pub fn stack_get_kv_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    GetKvRequest,
+                    GetKvResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                GetKvRequest,
+                Response = GetKvResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<GetKvRequest>>::Future: Send + 'static,
+    {
+        self.get_kv_layers.push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_set_kv_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    SetKvRequest,
+                    EmptyResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                SetKvRequest,
+                Response = EmptyResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<SetKvRequest>>::Future: Send + 'static,
+    {
+        self.set_kv_layers.push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_delete_kv_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    DeleteKvRequest,
+                    EmptyResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                DeleteKvRequest,
+                Response = EmptyResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<DeleteKvRequest>>::Future: Send + 'static,
+    {
+        self.delete_kv_layers.push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
     pub fn stack_get_cluster_identity_layer<L>(mut self, layer: L) -> Self
     where
         L: tower::Layer<
@@ -4522,6 +5132,14 @@ impl MetastoreServiceTowerLayerStack {
                 quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
+        let soft_delete_documents_svc = self
+            .soft_delete_documents_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
         let add_source_svc = self
             .add_source_layers
             .into_iter()
@@ -4556,6 +5174,14 @@ impl MetastoreServiceTowerLayerStack {
             );
         let reset_source_checkpoint_svc = self
             .reset_source_checkpoint_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
+        let get_source_checkpoint_svc = self
+            .get_source_checkpoint_layers
             .into_iter()
             .rev()
             .fold(
@@ -4682,6 +5308,30 @@ impl MetastoreServiceTowerLayerStack {
                 quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
+        let get_kv_svc = self
+            .get_kv_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
+        let set_kv_svc = self
+            .set_kv_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
+        let delete_kv_svc = self
+            .delete_kv_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
         let get_cluster_identity_svc = self
             .get_cluster_identity_layers
             .into_iter()
@@ -4704,11 +5354,13 @@ impl MetastoreServiceTowerLayerStack {
             publish_splits_svc,
             mark_splits_for_deletion_svc,
             delete_splits_svc,
+            soft_delete_documents_svc,
             add_source_svc,
             update_source_svc,
             toggle_source_svc,
             delete_source_svc,
             reset_source_checkpoint_svc,
+            get_source_checkpoint_svc,
             last_delete_opstamp_svc,
             create_delete_task_svc,
             update_splits_delete_opstamp_svc,
@@ -4724,6 +5376,9 @@ impl MetastoreServiceTowerLayerStack {
             find_index_template_matches_svc,
             list_index_templates_svc,
             delete_index_templates_svc,
+            get_kv_svc,
+            set_kv_svc,
+            delete_kv_svc,
             get_cluster_identity_svc,
         };
         MetastoreServiceClient::new(tower_svc_stack)
@@ -4880,6 +5535,15 @@ where
             Future = BoxFuture<EmptyResponse, crate::metastore::MetastoreError>,
         >
         + tower::Service<
+            SoftDeleteDocumentsRequest,
+            Response = SoftDeleteDocumentsResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<
+                SoftDeleteDocumentsResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >
+        + tower::Service<
             AddSourceRequest,
             Response = EmptyResponse,
             Error = crate::metastore::MetastoreError,
@@ -4908,6 +5572,15 @@ where
             Response = EmptyResponse,
             Error = crate::metastore::MetastoreError,
             Future = BoxFuture<EmptyResponse, crate::metastore::MetastoreError>,
+        >
+        + tower::Service<
+            GetSourceCheckpointRequest,
+            Response = GetSourceCheckpointResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<
+                GetSourceCheckpointResponse,
+                crate::metastore::MetastoreError,
+            >,
         >
         + tower::Service<
             LastDeleteOpstampRequest,
@@ -5015,6 +5688,24 @@ where
             Future = BoxFuture<EmptyResponse, crate::metastore::MetastoreError>,
         >
         + tower::Service<
+            GetKvRequest,
+            Response = GetKvResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<GetKvResponse, crate::metastore::MetastoreError>,
+        >
+        + tower::Service<
+            SetKvRequest,
+            Response = EmptyResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<EmptyResponse, crate::metastore::MetastoreError>,
+        >
+        + tower::Service<
+            DeleteKvRequest,
+            Response = EmptyResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<EmptyResponse, crate::metastore::MetastoreError>,
+        >
+        + tower::Service<
             GetClusterIdentityRequest,
             Response = GetClusterIdentityResponse,
             Error = crate::metastore::MetastoreError,
@@ -5096,6 +5787,12 @@ where
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.clone().call(request).await
     }
+    async fn soft_delete_documents(
+        &self,
+        request: SoftDeleteDocumentsRequest,
+    ) -> crate::metastore::MetastoreResult<SoftDeleteDocumentsResponse> {
+        self.clone().call(request).await
+    }
     async fn add_source(
         &self,
         request: AddSourceRequest,
@@ -5124,6 +5821,12 @@ where
         &self,
         request: ResetSourceCheckpointRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.clone().call(request).await
+    }
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse> {
         self.clone().call(request).await
     }
     async fn last_delete_opstamp(
@@ -5213,6 +5916,24 @@ where
     async fn delete_index_templates(
         &self,
         request: DeleteIndexTemplatesRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.clone().call(request).await
+    }
+    async fn get_kv(
+        &self,
+        request: GetKvRequest,
+    ) -> crate::metastore::MetastoreResult<GetKvResponse> {
+        self.clone().call(request).await
+    }
+    async fn set_kv(
+        &self,
+        request: SetKvRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.clone().call(request).await
+    }
+    async fn delete_kv(
+        &self,
+        request: DeleteKvRequest,
     ) -> crate::metastore::MetastoreResult<EmptyResponse> {
         self.clone().call(request).await
     }
@@ -5445,6 +6166,20 @@ where
                 DeleteSplitsRequest::rpc_name(),
             ))
     }
+    async fn soft_delete_documents(
+        &self,
+        request: SoftDeleteDocumentsRequest,
+    ) -> crate::metastore::MetastoreResult<SoftDeleteDocumentsResponse> {
+        self.inner
+            .clone()
+            .soft_delete_documents(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                SoftDeleteDocumentsRequest::rpc_name(),
+            ))
+    }
     async fn add_source(
         &self,
         request: AddSourceRequest,
@@ -5513,6 +6248,20 @@ where
             .map_err(|status| crate::error::grpc_status_to_service_error(
                 status,
                 ResetSourceCheckpointRequest::rpc_name(),
+            ))
+    }
+    async fn get_source_checkpoint(
+        &self,
+        request: GetSourceCheckpointRequest,
+    ) -> crate::metastore::MetastoreResult<GetSourceCheckpointResponse> {
+        self.inner
+            .clone()
+            .get_source_checkpoint(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                GetSourceCheckpointRequest::rpc_name(),
             ))
     }
     async fn last_delete_opstamp(
@@ -5725,6 +6474,48 @@ where
                 DeleteIndexTemplatesRequest::rpc_name(),
             ))
     }
+    async fn get_kv(
+        &self,
+        request: GetKvRequest,
+    ) -> crate::metastore::MetastoreResult<GetKvResponse> {
+        self.inner
+            .clone()
+            .get_kv(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                GetKvRequest::rpc_name(),
+            ))
+    }
+    async fn set_kv(
+        &self,
+        request: SetKvRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.inner
+            .clone()
+            .set_kv(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                SetKvRequest::rpc_name(),
+            ))
+    }
+    async fn delete_kv(
+        &self,
+        request: DeleteKvRequest,
+    ) -> crate::metastore::MetastoreResult<EmptyResponse> {
+        self.inner
+            .clone()
+            .delete_kv(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                DeleteKvRequest::rpc_name(),
+            ))
+    }
     async fn get_cluster_identity(
         &self,
         request: GetClusterIdentityRequest,
@@ -5909,6 +6700,17 @@ for MetastoreServiceGrpcServerAdapter {
             .map(tonic::Response::new)
             .map_err(crate::error::grpc_error_to_grpc_status)
     }
+    async fn soft_delete_documents(
+        &self,
+        request: tonic::Request<SoftDeleteDocumentsRequest>,
+    ) -> Result<tonic::Response<SoftDeleteDocumentsResponse>, tonic::Status> {
+        self.inner
+            .0
+            .soft_delete_documents(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
     async fn add_source(
         &self,
         request: tonic::Request<AddSourceRequest>,
@@ -5960,6 +6762,17 @@ for MetastoreServiceGrpcServerAdapter {
         self.inner
             .0
             .reset_source_checkpoint(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
+    async fn get_source_checkpoint(
+        &self,
+        request: tonic::Request<GetSourceCheckpointRequest>,
+    ) -> Result<tonic::Response<GetSourceCheckpointResponse>, tonic::Status> {
+        self.inner
+            .0
+            .get_source_checkpoint(request.into_inner())
             .await
             .map(tonic::Response::new)
             .map_err(crate::error::grpc_error_to_grpc_status)
@@ -6125,6 +6938,39 @@ for MetastoreServiceGrpcServerAdapter {
         self.inner
             .0
             .delete_index_templates(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
+    async fn get_kv(
+        &self,
+        request: tonic::Request<GetKvRequest>,
+    ) -> Result<tonic::Response<GetKvResponse>, tonic::Status> {
+        self.inner
+            .0
+            .get_kv(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
+    async fn set_kv(
+        &self,
+        request: tonic::Request<SetKvRequest>,
+    ) -> Result<tonic::Response<EmptyResponse>, tonic::Status> {
+        self.inner
+            .0
+            .set_kv(request.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(crate::error::grpc_error_to_grpc_status)
+    }
+    async fn delete_kv(
+        &self,
+        request: tonic::Request<DeleteKvRequest>,
+    ) -> Result<tonic::Response<EmptyResponse>, tonic::Status> {
+        self.inner
+            .0
+            .delete_kv(request.into_inner())
             .await
             .map(tonic::Response::new)
             .map_err(crate::error::grpc_error_to_grpc_status)
@@ -6619,6 +7465,36 @@ pub mod metastore_service_grpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Soft-deletes individual documents within published splits.
+        pub async fn soft_delete_documents(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SoftDeleteDocumentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SoftDeleteDocumentsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/SoftDeleteDocuments",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.metastore.MetastoreService",
+                        "SoftDeleteDocuments",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Adds a source.
         pub async fn add_source(
             &mut self,
@@ -6747,6 +7623,36 @@ pub mod metastore_service_grpc_client {
                     GrpcMethod::new(
                         "quickwit.metastore.MetastoreService",
                         "ResetSourceCheckpoint",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Gets source checkpoint.
+        pub async fn get_source_checkpoint(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetSourceCheckpointRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetSourceCheckpointResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/GetSourceCheckpoint",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.metastore.MetastoreService",
+                        "GetSourceCheckpoint",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -7193,6 +8099,74 @@ pub mod metastore_service_grpc_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Gets a value by key from the cluster-wide key-value store.
+        pub async fn get_kv(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetKvRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetKvResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/GetKv",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("quickwit.metastore.MetastoreService", "GetKv"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Sets a key-value pair in the cluster-wide key-value store.
+        pub async fn set_kv(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SetKvRequest>,
+        ) -> std::result::Result<tonic::Response<super::EmptyResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/SetKv",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("quickwit.metastore.MetastoreService", "SetKv"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Deletes a key from the cluster-wide key-value store.
+        pub async fn delete_kv(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteKvRequest>,
+        ) -> std::result::Result<tonic::Response<super::EmptyResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/DeleteKv",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("quickwit.metastore.MetastoreService", "DeleteKv"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Get cluster identity
         pub async fn get_cluster_identity(
             &mut self,
@@ -7325,6 +8299,14 @@ pub mod metastore_service_grpc_server {
             &self,
             request: tonic::Request<super::DeleteSplitsRequest>,
         ) -> std::result::Result<tonic::Response<super::EmptyResponse>, tonic::Status>;
+        /// Soft-deletes individual documents within published splits.
+        async fn soft_delete_documents(
+            &self,
+            request: tonic::Request<super::SoftDeleteDocumentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SoftDeleteDocumentsResponse>,
+            tonic::Status,
+        >;
         /// Adds a source.
         async fn add_source(
             &self,
@@ -7350,6 +8332,14 @@ pub mod metastore_service_grpc_server {
             &self,
             request: tonic::Request<super::ResetSourceCheckpointRequest>,
         ) -> std::result::Result<tonic::Response<super::EmptyResponse>, tonic::Status>;
+        /// Gets source checkpoint.
+        async fn get_source_checkpoint(
+            &self,
+            request: tonic::Request<super::GetSourceCheckpointRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetSourceCheckpointResponse>,
+            tonic::Status,
+        >;
         /// Gets last opstamp for a given `index_id`.
         async fn last_delete_opstamp(
             &self,
@@ -7470,6 +8460,21 @@ pub mod metastore_service_grpc_server {
         async fn delete_index_templates(
             &self,
             request: tonic::Request<super::DeleteIndexTemplatesRequest>,
+        ) -> std::result::Result<tonic::Response<super::EmptyResponse>, tonic::Status>;
+        /// Gets a value by key from the cluster-wide key-value store.
+        async fn get_kv(
+            &self,
+            request: tonic::Request<super::GetKvRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetKvResponse>, tonic::Status>;
+        /// Sets a key-value pair in the cluster-wide key-value store.
+        async fn set_kv(
+            &self,
+            request: tonic::Request<super::SetKvRequest>,
+        ) -> std::result::Result<tonic::Response<super::EmptyResponse>, tonic::Status>;
+        /// Deletes a key from the cluster-wide key-value store.
+        async fn delete_kv(
+            &self,
+            request: tonic::Request<super::DeleteKvRequest>,
         ) -> std::result::Result<tonic::Response<super::EmptyResponse>, tonic::Status>;
         /// Get cluster identity
         async fn get_cluster_identity(
@@ -8176,6 +9181,55 @@ pub mod metastore_service_grpc_server {
                     };
                     Box::pin(fut)
                 }
+                "/quickwit.metastore.MetastoreService/SoftDeleteDocuments" => {
+                    #[allow(non_camel_case_types)]
+                    struct SoftDeleteDocumentsSvc<T: MetastoreServiceGrpc>(pub Arc<T>);
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::SoftDeleteDocumentsRequest>
+                    for SoftDeleteDocumentsSvc<T> {
+                        type Response = super::SoftDeleteDocumentsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SoftDeleteDocumentsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::soft_delete_documents(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SoftDeleteDocumentsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/quickwit.metastore.MetastoreService/AddSource" => {
                     #[allow(non_camel_case_types)]
                     struct AddSourceSvc<T: MetastoreServiceGrpc>(pub Arc<T>);
@@ -8394,6 +9448,55 @@ pub mod metastore_service_grpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ResetSourceCheckpointSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.metastore.MetastoreService/GetSourceCheckpoint" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetSourceCheckpointSvc<T: MetastoreServiceGrpc>(pub Arc<T>);
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::GetSourceCheckpointRequest>
+                    for GetSourceCheckpointSvc<T> {
+                        type Response = super::GetSourceCheckpointResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetSourceCheckpointRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::get_source_checkpoint(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetSourceCheckpointSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -9123,6 +10226,140 @@ pub mod metastore_service_grpc_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeleteIndexTemplatesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.metastore.MetastoreService/GetKv" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetKvSvc<T: MetastoreServiceGrpc>(pub Arc<T>);
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::GetKvRequest> for GetKvSvc<T> {
+                        type Response = super::GetKvResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetKvRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::get_kv(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetKvSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.metastore.MetastoreService/SetKv" => {
+                    #[allow(non_camel_case_types)]
+                    struct SetKvSvc<T: MetastoreServiceGrpc>(pub Arc<T>);
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::SetKvRequest> for SetKvSvc<T> {
+                        type Response = super::EmptyResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SetKvRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::set_kv(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SetKvSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.metastore.MetastoreService/DeleteKv" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteKvSvc<T: MetastoreServiceGrpc>(pub Arc<T>);
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::DeleteKvRequest>
+                    for DeleteKvSvc<T> {
+                        type Response = super::EmptyResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteKvRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::delete_kv(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteKvSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

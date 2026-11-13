@@ -98,6 +98,7 @@ In memory:
 On disk:
 
 - The split cache stores entire splits on disk. It can be enabled by setting the `split_cache` configuration fields. This cache can help reduce object store costs and load. Searchers populate this cache when splits are created or queried and evict them with a simple LRU strategy.
+- The split footer disk cache persists split footers on disk. It can be enabled by setting the `split_footer_disk_cache_capacity` configuration value. It backs the in-memory footer cache with a persistent LRU tier so that, after a searcher restart, footers do not have to be refetched from the object store. Cached footers are promoted back into memory on the first access.
 
 Learn more about cache parameters in the [searcher configuration docs](../../configuration/node-config.md#searcher-configuration).
 

@@ -66,7 +66,7 @@ Hardcoding credentials into configuration files is not secure and strongly disco
 | Env variable | Description |
 | --- | --- |
 | `QW_S3_ENDPOINT` | Custom S3 endpoint. |
-| `QW_S3_MAX_CONCURRENCY` | Limit the number of concurrent requests to S3 |
+| `QW_S3_MAX_GET_OBJECT_CONNECTIONS` | Maximum number of concurrent S3 GetObject requests per process (unlimited by default). A request holds its slot from sending until its body is fully read, so this bounds the number of connections used for downloads. Retry backoff does not hold a slot. |
 
 #### Storage flavors
 

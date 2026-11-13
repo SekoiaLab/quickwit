@@ -21,6 +21,7 @@ use bytes::Bytes;
 use elasticsearch_dsl::search::Hit as ElasticHit;
 use elasticsearch_dsl::{HitsMetadata, ShardStatistics, Source, TotalHits, TotalHitsRelation};
 use futures_util::StreamExt;
+use http::HeaderValue;
 use itertools::Itertools;
 use quickwit_cluster::Cluster;
 use quickwit_common::truncate_str;
@@ -30,7 +31,7 @@ use quickwit_metastore::*;
 use quickwit_proto::metastore::MetastoreServiceClient;
 use quickwit_proto::search::{
     CountHits, ListFieldsResponse, PartialHit, ScrollRequest, SearchResponse, SortByValue,
-    SortDatetimeFormat,
+    SortDatetimeFormat, SplitsByOutcome,
 };
 use quickwit_proto::types::IndexUid;
 use quickwit_query::BooleanOperand;
@@ -307,6 +308,7 @@ fn build_request_for_es_api(
     index_id_patterns: Vec<String>,
     search_params: SearchQueryParams,
     search_body: SearchBody,
+    user_agent: Option<HeaderValue>,
 ) -> Result<(quickwit_proto::search::SearchRequest, bool), ElasticsearchError> {
     let default_operator = search_params.default_operator.unwrap_or(BooleanOperand::Or);
     // The query string, if present, takes priority over what can be in the request
@@ -363,10 +365,14 @@ fn build_request_for_es_api(
         .track_total_hits
         .or(search_body.track_total_hits)
     {
-        None => CountHits::Underestimate,
         Some(TrackTotalHits::Track(false)) => CountHits::Underestimate,
         Some(TrackTotalHits::Count(count)) if count <= max_hits as i64 => CountHits::Underestimate,
         Some(TrackTotalHits::Track(true) | TrackTotalHits::Count(_)) => CountHits::CountAll,
+        // A query without aggregation and a size set to 0 cannot be used for
+        // anything else than counting. We avoid setting `Underestimate` in that
+        // case as it would always return 0.
+        None if max_hits == 0 && aggregation_request.is_none() => CountHits::CountAll,
+        None => CountHits::Underestimate,
     }
     .into();
 
@@ -413,6 +419,7 @@ fn build_request_for_es_api(
             count_hits,
             ignore_missing_indexes,
             split_id: None,
+            user_agent: user_agent.and_then(|h| h.to_str().ok().map(str::to_owned)),
         },
         has_doc_id_field,
     ))
@@ -490,12 +497,13 @@ async fn es_compat_index_count(
     index_id_patterns: Vec<String>,
     search_params: SearchQueryParamsCount,
     search_body: SearchBody,
+    user_agent: Option<HeaderValue>,
     search_service: Arc<dyn SearchService>,
 ) -> Result<ElasticsearchCountResponse, ElasticsearchError> {
     let mut search_params: SearchQueryParams = search_params.into();
     search_params.track_total_hits = Some(TrackTotalHits::Track(true));
     let (search_request, _append_shard_doc) =
-        build_request_for_es_api(index_id_patterns, search_params, search_body)?;
+        build_request_for_es_api(index_id_patterns, search_params, search_body, user_agent)?;
     let search_response: SearchResponse = search_service.root_search(search_request).await?;
     let search_response_rest: ElasticsearchCountResponse = ElasticsearchCountResponse {
         count: search_response.num_hits,
@@ -507,6 +515,7 @@ async fn es_compat_index_search(
     index_id_patterns: Vec<String>,
     search_params: SearchQueryParams,
     search_body: SearchBody,
+    user_agent: Option<HeaderValue>,
     search_service: Arc<dyn SearchService>,
 ) -> Result<ElasticsearchResponse, ElasticsearchError> {
     if search_params.scroll.is_some() && !search_params.allow_partial_search_results() {
@@ -520,7 +529,7 @@ async fn es_compat_index_search(
     let start_instant = Instant::now();
     let allow_partial_search_results = search_params.allow_partial_search_results();
     let (search_request, append_shard_doc) =
-        build_request_for_es_api(index_id_patterns, search_params, search_body)?;
+        build_request_for_es_api(index_id_patterns, search_params, search_body, user_agent)?;
     let search_response: SearchResponse = search_service.root_search(search_request).await?;
     let elapsed = start_instant.elapsed();
     let mut search_response_rest: ElasticsearchResponse = convert_to_es_search_response(
@@ -778,16 +787,16 @@ fn convert_hit(
             .unwrap_or_else(|_| Source::from_string("{}".to_string()).unwrap());
 
     let mut sort = Vec::new();
-    if let Some(partial_hit) = hit.partial_hit {
-        if let Some(sort_value) = partial_hit.sort_value {
-            sort.push(sort_value.into_json());
+    if let Some(partial_hit) = &hit.partial_hit {
+        if let Some(sort_value) = &partial_hit.sort_value {
+            sort.push(sort_value.clone().into_json());
         }
-        if let Some(sort_value2) = partial_hit.sort_value2 {
-            sort.push(sort_value2.into_json());
+        if let Some(sort_value2) = &partial_hit.sort_value2 {
+            sort.push(sort_value2.clone().into_json());
         }
         if append_shard_doc {
             sort.push(serde_json::Value::String(
-                quickwit_search::GlobalDocAddress::from_partial_hit(&partial_hit).to_string(),
+                quickwit_search::GlobalDocAddress::from_partial_hit(partial_hit).to_string(),
             ));
         }
     }
@@ -810,6 +819,7 @@ fn convert_hit(
 async fn es_compat_index_multi_search(
     payload: Bytes,
     multi_search_params: MultiSearchQueryParams,
+    user_agent: Option<HeaderValue>,
     search_service: Arc<dyn SearchService>,
 ) -> Result<MultiSearchResponse, ElasticsearchError> {
     let mut search_requests = Vec::new();
@@ -864,8 +874,12 @@ async fn es_compat_index_multi_search(
         if let Some(extra_filters) = &multi_search_params.extra_filters {
             search_query_params.extra_filters = Some(extra_filters.to_vec());
         }
-        let es_request =
-            build_request_for_es_api(index_ids_patterns, search_query_params, search_body)?;
+        let es_request = build_request_for_es_api(
+            index_ids_patterns,
+            search_query_params,
+            search_body,
+            user_agent.clone(),
+        )?;
         search_requests.push(es_request);
     }
 
@@ -998,6 +1012,34 @@ fn convert_to_es_stats_response(
     ElasticsearchStatsResponse { _all, indices }
 }
 
+fn get_relation_from_split_outcome(
+    splits_by_outcome: &Option<SplitsByOutcome>,
+    num_failed_splits: usize,
+) -> TotalHitsRelation {
+    let Some(splits_by_outcome) = splits_by_outcome else {
+        return TotalHitsRelation::GreaterThanOrEqualTo;
+    };
+    // Destructure to make sure we update this if a state is added.
+    let SplitsByOutcome {
+        cancel_before_warmup: _,
+        cancel_warmup: _,
+        cancel_cpu_queue: _,
+        cancel_cpu: _,
+        pruned_before_warmup,
+        pruned_after_warmup,
+        cache_hit: _,
+        processed: _,
+        processed_from_metadata: _,
+    } = *splits_by_outcome;
+    // A cancelled split may be retried and eventually succeed, so cancel
+    // counters alone don't imply an underestimated count. Use reported failed
+    // splits instead.
+    if num_failed_splits == 0 && pruned_before_warmup == 0 && pruned_after_warmup == 0 {
+        return TotalHitsRelation::Equal;
+    }
+    TotalHitsRelation::GreaterThanOrEqualTo
+}
+
 #[allow(clippy::result_large_err)]
 fn convert_to_es_search_response(
     resp: SearchResponse,
@@ -1033,12 +1075,16 @@ fn convert_to_es_search_response(
     let num_failed_splits = resp.failed_splits.len() as u32;
     let num_successful_splits = resp.num_successful_splits as u32;
     let num_total_splits = num_successful_splits + num_failed_splits;
+
+    let relation =
+        get_relation_from_split_outcome(&resp.splits_by_outcome, resp.failed_splits.len());
+
     Ok(ElasticsearchResponse {
         timed_out: false,
         hits: HitsMetadata {
             total: Some(TotalHits {
                 value: resp.num_hits,
-                relation: TotalHitsRelation::Equal,
+                relation,
             }),
             max_score: None,
             hits,

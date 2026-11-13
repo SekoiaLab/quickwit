@@ -16,56 +16,132 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use std::{fmt, io};
 
 use anyhow::{Context as AnyhhowContext, anyhow};
 use async_trait::async_trait;
+use aws_config::timeout::TimeoutConfig;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
 use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::builders::ObjectIdentifierBuilder;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use base64::prelude::{BASE64_STANDARD, Engine};
+use bytes::Bytes;
 use futures::{StreamExt, stream};
 use once_cell::sync::{Lazy, OnceCell};
-use quickwit_aws::retry::{AwsRetryable, aws_retry};
+use quickwit_aws::http_client::s3_http_client;
+use quickwit_aws::retry::AwsRetryable;
 use quickwit_aws::{aws_behavior_version, get_aws_config};
+use quickwit_common::metrics::OwnedGaugeGuard;
 use quickwit_common::retry::{Retry, RetryParams};
+use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
-use quickwit_common::{chunk_range, into_u64_range};
-use quickwit_config::{S3EncryptionConfig, S3StorageConfig};
+use quickwit_common::{chunk_range, into_u64_range, rate_limited_warn};
+use quickwit_config::{S3EncryptionConfig, S3StorageConfig, StorageTimeoutPolicy};
 use regex::Regex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::Semaphore;
 use tracing::{info, instrument, warn};
 
-use crate::metrics::object_storage_get_slice_in_flight_guards;
-use crate::metrics_wrappers::{ActionLabel, RequestMetricsWrapperExt, copy_with_download_metrics};
+use crate::metrics::{STORAGE_METRICS, object_storage_get_slice_in_flight_guards};
+use crate::metrics_wrappers::{
+    ActionLabel, DownloadKind, RequestMetricsWrapperExt, aws_retry_with_metrics,
+    collect_with_download_metrics, copy_with_download_metrics,
+};
 use crate::object_storage::MultiPartPolicy;
+use crate::stable_deref_bytes::into_owned_bytes;
 use crate::storage::SendableAsync;
 use crate::{
     BulkDeleteError, DeleteFailure, OwnedBytes, Storage, StorageError, StorageErrorKind,
     StorageResolverError, StorageResult,
 };
 
-/// Semaphore to limit the number of concurrent requests to the object store. Some object stores
-/// (R2, SeaweedFs...) return errors when too many concurrent requests are emitted.
-static REQUEST_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| {
-    let num_permits: usize =
-        quickwit_common::get_from_env("QW_S3_MAX_CONCURRENCY", 10_000usize, false);
+const MAX_GET_OBJECT_CONNECTIONS_ENV_KEY: &str = "QW_S3_MAX_GET_OBJECT_CONNECTIONS";
+
+/// Maximum number of GetObject attempts in flight at any time. Unlimited when
+/// `QW_S3_MAX_GET_OBJECT_CONNECTIONS` is not set. An invalid value is reported as an error
+/// when the storage is resolved, see [`S3CompatibleObjectStorage::from_uri_and_client`].
+static MAX_GET_OBJECT_CONNECTIONS: Lazy<Result<usize, String>> = Lazy::new(|| {
+    let value_opt = std::env::var(MAX_GET_OBJECT_CONNECTIONS_ENV_KEY).ok();
+    let max_connections_res = parse_max_get_object_connections(value_opt.as_deref());
+    if let (Some(_), Ok(max_connections)) = (&value_opt, &max_connections_res) {
+        info!(
+            max_connections,
+            "using environment variable `{MAX_GET_OBJECT_CONNECTIONS_ENV_KEY}` value"
+        );
+    }
+    max_connections_res
+});
+
+fn parse_max_get_object_connections(value_opt: Option<&str>) -> Result<usize, String> {
+    let Some(value_str) = value_opt else {
+        return Ok(Semaphore::MAX_PERMITS);
+    };
+    match value_str.trim().parse::<usize>() {
+        Ok(max_connections) if (1..=Semaphore::MAX_PERMITS).contains(&max_connections) => {
+            Ok(max_connections)
+        }
+        _ => Err(format!(
+            "environment variable `{MAX_GET_OBJECT_CONNECTIONS_ENV_KEY}` must be an integer \
+             between 1 and {}, got `{value_str}`",
+            Semaphore::MAX_PERMITS
+        )),
+    }
+}
+
+/// Semaphore limiting the number of GetObject attempts in flight at any time.
+static GET_OBJECT_CONNECTION_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| {
+    let num_permits = MAX_GET_OBJECT_CONNECTIONS
+        .clone()
+        .expect("the GetObject connection limit should be validated when resolving the storage");
     Semaphore::new(num_permits)
 });
 
-/// Wrap the async read handle together with a permit to keep the permit alive
+/// A permit from `GET_OBJECT_CONNECTION_SEMAPHORE`. It must be held until the response body
+/// has been fully read or dropped.
+struct GetObjectConnectionPermit {
+    _permit: tokio::sync::SemaphorePermit<'static>,
+    _in_use_guard: OwnedGaugeGuard,
+}
+
+/// Acquires a connection permit for a GetObject request to `bucket`. The permits are shared by
+/// all buckets; the gauges are labelled by bucket to tell which ones hold or wait for them.
+async fn acquire_get_object_connection_permit(bucket: &str) -> GetObjectConnectionPermit {
+    let mut waiting_guard = OwnedGaugeGuard::from_gauge(
+        STORAGE_METRICS
+            .object_storage_get_object_connections_waiting
+            .with_label_values([bucket]),
+    );
+    waiting_guard.add(1);
+    let permit = GET_OBJECT_CONNECTION_SEMAPHORE
+        .acquire()
+        .await
+        .expect("the semaphore should never be closed");
+    drop(waiting_guard);
+    let mut in_use_guard = OwnedGaugeGuard::from_gauge(
+        STORAGE_METRICS
+            .object_storage_get_object_connections_in_use
+            .with_label_values([bucket]),
+    );
+    in_use_guard.add(1);
+    GetObjectConnectionPermit {
+        _permit: permit,
+        _in_use_guard: in_use_guard,
+    }
+}
+
+/// Wrap the async read handle together with the connection permit to keep the permit alive
 /// until the handle is dropped
 struct S3AsyncRead<T: AsyncRead + Send + Unpin> {
-    pub read: T,
-    pub _permit: Result<tokio::sync::SemaphorePermit<'static>, tokio::sync::AcquireError>,
+    read: T,
+    _connection_permit: GetObjectConnectionPermit,
 }
 
 impl<T: AsyncRead + Send + Unpin> AsyncRead for S3AsyncRead<T> {
@@ -76,6 +152,40 @@ impl<T: AsyncRead + Send + Unpin> AsyncRead for S3AsyncRead<T> {
     ) -> Poll<io::Result<()>> {
         let self_unpin = self.get_mut();
         Pin::new(&mut self_unpin.read).poll_read(cx, buf)
+    }
+}
+
+/// Classifies an SDK error for the retry loop: throttled, transient or permanent.
+fn into_retry<E>(sdk_error: SdkError<E>) -> Retry<StorageError>
+where
+    SdkError<E>: AwsRetryable,
+    StorageError: From<SdkError<E>>,
+{
+    if sdk_error.is_throttling() {
+        Retry::Throttled(StorageError::from(sdk_error))
+    } else if sdk_error.is_retryable() {
+        Retry::Transient(StorageError::from(sdk_error))
+    } else {
+        Retry::Permanent(StorageError::from(sdk_error))
+    }
+}
+
+/// The deadline of a `get_slice` subject to a timeout policy is this many times the timeout of a
+/// single attempt, whatever the number of attempts and including the waits between them: until it
+/// completes, it holds resources of its caller, for instance a search permit.
+///
+/// With [`RetryParams::aggressive`], the throttling backoff between the 5 attempts lasts 5.85s at
+/// most, so it fits in the deadline as long as the attempt timeout is at least 2s.
+const DEADLINE_FACTOR: u32 = 3;
+
+/// Records the outcome of a `get_slice` subject to a timeout policy, in the same metric as
+/// [`crate::TimeoutAndRetryStorage`]: either it gave up because its last attempt timed out, or it
+/// completed, successfully or not, after `num_timeouts` timed-out attempts.
+fn record_get_slice_timeout_outcome(num_timeouts: usize, gave_up_on_timeout: bool) {
+    if gave_up_on_timeout {
+        STORAGE_METRICS.get_slice_timeout_all_timeouts.inc();
+    } else {
+        STORAGE_METRICS.get_slice_timeout_successes[num_timeouts.min(2)].inc();
     }
 }
 
@@ -90,6 +200,14 @@ pub struct S3CompatibleObjectStorage {
     disable_multi_object_delete: bool,
     disable_multipart_upload: bool,
     encryption: Option<S3EncryptionConfig>,
+    /// Thread pool on which large multi-segment response bodies are assembled into a single
+    /// buffer. `None` assembles them inline on the tokio worker. This is not part of the storage
+    /// config: it is set by the node that builds the storage (see
+    /// [`Self::with_assembly_thread_pool`]).
+    assembly_thread_pool: Option<ThreadPoolWithPriority>,
+    /// Timeout of each attempt to download a slice. Like the assembly thread pool, it is set by
+    /// the node that builds the storage (see [`Self::with_timeout_policy`]).
+    timeout_policy: Option<StorageTimeoutPolicy>,
 }
 
 impl fmt::Debug for S3CompatibleObjectStorage {
@@ -99,6 +217,7 @@ impl fmt::Debug for S3CompatibleObjectStorage {
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
             .field("encryption", &self.encryption)
+            .field("assembly_thread_pool", &self.assembly_thread_pool.is_some())
             .finish()
     }
 }
@@ -141,11 +260,19 @@ pub async fn create_s3_client(s3_storage_config: &S3StorageConfig) -> S3Client {
     }
     s3_config.set_credentials_provider(credentials_provider);
     s3_config.set_force_path_style(s3_storage_config.force_path_style_access());
-    s3_config.set_http_client(aws_config.http_client());
+    // Records the S3 connection pool's background tasks (socket reads, TLS, HTTP parsing) as
+    // `s3` rather than attributing them to whichever caller opened each connection.
+    s3_config.set_http_client(aws_config.http_client().map(s3_http_client));
     s3_config.set_retry_config(aws_config.retry_config().cloned());
     s3_config.set_sleep_impl(aws_config.sleep_impl());
     s3_config.set_stalled_stream_protection(aws_config.stalled_stream_protection());
-    s3_config.set_timeout_config(aws_config.timeout_config().cloned());
+    s3_config.set_timeout_config(Some(
+        TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .operation_attempt_timeout(Duration::from_secs(900)) // Single attempt timeout
+            .operation_timeout(Duration::from_secs(1800)) // Total timeout
+            .build(),
+    ));
 
     if let Some(endpoint) = s3_storage_config.endpoint() {
         info!(endpoint=%endpoint, "using S3 endpoint defined in storage config or environment variable");
@@ -174,6 +301,9 @@ impl S3CompatibleObjectStorage {
             let message = format!("failed to extract bucket name from S3 URI: {uri}");
             StorageResolverError::InvalidUri(message)
         })?;
+        MAX_GET_OBJECT_CONNECTIONS
+            .as_ref()
+            .map_err(|message| StorageResolverError::InvalidConfig(message.clone()))?;
         let retry_params = RetryParams::aggressive();
         let disable_multi_object_delete = s3_storage_config.disable_multi_object_delete;
         let disable_multipart_upload = s3_storage_config.disable_multipart_upload;
@@ -187,6 +317,8 @@ impl S3CompatibleObjectStorage {
             disable_multi_object_delete,
             disable_multipart_upload,
             encryption: s3_storage_config.encryption.clone(),
+            assembly_thread_pool: None,
+            timeout_policy: None,
         })
     }
 
@@ -195,16 +327,27 @@ impl S3CompatibleObjectStorage {
     /// This method overrides any existing prefix. (It does NOT
     /// append the argument to any existing prefix.)
     pub fn with_prefix(self, prefix: PathBuf) -> Self {
+        Self { prefix, ..self }
+    }
+
+    /// Assembles large multi-segment response bodies on `thread_pool` instead of the tokio
+    /// worker polling the download. See
+    /// [`crate::metrics_wrappers::collect_with_download_metrics`] for the threshold.
+    pub fn with_assembly_thread_pool(self, thread_pool: ThreadPoolWithPriority) -> Self {
         Self {
-            s3_client: self.s3_client,
-            uri: self.uri,
-            bucket: self.bucket,
-            prefix,
-            multipart_policy: self.multipart_policy,
-            retry_params: self.retry_params,
-            disable_multi_object_delete: self.disable_multi_object_delete,
-            disable_multipart_upload: self.disable_multipart_upload,
-            encryption: self.encryption,
+            assembly_thread_pool: Some(thread_pool),
+            ..self
+        }
+    }
+
+    /// Applies `timeout_policy` to each attempt to download a slice, response body included. A
+    /// timed-out attempt is retried, `max_num_retries` times at most, like any transient error:
+    /// waiting for a connection permit and the delays between attempts are not counted in the
+    /// timeout. The whole download has a deadline of [`DEADLINE_FACTOR`] times the timeout.
+    pub fn with_timeout_policy(self, timeout_policy: StorageTimeoutPolicy) -> Self {
+        Self {
+            timeout_policy: Some(timeout_policy),
+            ..self
         }
     }
 
@@ -318,15 +461,9 @@ impl S3CompatibleObjectStorage {
         }
         req_builder
             .send()
-            .with_count_and_upload_metrics(ActionLabel::PutObject, len)
+            .with_count_and_upload_metrics(ActionLabel::PutObject, bucket, len)
             .await
-            .map_err(|sdk_error| {
-                if sdk_error.is_retryable() {
-                    Retry::Transient(StorageError::from(sdk_error))
-                } else {
-                    Retry::Permanent(StorageError::from(sdk_error))
-                }
-            })?;
+            .map_err(into_retry)?;
         Ok(())
     }
 
@@ -337,7 +474,7 @@ impl S3CompatibleObjectStorage {
         len: u64,
     ) -> StorageResult<()> {
         let bucket = &self.bucket;
-        aws_retry(&self.retry_params, || async {
+        aws_retry_with_metrics(&self.retry_params, ActionLabel::PutObject, || async {
             self.put_single_part_single_try(bucket, key, payload.clone(), len)
                 .await
         })
@@ -347,33 +484,37 @@ impl S3CompatibleObjectStorage {
     }
 
     async fn create_multipart_upload(&self, key: &str) -> StorageResult<MultipartUploadId> {
-        let upload_id = aws_retry(&self.retry_params, || async {
-            let mut req_builder = self
-                .s3_client
-                .create_multipart_upload()
-                .bucket(self.bucket.clone())
-                .key(key);
-            match &self.encryption {
-                Some(S3EncryptionConfig::SseC {
-                    key,
-                    key_md5,
-                    read_only: false,
-                }) => {
-                    req_builder = req_builder
-                        .set_sse_customer_algorithm(Some("AES256".to_string()))
-                        .set_sse_customer_key(Some(key.clone()))
-                        .set_sse_customer_key_md5(Some(key_md5.clone()));
+        let upload_id = aws_retry_with_metrics(
+            &self.retry_params,
+            ActionLabel::CreateMultipartUpload,
+            || async {
+                let mut req_builder = self
+                    .s3_client
+                    .create_multipart_upload()
+                    .bucket(self.bucket.clone())
+                    .key(key);
+                match &self.encryption {
+                    Some(S3EncryptionConfig::SseC {
+                        key,
+                        key_md5,
+                        read_only: false,
+                    }) => {
+                        req_builder = req_builder
+                            .set_sse_customer_algorithm(Some("AES256".to_string()))
+                            .set_sse_customer_key(Some(key.clone()))
+                            .set_sse_customer_key_md5(Some(key_md5.clone()));
+                    }
+                    Some(S3EncryptionConfig::SseC {
+                        read_only: true, ..
+                    }) => {}
+                    None => {}
                 }
-                Some(S3EncryptionConfig::SseC {
-                    read_only: true, ..
-                }) => {}
-                None => {}
-            }
-            req_builder
-                .send()
-                .with_count_metric(ActionLabel::CreateMultipartUpload)
-                .await
-        })
+                req_builder
+                    .send()
+                    .with_count_metric(ActionLabel::CreateMultipartUpload, &self.bucket)
+                    .await
+            },
+        )
         .await?
         .upload_id
         .ok_or_else(|| {
@@ -489,15 +630,9 @@ impl S3CompatibleObjectStorage {
         }
         let upload_part_output = req_builder
             .send()
-            .with_count_and_upload_metrics(ActionLabel::UploadPart, part.len())
+            .with_count_and_upload_metrics(ActionLabel::UploadPart, &self.bucket, part.len())
             .await
-            .map_err(|s3_err| {
-                if s3_err.is_retryable() {
-                    Retry::Transient(StorageError::from(s3_err))
-                } else {
-                    Retry::Permanent(StorageError::from(s3_err))
-                }
-            })?;
+            .map_err(into_retry)?;
 
         let completed_part = CompletedPart::builder()
             .set_e_tag(upload_part_output.e_tag)
@@ -522,7 +657,7 @@ impl S3CompatibleObjectStorage {
             stream::iter(parts.into_iter().map(|part| {
                 let payload = payload.clone();
                 let upload_id = upload_id.clone();
-                aws_retry(&self.retry_params, move || {
+                aws_retry_with_metrics(&self.retry_params, ActionLabel::UploadPart, move || {
                     self.upload_part(upload_id.clone(), key, part.clone(), payload.clone())
                 })
             }))
@@ -561,37 +696,58 @@ impl S3CompatibleObjectStorage {
         let completed_upload = CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
             .build();
-        aws_retry(&self.retry_params, || async {
-            self.s3_client
-                .complete_multipart_upload()
-                .bucket(self.bucket.clone())
-                .key(key)
-                .multipart_upload(completed_upload.clone())
-                .upload_id(upload_id)
-                .send()
-                .with_count_metric(ActionLabel::CompleteMultipartUpload)
-                .await
-        })
+        aws_retry_with_metrics(
+            &self.retry_params,
+            ActionLabel::CompleteMultipartUpload,
+            || async {
+                self.s3_client
+                    .complete_multipart_upload()
+                    .bucket(self.bucket.clone())
+                    .key(key)
+                    .multipart_upload(completed_upload.clone())
+                    .upload_id(upload_id)
+                    .send()
+                    .with_count_metric(ActionLabel::CompleteMultipartUpload, &self.bucket)
+                    .await
+            },
+        )
         .await?;
         Ok(())
     }
 
     async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> StorageResult<()> {
-        aws_retry(&self.retry_params, || async {
-            self.s3_client
-                .abort_multipart_upload()
-                .bucket(self.bucket.clone())
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .with_count_metric(ActionLabel::AbortMultipartUpload)
-                .await
-        })
+        aws_retry_with_metrics(
+            &self.retry_params,
+            ActionLabel::AbortMultipartUpload,
+            || async {
+                self.s3_client
+                    .abort_multipart_upload()
+                    .bucket(self.bucket.clone())
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .with_count_metric(ActionLabel::AbortMultipartUpload, &self.bucket)
+                    .await
+            },
+        )
         .await?;
         Ok(())
     }
 
+    /// Sends a single GetObject request. The returned permit must be kept alive until the body
+    /// has been consumed.
     async fn get_object(
+        &self,
+        path: &Path,
+        range_opt: Option<Range<usize>>,
+    ) -> Result<(GetObjectOutput, GetObjectConnectionPermit), SdkError<GetObjectError>> {
+        let connection_permit = acquire_get_object_connection_permit(&self.bucket).await;
+        let get_object_output = self.send_get_object(path, range_opt).await?;
+        Ok((get_object_output, connection_permit))
+    }
+
+    /// Sends a single GetObject request, on a connection permit acquired by the caller.
+    async fn send_get_object(
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
@@ -618,29 +774,94 @@ impl S3CompatibleObjectStorage {
             }
             None => {}
         }
-        let get_object_output = req_builder
+        req_builder
             .send()
-            .with_count_and_duration_metrics(ActionLabel::GetObject)
-            .await?;
-        Ok(get_object_output)
+            .with_count_and_duration_metrics(ActionLabel::GetObject, &self.bucket)
+            .await
     }
 
-    async fn get_to_vec(
+    /// A single attempt of [`Self::get_to_bytes`]. The body is read within the attempt: a
+    /// connection dropped or stalled while streaming the body fails it, and the whole GET is sent
+    /// again.
+    async fn get_to_bytes_attempt(
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
-    ) -> StorageResult<Vec<u8>> {
-        let cap = range_opt.as_ref().map(Range::len).unwrap_or(0);
-        let get_object_output = aws_retry(&self.retry_params, || {
-            self.get_object(path, range_opt.clone())
-        })
-        .await?;
+        _connection_permit: GetObjectConnectionPermit,
+    ) -> Result<Bytes, Retry<StorageError>> {
+        let download_kind = if range_opt.is_some() {
+            DownloadKind::Slice
+        } else {
+            DownloadKind::Object
+        };
+        let get_object_output = self
+            .send_get_object(path, range_opt.clone())
+            .await
+            .map_err(into_retry)?;
         // only record ranged get request as being in flight
         let _in_flight_guards =
             range_opt.map(|range| object_storage_get_slice_in_flight_guards(range.len()));
-        let mut buf: Vec<u8> = Vec::with_capacity(cap);
-        download_all(get_object_output.body, &mut buf).await?;
-        Ok(buf)
+        collect_with_download_metrics(
+            get_object_output.body,
+            download_kind,
+            self.assembly_thread_pool.as_ref(),
+        )
+        .await
+        // GET requests are idempotent, and a body error is a transport failure.
+        .map_err(|io_error| Retry::Transient(StorageError::from(io_error)))
+    }
+
+    async fn get_to_bytes(
+        &self,
+        path: &Path,
+        range_opt: Option<Range<usize>>,
+    ) -> StorageResult<Bytes> {
+        // The timeout policy only applies to slices, whose size is known.
+        let slice_timeout_policy_opt = range_opt.as_ref().zip(self.timeout_policy.as_ref());
+        let num_timeouts = AtomicUsize::new(0);
+        let last_attempt_timed_out = AtomicBool::new(false);
+        let retry_fut =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
+                // Waiting for a connection permit is local queueing: the attempt timeout starts
+                // once the permit is acquired.
+                let connection_permit = acquire_get_object_connection_permit(&self.bucket).await;
+                let attempt = self.get_to_bytes_attempt(path, range_opt.clone(), connection_permit);
+                let Some((range, timeout_policy)) = slice_timeout_policy_opt else {
+                    return attempt.await;
+                };
+                let attempt_res =
+                    tokio::time::timeout(timeout_policy.timeout(range.len()), attempt).await;
+                last_attempt_timed_out.store(attempt_res.is_err(), Ordering::Relaxed);
+                attempt_res.unwrap_or_else(|_elapsed| {
+                    let error = StorageErrorKind::Timeout
+                        .with_error(anyhow!("internal timeout on get_slice"));
+                    // Timed-out attempts are retried `max_num_retries` times at most.
+                    if num_timeouts.fetch_add(1, Ordering::Relaxed) < timeout_policy.max_num_retries
+                    {
+                        Err(Retry::Transient(error))
+                    } else {
+                        Err(Retry::Permanent(error))
+                    }
+                })
+            });
+        let Some((range, timeout_policy)) = slice_timeout_policy_opt else {
+            return retry_fut.await.map_err(Retry::into_inner);
+        };
+        let deadline = timeout_policy.timeout(range.len()) * DEADLINE_FACTOR;
+        let Ok(payload_res) = tokio::time::timeout(deadline, retry_fut).await else {
+            STORAGE_METRICS.get_slice_timeout_deadlines_exceeded.inc();
+            rate_limited_warn!(limit_per_min=60, bucket=%self.bucket, key=%self.key(path), num_bytes=range.len(), deadline_secs=deadline.as_secs_f32(), "get_slice deadline exceeded");
+            return Err(StorageErrorKind::Timeout
+                .with_error(anyhow!("internal timeout on get_slice, deadline exceeded")));
+        };
+        let num_timeouts = num_timeouts.into_inner();
+        let gave_up_on_timeout = payload_res.is_err() && last_attempt_timed_out.into_inner();
+        if gave_up_on_timeout {
+            rate_limited_warn!(limit_per_min=60, bucket=%self.bucket, key=%self.key(path), num_bytes=range.len(), num_timeouts, "get_slice gave up after a timed-out attempt");
+        }
+        record_get_slice_timeout_outcome(num_timeouts, gave_up_on_timeout);
+        let payload = payload_res.map_err(Retry::into_inner)?;
+        Ok(payload)
     }
 
     /// Bulk delete implementation based on the DeleteObject API:
@@ -684,8 +905,6 @@ impl S3CompatibleObjectStorage {
     /// Bulk delete implementation based on the DeleteObjects API, also called Multi-Object Delete
     /// API: <https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html>
     async fn bulk_delete_multi(&self, paths: &[&Path]) -> Result<(), BulkDeleteError> {
-        let _permit = REQUEST_SEMAPHORE.acquire().await;
-
         let delete_requests: Vec<(&[&Path], Delete)> = self
             .build_delete_batch_requests(paths)
             .map_err(|error: anyhow::Error| {
@@ -707,13 +926,13 @@ impl S3CompatibleObjectStorage {
 
         for (path_chunk, delete) in &mut delete_requests_it {
             let delete_objects_res: StorageResult<DeleteObjectsOutput> =
-                aws_retry(&self.retry_params, || async {
+                aws_retry_with_metrics(&self.retry_params, ActionLabel::DeleteObjects, || async {
                     self.s3_client
                         .delete_objects()
                         .bucket(self.bucket.clone())
                         .delete(delete.clone())
                         .send()
-                        .with_count_and_duration_metrics(ActionLabel::DeleteObjects)
+                        .with_count_and_duration_metrics(ActionLabel::DeleteObjects, &self.bucket)
                         .await
                 })
                 .await
@@ -776,26 +995,15 @@ impl S3CompatibleObjectStorage {
     }
 }
 
-async fn download_all(byte_stream: ByteStream, output: &mut Vec<u8>) -> io::Result<()> {
-    output.clear();
-    let mut body_stream_reader = BufReader::new(byte_stream.into_async_read());
-    copy_with_download_metrics(&mut body_stream_reader, output).await?;
-    // When calling `get_all`, the Vec capacity is not properly set.
-    output.shrink_to_fit();
-    Ok(())
-}
-
 #[async_trait]
 impl Storage for S3CompatibleObjectStorage {
     async fn check_connectivity(&self) -> anyhow::Result<()> {
-        // we ignore error as we never close the semaphore
-        let _permit = REQUEST_SEMAPHORE.acquire().await;
         self.s3_client
             .list_objects_v2()
             .bucket(self.bucket.clone())
             .max_keys(1)
             .send()
-            .with_count_metric(ActionLabel::ListObjects)
+            .with_count_metric(ActionLabel::ListObjects, &self.bucket)
             .await?;
         Ok(())
     }
@@ -805,7 +1013,6 @@ impl Storage for S3CompatibleObjectStorage {
         path: &Path,
         payload: Box<dyn crate::PutPayload>,
     ) -> crate::StorageResult<()> {
-        let _permit = REQUEST_SEMAPHORE.acquire().await;
         let key = self.key(path);
         let total_len = payload.len();
         let part_num_bytes = self.multipart_policy.part_num_bytes(total_len);
@@ -819,29 +1026,34 @@ impl Storage for S3CompatibleObjectStorage {
     }
 
     async fn copy_to(&self, path: &Path, output: &mut dyn SendableAsync) -> StorageResult<()> {
-        let _permit = REQUEST_SEMAPHORE.acquire().await;
-        let get_object_output =
-            aws_retry(&self.retry_params, || self.get_object(path, None)).await?;
+        let (get_object_output, connection_permit) =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || {
+                self.get_object(path, None)
+            })
+            .await?;
         let mut body_read = BufReader::new(get_object_output.body.into_async_read());
-        copy_with_download_metrics(&mut body_read, output).await?;
+        copy_with_download_metrics(&mut body_read, output, DownloadKind::Object).await?;
+        // The body has been fully read: release the connection before flushing the output.
+        drop(body_read);
+        drop(connection_permit);
         output.flush().await?;
         Ok(())
     }
 
     async fn delete(&self, path: &Path) -> StorageResult<()> {
-        let _permit = REQUEST_SEMAPHORE.acquire().await;
         let bucket = self.bucket.clone();
         let key = self.key(path);
-        let delete_res = aws_retry(&self.retry_params, || async {
-            self.s3_client
-                .delete_object()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .with_count_and_duration_metrics(ActionLabel::DeleteObject)
-                .await
-        })
-        .await;
+        let delete_res =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::DeleteObject, || async {
+                self.s3_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .with_count_and_duration_metrics(ActionLabel::DeleteObject, &bucket)
+                    .await
+            })
+            .await;
 
         match delete_res {
             Ok(_) => Ok(()),
@@ -860,10 +1072,9 @@ impl Storage for S3CompatibleObjectStorage {
 
     #[instrument(level = "debug", skip(self, range), fields(range.start = range.start, range.end = range.end))]
     async fn get_slice(&self, path: &Path, range: Range<usize>) -> StorageResult<OwnedBytes> {
-        let _permit = REQUEST_SEMAPHORE.acquire().await;
-        self.get_to_vec(path, Some(range.clone()))
+        self.get_to_bytes(path, Some(range.clone()))
             .await
-            .map(OwnedBytes::new)
+            .map(into_owned_bytes)
             .map_err(|err| {
                 err.add_context(format!(
                     "failed to fetch slice {:?} for object: {}/{}",
@@ -880,24 +1091,23 @@ impl Storage for S3CompatibleObjectStorage {
         path: &Path,
         range: Range<usize>,
     ) -> crate::StorageResult<Box<dyn AsyncRead + Send + Unpin>> {
-        let permit = REQUEST_SEMAPHORE.acquire().await;
-        let get_object_output = aws_retry(&self.retry_params, || {
-            self.get_object(path, Some(range.clone()))
-        })
-        .await?;
+        let (get_object_output, connection_permit) =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || {
+                self.get_object(path, Some(range.clone()))
+            })
+            .await?;
         Ok(Box::new(S3AsyncRead {
             read: get_object_output.body.into_async_read(),
-            _permit: permit,
+            _connection_permit: connection_permit,
         }))
     }
 
     #[instrument(level = "debug", skip(self), fields(num_bytes_fetched))]
     async fn get_all(&self, path: &Path) -> StorageResult<OwnedBytes> {
-        let _permit = REQUEST_SEMAPHORE.acquire().await;
         let bytes = self
-            .get_to_vec(path, None)
+            .get_to_bytes(path, None)
             .await
-            .map(OwnedBytes::new)
+            .map(into_owned_bytes)
             .map_err(|err| {
                 err.add_context(format!(
                     "failed to fetch object: {}/{}",
@@ -910,36 +1120,40 @@ impl Storage for S3CompatibleObjectStorage {
     }
 
     async fn file_num_bytes(&self, path: &Path) -> StorageResult<u64> {
-        let _permit = REQUEST_SEMAPHORE.acquire().await;
         let bucket = self.bucket.clone();
         let key = self.key(path);
-        let head_object_output = aws_retry(&self.retry_params, || async {
-            let mut req_builder = self.s3_client.head_object().bucket(&bucket).key(&key);
-            match &self.encryption {
-                Some(S3EncryptionConfig::SseC {
-                    key,
-                    key_md5,
-                    read_only: _,
-                }) => {
-                    req_builder = req_builder
-                        .set_sse_customer_algorithm(Some("AES256".to_string()))
-                        .set_sse_customer_key(Some(key.clone()))
-                        .set_sse_customer_key_md5(Some(key_md5.clone()));
+        let head_object_output =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::HeadObject, || async {
+                let mut req_builder = self.s3_client.head_object().bucket(&bucket).key(&key);
+                match &self.encryption {
+                    Some(S3EncryptionConfig::SseC {
+                        key,
+                        key_md5,
+                        read_only: _,
+                    }) => {
+                        req_builder = req_builder
+                            .set_sse_customer_algorithm(Some("AES256".to_string()))
+                            .set_sse_customer_key(Some(key.clone()))
+                            .set_sse_customer_key_md5(Some(key_md5.clone()));
+                    }
+                    None => {}
                 }
-                None => {}
-            }
-            req_builder
-                .send()
-                .with_count_metric(ActionLabel::HeadObject)
-                .await
-        })
-        .await?;
+                req_builder
+                    .send()
+                    .with_count_metric(ActionLabel::HeadObject, &bucket)
+                    .await
+            })
+            .await?;
 
         Ok(head_object_output.content_length().unwrap_or(0) as u64)
     }
 
     fn uri(&self) -> &Uri {
         &self.uri
+    }
+
+    fn timeout_policy(&self) -> Option<StorageTimeoutPolicy> {
+        self.timeout_policy.clone()
     }
 }
 
@@ -966,6 +1180,41 @@ mod tests {
         assert_eq!(md5, md5::compute(data));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_parse_max_get_object_connections() {
+        assert_eq!(
+            parse_max_get_object_connections(None),
+            Ok(Semaphore::MAX_PERMITS)
+        );
+        assert_eq!(parse_max_get_object_connections(Some("2048")), Ok(2048));
+        assert_eq!(parse_max_get_object_connections(Some(" 1 ")), Ok(1));
+        let max_permits = Semaphore::MAX_PERMITS.to_string();
+        assert_eq!(
+            parse_max_get_object_connections(Some(&max_permits)),
+            Ok(Semaphore::MAX_PERMITS)
+        );
+        let too_many_permits = (Semaphore::MAX_PERMITS + 1).to_string();
+        for invalid_value in ["0", "-1", "", "abc", "1.5", too_many_permits.as_str()] {
+            parse_max_get_object_connections(Some(invalid_value)).unwrap_err();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_object_connection_permit_gauges_by_bucket() {
+        // Buckets of their own: the gauges are shared with the other tests.
+        let in_use = |bucket| {
+            STORAGE_METRICS
+                .object_storage_get_object_connections_in_use
+                .with_label_values([bucket])
+                .get()
+        };
+        let permit = acquire_get_object_connection_permit("test-permit-gauges-a").await;
+        assert_eq!(in_use("test-permit-gauges-a"), 1);
+        assert_eq!(in_use("test-permit-gauges-b"), 0);
+        drop(permit);
+        assert_eq!(in_use("test-permit-gauges-a"), 0);
     }
 
     #[test]
@@ -1031,6 +1280,8 @@ mod tests {
             disable_multi_object_delete: false,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
+            timeout_policy: None,
         };
         assert_eq!(
             s3_storage.relative_path("indexes/foo"),
@@ -1079,6 +1330,8 @@ mod tests {
             disable_multi_object_delete: true,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
+            timeout_policy: None,
         };
         let _ = s3_storage
             .bulk_delete(&[Path::new("foo"), Path::new("bar")])
@@ -1117,6 +1370,8 @@ mod tests {
             disable_multi_object_delete: false,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
+            timeout_policy: None,
         };
         let _ = s3_storage
             .bulk_delete(&[Path::new("foo"), Path::new("bar")])
@@ -1200,6 +1455,8 @@ mod tests {
             disable_multi_object_delete: false,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
+            timeout_policy: None,
         };
         let bulk_delete_error = s3_storage
             .bulk_delete(&[
@@ -1292,11 +1549,293 @@ mod tests {
             disable_multi_object_delete: false,
             disable_multipart_upload: false,
             encryption: None,
+            assembly_thread_pool: None,
+            timeout_policy: None,
         };
         s3_storage
             .put(Path::new("my-path"), Box::new(vec![1, 2, 3]))
             .await
             .unwrap();
+    }
+
+    /// A response whose body streams a few bytes, then fails as if the connection was reset.
+    fn get_object_event_with_body_error() -> ReplayEvent {
+        let failing_body = http_body_util::StreamBody::new(futures::stream::iter(vec![
+            Ok(hyper::body::Frame::data(Bytes::from_static(b"ab"))),
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection reset",
+            )),
+        ]));
+        ReplayEvent::new(
+            http::Request::builder().body(SdkBody::empty()).unwrap(),
+            http::Response::builder()
+                .status(206)
+                .body(SdkBody::from_body_1_x(failing_body))
+                .unwrap(),
+        )
+    }
+
+    fn s3_storage_for_get_test(client: StaticReplayClient) -> S3CompatibleObjectStorage {
+        let credentials = Credentials::new("mock_key", "mock_secret", None, None, "mock_provider");
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_behavior_version())
+            .region(Some(Region::new("Foo")))
+            .http_client(client)
+            .credentials_provider(credentials)
+            .build();
+        S3CompatibleObjectStorage {
+            s3_client: S3Client::from_conf(config),
+            uri: Uri::for_test("s3://bucket/indexes"),
+            bucket: "bucket".to_string(),
+            prefix: PathBuf::new(),
+            multipart_policy: MultiPartPolicy::default(),
+            retry_params: RetryParams::for_test(),
+            disable_multi_object_delete: false,
+            disable_multipart_upload: false,
+            encryption: None,
+            assembly_thread_pool: None,
+            timeout_policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_retries_body_error() {
+        let client = StaticReplayClient::new(vec![
+            get_object_event_with_body_error(),
+            ReplayEvent::new(
+                http::Request::builder().body(SdkBody::empty()).unwrap(),
+                http::Response::builder()
+                    .status(206)
+                    .body(SdkBody::from("abcd"))
+                    .unwrap(),
+            ),
+        ]);
+        let s3_storage = s3_storage_for_get_test(client.clone());
+
+        let slice = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap();
+        assert_eq!(slice.as_slice(), b"abcd");
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_body_error_exhausts_retries() {
+        let retry_params = RetryParams::for_test();
+        let client = StaticReplayClient::new(
+            (0..retry_params.max_attempts)
+                .map(|_| get_object_event_with_body_error())
+                .collect(),
+        );
+        let s3_storage = s3_storage_for_get_test(client.clone());
+
+        let error = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Io);
+        assert_eq!(client.actual_requests().count(), retry_params.max_attempts);
+    }
+
+    fn get_object_event(status: u16, body: SdkBody) -> ReplayEvent {
+        ReplayEvent::new(
+            http::Request::builder().body(SdkBody::empty()).unwrap(),
+            http::Response::builder().status(status).body(body).unwrap(),
+        )
+    }
+
+    fn get_object_error_event(status: u16, code: &str) -> ReplayEvent {
+        let body = format!("<Error><Code>{code}</Code><Message>message</Message></Error>");
+        get_object_event(status, SdkBody::from(body))
+    }
+
+    /// A response whose body never arrives: only a timeout can end the attempt.
+    fn get_object_event_with_pending_body() -> ReplayEvent {
+        let pending_body = http_body_util::StreamBody::new(futures::stream::pending::<
+            Result<hyper::body::Frame<Bytes>, io::Error>,
+        >());
+        get_object_event(206, SdkBody::from_body_1_x(pending_body))
+    }
+
+    fn timeout_policy(timeout: Duration, max_num_retries: usize) -> StorageTimeoutPolicy {
+        StorageTimeoutPolicy {
+            min_throughtput_bytes_per_secs: 0,
+            timeout_millis: timeout.as_millis() as u64,
+            max_num_retries,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_retries_timed_out_attempt() {
+        tokio::time::pause();
+        let client = StaticReplayClient::new(vec![
+            get_object_event_with_pending_body(),
+            get_object_event(206, SdkBody::from("abcd")),
+        ]);
+        let s3_storage = s3_storage_for_get_test(client.clone())
+            .with_timeout_policy(timeout_policy(Duration::from_secs(2), 1));
+
+        let slice = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap();
+        assert_eq!(slice.as_slice(), b"abcd");
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_timeout_without_retries() {
+        tokio::time::pause();
+        let client = StaticReplayClient::new(vec![
+            get_object_event_with_pending_body(),
+            get_object_event(206, SdkBody::from("abcd")),
+        ]);
+        let s3_storage = s3_storage_for_get_test(client.clone())
+            .with_timeout_policy(timeout_policy(Duration::from_secs(2), 0));
+
+        let error = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        assert_eq!(client.actual_requests().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_timeout_excludes_backoff() {
+        tokio::time::pause();
+        let client = StaticReplayClient::new(vec![
+            get_object_error_event(503, "SlowDown"),
+            get_object_event(206, SdkBody::from("abcd")),
+        ]);
+        // The backoff after the throttling error, 1 to 1.999s (jittered), is at least the 1s
+        // attempt timeout, yet under the deadline (at least 2s): only the attempts are timed.
+        let s3_storage = S3CompatibleObjectStorage {
+            retry_params: RetryParams {
+                base_delay: Duration::from_millis(1_999),
+                max_delay: Duration::from_secs(10),
+                max_attempts: 3,
+                throttling_base_delay: Duration::from_millis(1_999),
+                throttling_max_delay: Duration::from_secs(10),
+            },
+            ..s3_storage_for_get_test(client.clone())
+        }
+        .with_timeout_policy(timeout_policy(Duration::from_secs(1), 0));
+
+        let slice = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap();
+        assert_eq!(slice.as_slice(), b"abcd");
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    /// Returns how long `read` waited before retrying after an error response with `code`.
+    /// Time must be paused.
+    async fn retry_delay(
+        status: u16,
+        code: &str,
+        read: impl AsyncFn(&S3CompatibleObjectStorage),
+    ) -> Duration {
+        let client = StaticReplayClient::new(vec![
+            get_object_error_event(status, code),
+            get_object_event(206, SdkBody::from("abcd")),
+        ]);
+        let s3_storage = S3CompatibleObjectStorage {
+            retry_params: RetryParams {
+                base_delay: Duration::from_millis(100),
+                max_delay: Duration::from_secs(10),
+                max_attempts: 2,
+                throttling_base_delay: Duration::from_millis(300),
+                throttling_max_delay: Duration::from_secs(10),
+            },
+            ..s3_storage_for_get_test(client)
+        };
+        let start = tokio::time::Instant::now();
+        read(&s3_storage).await;
+        start.elapsed()
+    }
+
+    /// Checks that `read` waits for the throttling delay after a `SlowDown`, and for the base delay
+    /// after another transient error.
+    async fn assert_waits_longer_after_throttling(read: impl AsyncFn(&S3CompatibleObjectStorage)) {
+        tokio::time::pause();
+        // Throttling: 300ms, jittered.
+        let throttled_delay = retry_delay(503, "SlowDown", &read).await;
+        assert!(
+            (150..=301).contains(&throttled_delay.as_millis()),
+            "{throttled_delay:?}"
+        );
+        // Other transient error: 100ms, jittered.
+        let transient_delay = retry_delay(500, "InternalError", &read).await;
+        assert!(
+            (50..=101).contains(&transient_delay.as_millis()),
+            "{transient_delay:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_waits_longer_after_throttling() {
+        assert_waits_longer_after_throttling(async |s3_storage: &S3CompatibleObjectStorage| {
+            s3_storage
+                .get_slice(Path::new("my-path"), 0..4)
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
+    /// `copy_to` retries the SDK errors as they are, without `into_retry`.
+    #[tokio::test]
+    async fn test_s3_compatible_storage_copy_to_waits_longer_after_throttling() {
+        assert_waits_longer_after_throttling(async |s3_storage: &S3CompatibleObjectStorage| {
+            s3_storage
+                .copy_to(Path::new("my-path"), &mut Vec::new())
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_get_slice_deadline_exceeded() {
+        tokio::time::pause();
+        let max_attempts = 20;
+        let client = StaticReplayClient::new(
+            (0..max_attempts)
+                .map(|_| get_object_error_event(503, "SlowDown"))
+                .collect(),
+        );
+        // Attempts never time out, but the throttling lasts longer than the deadline.
+        let deadline = Duration::from_secs(1) * DEADLINE_FACTOR;
+        let s3_storage = S3CompatibleObjectStorage {
+            retry_params: RetryParams {
+                base_delay: Duration::from_secs(2),
+                max_delay: Duration::from_secs(10),
+                max_attempts,
+                throttling_base_delay: Duration::from_secs(2),
+                throttling_max_delay: Duration::from_secs(10),
+            },
+            ..s3_storage_for_get_test(client.clone())
+        }
+        .with_timeout_policy(timeout_policy(Duration::from_secs(1), 0));
+
+        let start = tokio::time::Instant::now();
+        let error = s3_storage
+            .get_slice(Path::new("my-path"), 0..4)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Timeout);
+        // Tokio timers have a millisecond granularity.
+        let elapsed = start.elapsed();
+        assert!(
+            deadline <= elapsed && elapsed < deadline + Duration::from_millis(10),
+            "{elapsed:?}"
+        );
+        // A throttling backoff of 1 to 2s: at most one attempt per second fits in the deadline.
+        assert!(client.actual_requests().count() <= DEADLINE_FACTOR as usize);
     }
 
     #[tokio::test]
@@ -1335,6 +1874,8 @@ mod tests {
                     key_md5: "SomeBase64MD5Value=".to_string(),
                     read_only,
                 }),
+                assembly_thread_pool: None,
+                timeout_policy: None,
             };
 
             let small_payload = vec![1u8; 100];
@@ -1436,6 +1977,8 @@ mod tests {
                     key_md5: "SomeBase64MD5Value=".to_string(),
                     read_only,
                 }),
+                assembly_thread_pool: None,
+                timeout_policy: None,
             };
 
             // Test multipart upload with large payload that triggers multipart (15MB > 10MB

@@ -20,6 +20,7 @@ use tantivy::aggregation::agg_result::{
     BucketEntries as TantivyBucketEntries, BucketEntry as TantivyBucketEntry,
     BucketResult as TantivyBucketResult, CompositeBucketEntry as TantivyCompositeBucketEntry,
     CompositeKey as TantivyCompositeKey, MetricResult as TantivyMetricResult,
+    MultiTermsBucketEntry as TantivyMultiTermsBucketEntry,
     RangeBucketEntry as TantivyRangeBucketEntry,
 };
 use tantivy::aggregation::bucket::AfterKey;
@@ -178,6 +179,17 @@ pub enum BucketResult {
         /// The key to start after when paginating
         after_key: FxHashMap<String, AfterKey>,
     },
+    /// This is the multi_terms result
+    MultiTerms {
+        /// The buckets, one per unique combination of field values.
+        ///
+        /// See `MultiTermsAggregation`
+        buckets: Vec<MultiTermsBucketEntry>,
+        /// The number of documents that didn’t make it into to TOP N due to shard_size or size
+        sum_other_doc_count: u64,
+        /// The upper bound error for the doc count of each term combination.
+        doc_count_error_upper_bound: Option<u64>,
+    },
 }
 
 impl From<TantivyBucketResult> for BucketResult {
@@ -205,6 +217,15 @@ impl From<TantivyBucketResult> for BucketResult {
                 buckets: buckets.into_iter().map(Into::into).collect(),
                 after_key: after_key.into_iter().collect(),
             },
+            TantivyBucketResult::MultiTerms {
+                buckets,
+                sum_other_doc_count,
+                doc_count_error_upper_bound,
+            } => BucketResult::MultiTerms {
+                buckets: buckets.into_iter().map(Into::into).collect(),
+                sum_other_doc_count,
+                doc_count_error_upper_bound,
+            },
         }
     }
 }
@@ -230,6 +251,15 @@ impl From<BucketResult> for TantivyBucketResult {
             BucketResult::Composite { buckets, after_key } => TantivyBucketResult::Composite {
                 buckets: buckets.into_iter().map(Into::into).collect(),
                 after_key: after_key.into_iter().collect(),
+            },
+            BucketResult::MultiTerms {
+                buckets,
+                sum_other_doc_count,
+                doc_count_error_upper_bound,
+            } => TantivyBucketResult::MultiTerms {
+                buckets: buckets.into_iter().map(Into::into).collect(),
+                sum_other_doc_count,
+                doc_count_error_upper_bound,
             },
         }
     }
@@ -350,6 +380,40 @@ impl From<BucketEntry> for TantivyBucketEntry {
         TantivyBucketEntry {
             key_as_string: value.key_as_string,
             key: value.key.into(),
+            doc_count: value.doc_count,
+            sub_aggregation: value.sub_aggregation.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiTermsBucketEntry {
+    /// Pipe-joined string representation of all key elements, e.g. `"rock|Product A"`.
+    pub key_as_string: String,
+    /// The composite key: one [`Key`] per field in declaration order.
+    pub key: Vec<Key>,
+    /// Number of documents in the bucket.
+    pub doc_count: u64,
+    /// Sub-aggregations in this bucket.
+    pub sub_aggregation: AggregationResults,
+}
+
+impl From<TantivyMultiTermsBucketEntry> for MultiTermsBucketEntry {
+    fn from(value: TantivyMultiTermsBucketEntry) -> MultiTermsBucketEntry {
+        MultiTermsBucketEntry {
+            key_as_string: value.key_as_string,
+            key: value.key.into_iter().map(Into::into).collect(),
+            doc_count: value.doc_count,
+            sub_aggregation: value.sub_aggregation.into(),
+        }
+    }
+}
+
+impl From<MultiTermsBucketEntry> for TantivyMultiTermsBucketEntry {
+    fn from(value: MultiTermsBucketEntry) -> TantivyMultiTermsBucketEntry {
+        TantivyMultiTermsBucketEntry {
+            key_as_string: value.key_as_string,
+            key: value.key.into_iter().map(Into::into).collect(),
             doc_count: value.doc_count,
             sub_aggregation: value.sub_aggregation.into(),
         }

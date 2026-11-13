@@ -25,7 +25,7 @@ use quickwit_proto::ingest::Shard;
 use quickwit_serve::{
     ListSplitsQueryParams, ListSplitsResponse, RestIngestResponse, SearchRequestQueryString,
 };
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::tls::Certificate;
 use reqwest::{ClientBuilder as ReqwestClientBuilder, Method, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder as ReqwestMiddlewareClientBuilder, ClientWithMiddleware};
@@ -112,8 +112,9 @@ impl Transport {
         }
         let mut request_headers = HeaderMap::new();
         request_headers.insert(CONTENT_TYPE, HeaderValue::from_static(DEFAULT_CONTENT_TYPE));
+        request_headers.insert(USER_AGENT, HeaderValue::from_static("qw-rest-client"));
         if let Some(header_map_val) = header_map {
-            request_headers.extend(header_map_val.into_iter());
+            request_headers.extend(header_map_val);
         }
         request_builder = request_builder.headers(request_headers);
         if let Some(bytes) = body {
@@ -290,6 +291,10 @@ impl QuickwitClient {
 
     pub fn cluster(&self) -> ClusterClient<'_> {
         ClusterClient::new(&self.transport, self.timeout)
+    }
+
+    pub fn maintenance(&self) -> MaintenanceClient<'_> {
+        MaintenanceClient::new(&self.transport, self.timeout)
     }
 
     pub fn node_stats(&self) -> NodeStatsClient<'_> {
@@ -780,6 +785,79 @@ impl<'a> NodeHealthClient<'a> {
     }
 }
 
+/// Response from the maintenance status endpoint.
+#[derive(Debug, serde::Deserialize)]
+pub struct MaintenanceStatusResponse {
+    pub is_maintenance_mode: bool,
+    pub enabled_at: Option<String>,
+}
+
+/// Response from the enable maintenance endpoint.
+#[derive(Debug, serde::Deserialize)]
+pub struct EnableMaintenanceResponse {
+    pub frozen_plan_json: String,
+}
+
+/// Client for maintenance mode APIs.
+pub struct MaintenanceClient<'a> {
+    transport: &'a Transport,
+    timeout: Timeout,
+}
+
+impl<'a> MaintenanceClient<'a> {
+    fn new(transport: &'a Transport, timeout: Timeout) -> Self {
+        Self { transport, timeout }
+    }
+
+    pub async fn status(&self) -> Result<MaintenanceStatusResponse, Error> {
+        let response = self
+            .transport
+            .send::<()>(
+                Method::GET,
+                "cluster/maintenance",
+                None,
+                None,
+                None,
+                self.timeout,
+            )
+            .await?;
+        let status = response.deserialize().await?;
+        Ok(status)
+    }
+
+    pub async fn enable(&self) -> Result<EnableMaintenanceResponse, Error> {
+        let response = self
+            .transport
+            .send::<()>(
+                Method::PUT,
+                "cluster/maintenance",
+                None,
+                None,
+                None,
+                self.timeout,
+            )
+            .await?;
+        let result = response.deserialize().await?;
+        Ok(result)
+    }
+
+    pub async fn disable(&self) -> Result<(), Error> {
+        let response = self
+            .transport
+            .send::<()>(
+                Method::DELETE,
+                "cluster/maintenance",
+                None,
+                None,
+                None,
+                self.timeout,
+            )
+            .await?;
+        response.check().await?;
+        Ok(())
+    }
+}
+
 fn header_from_config_format(config_format: ConfigFormat) -> HeaderMap {
     let mut header_map = HeaderMap::new();
     let content_type_value = format!("application/{}", config_format.as_str());
@@ -842,7 +920,6 @@ mod test {
             snippets: None,
             aggregations: None,
             elapsed_time_micros: 100,
-            errors: Vec::new(),
         };
         Mock::given(method("POST"))
             .and(path("/api/v1/my-index/search"))
