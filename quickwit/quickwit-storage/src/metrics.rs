@@ -103,9 +103,9 @@ impl Default for StorageMetrics {
             object_storage_operation_attempts: new_histogram_vec(
                 "object_storage_operation_attempts",
                 "Number of attempts per object store operation (a request and its retries), by \
-                 action and outcome: `success`, `exhausted` (every attempt failed with a \
-                 retryable error), `permanent_error`, `cancelled_during_attempt` or \
-                 `cancelled_during_backoff`.",
+                 action and outcome: `success`, `timed_out` (the last attempt timed out), \
+                 `exhausted` (every attempt failed with a retryable error), `permanent_error`, \
+                 `cancelled_during_attempt` or `cancelled_during_backoff`.",
                 "storage",
                 &[],
                 ["action", "outcome"],

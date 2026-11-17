@@ -20,16 +20,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
+use aws_sdk_s3::error::SdkError;
 use aws_smithy_types::byte_stream::ByteStream;
 use bytes::{Bytes, BytesMut};
 use once_cell::sync::Lazy;
 use pin_project::{pin_project, pinned_drop};
 use quickwit_aws::retry::{AwsRetryable, aws_retry};
-use quickwit_common::retry::RetryParams;
+use quickwit_common::retry::{Retry, RetryParams};
 use quickwit_common::thread_pool::with_priority::{Priority, ThreadPoolWithPriority};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
-use crate::STORAGE_METRICS;
+use crate::{STORAGE_METRICS, StorageError, StorageErrorKind};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ActionLabel {
@@ -235,9 +236,38 @@ where
     }
 }
 
+/// The error an object store operation fails with, as classified by [`aws_retry_with_metrics`].
+pub(crate) trait OperationError: AwsRetryable {
+    /// Whether the attempt that ended the operation timed out, for instance on the internal
+    /// timeout of a `get_slice` attempt.
+    fn is_timeout(&self) -> bool {
+        false
+    }
+}
+
+impl<E> OperationError for SdkError<E>
+where SdkError<E>: AwsRetryable
+{
+    fn is_timeout(&self) -> bool {
+        match self {
+            SdkError::TimeoutError(_) => true,
+            SdkError::DispatchFailure(error) => error.is_timeout(),
+            _ => false,
+        }
+    }
+}
+
+impl OperationError for Retry<StorageError> {
+    fn is_timeout(&self) -> bool {
+        let (Retry::Permanent(error) | Retry::Transient(error) | Retry::Throttled(error)) = self;
+        error.kind() == StorageErrorKind::Timeout
+    }
+}
+
 /// Runs an object store operation with [`aws_retry`] and records the number of attempts it took,
-/// by outcome: `success`, `exhausted` (every attempt failed with a retryable error),
-/// `permanent_error`, `cancelled_during_attempt` or `cancelled_during_backoff`.
+/// by outcome: `success`, `timed_out` (the last attempt timed out), `exhausted` (every attempt
+/// failed with a retryable error), `permanent_error`, `cancelled_during_attempt` or
+/// `cancelled_during_backoff`.
 ///
 /// The cancellation outcomes record operations dropped by the caller, for instance on a timeout.
 /// A cancellation while waiting between two attempts is not visible in the request metrics.
@@ -248,7 +278,7 @@ pub(crate) async fn aws_retry_with_metrics<U, E, Fut>(
 ) -> Result<U, E>
 where
     Fut: Future<Output = Result<U, E>>,
-    E: AwsRetryable + Debug + 'static,
+    E: OperationError + Debug + 'static,
 {
     let mut attempts_tracker = AttemptsTracker::new(action);
     let result = aws_retry(retry_params, || {
@@ -264,6 +294,9 @@ where
     .await;
     attempts_tracker.outcome_opt = Some(match &result {
         Ok(_) => "success",
+        // Checked first: an attempt that times out too many times is not retried anymore, and
+        // fails the operation with a permanent error.
+        Err(error) if error.is_timeout() => "timed_out",
         Err(error) if error.is_retryable() => "exhausted",
         Err(_) => "permanent_error",
     });
@@ -768,11 +801,18 @@ mod tests {
     enum TestError {
         Retryable,
         Permanent,
+        PermanentTimeout,
     }
 
     impl AwsRetryable for TestError {
         fn is_retryable(&self) -> bool {
             matches!(self, TestError::Retryable)
+        }
+    }
+
+    impl OperationError for TestError {
+        fn is_timeout(&self) -> bool {
+            matches!(self, TestError::PermanentTimeout)
         }
     }
 
@@ -857,6 +897,32 @@ mod tests {
         })
         .await;
         assert_eq!(recorded, (1, 1.0));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_timed_out() {
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("timed_out", async {
+            aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(usize::MAX, || TestError::PermanentTimeout),
+            )
+            .await
+            .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, 1.0));
+    }
+
+    #[test]
+    fn test_retry_storage_error_is_timeout() {
+        let timeout = || StorageErrorKind::Timeout.with_error(anyhow::anyhow!("timeout"));
+        let not_found = || StorageErrorKind::NotFound.with_error(anyhow::anyhow!("not found"));
+        assert!(Retry::Permanent(timeout()).is_timeout());
+        assert!(Retry::Transient(timeout()).is_timeout());
+        assert!(!Retry::Permanent(not_found()).is_timeout());
+        assert!(!Retry::Transient(not_found()).is_timeout());
     }
 
     #[tokio::test]
