@@ -30,6 +30,12 @@ pub trait Retryable {
     fn is_throttling(&self) -> bool {
         false
     }
+
+    /// Whether the operation gave up because its attempts timed out too many times. Such errors
+    /// are not retried.
+    fn is_timeout(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -37,6 +43,8 @@ pub enum Retry<E> {
     Permanent(E),
     Transient(E),
     Throttled(E),
+    /// The attempts timed out too many times: the operation gives up instead of retrying.
+    TimedOut(E),
 }
 
 impl<E> Retry<E> {
@@ -45,6 +53,7 @@ impl<E> Retry<E> {
             Self::Transient(error) => error,
             Self::Permanent(error) => error,
             Self::Throttled(error) => error,
+            Self::TimedOut(error) => error,
         }
     }
 }
@@ -52,13 +61,17 @@ impl<E> Retry<E> {
 impl<E> Retryable for Retry<E> {
     fn is_retryable(&self) -> bool {
         match self {
-            Retry::Permanent(_) => false,
+            Retry::Permanent(_) | Retry::TimedOut(_) => false,
             Retry::Transient(_) | Retry::Throttled(_) => true,
         }
     }
 
     fn is_throttling(&self) -> bool {
         matches!(self, Retry::Throttled(_))
+    }
+
+    fn is_timeout(&self) -> bool {
+        matches!(self, Retry::TimedOut(_))
     }
 }
 
@@ -299,6 +312,15 @@ mod tests {
             simulate_retries(vec![Err(Retry::Transient(1)), Ok(())]).await,
             Ok(())
         );
+    }
+
+    #[test]
+    fn test_retry_timed_out_is_not_retryable() {
+        let timed_out = super::Retry::TimedOut(());
+        assert!(!timed_out.is_retryable());
+        assert!(timed_out.is_timeout());
+        assert!(!super::Retry::Permanent(()).is_timeout());
+        assert!(!super::Retry::Transient(()).is_timeout());
     }
 
     #[tokio::test]
