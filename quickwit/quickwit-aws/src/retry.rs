@@ -29,6 +29,12 @@ pub trait AwsRetryable {
     fn is_throttling(&self) -> bool {
         false
     }
+
+    /// Whether the operation gave up because its attempts timed out, see
+    /// [`Retryable::is_timeout`].
+    fn is_timeout(&self) -> bool {
+        false
+    }
 }
 
 impl<E> AwsRetryable for Retry<E> {
@@ -38,6 +44,10 @@ impl<E> AwsRetryable for Retry<E> {
 
     fn is_throttling(&self) -> bool {
         Retryable::is_throttling(self)
+    }
+
+    fn is_timeout(&self) -> bool {
+        Retryable::is_timeout(self)
     }
 }
 
