@@ -28,7 +28,7 @@ use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_common::uri::Uri;
 use quickwit_config::{DocMapping, SearchSettings, build_doc_mapper};
 use quickwit_doc_mapper::tag_pruning::extract_tags_from_query;
-use quickwit_doc_mapper::{DYNAMIC_FIELD_NAME, DocMapper, DocMapperBuilder};
+use quickwit_doc_mapper::{DYNAMIC_FIELD_NAME, DocMapper};
 use quickwit_metastore::{IndexMetadata, ListIndexesMetadataResponseExt, SplitMetadata};
 use quickwit_proto::metastore::{
     ListIndexesMetadataRequest, MetastoreService, MetastoreServiceClient,
@@ -160,6 +160,9 @@ pub struct IndexMetasForLeafSearch {
     /// Index URI.
     pub index_uri: Uri,
     /// Doc mapper json string.
+    ///
+    /// The doc mapping UID is reset to its default value: the leaves do not use it, and leaving
+    /// it out lets indexes that share a doc mapping share a single doc mapper in leaf requests.
     pub doc_mapper_str: String,
 }
 
@@ -208,19 +211,20 @@ fn validate_request_and_build_metadata(
     let mut query_ast_resolved_opt: Option<QueryAst> = None;
     let mut timestamp_field_opt: Option<String> = None;
     let mut sort_fields_is_datetime: SortFieldsIsDatetime = HashMap::new();
-    // Doc mappers that passed validation, keyed by `doc_mapping_validation_key`.
-    let mut validated_doc_mappers: HashMap<String, Arc<DocMapper>> = HashMap::new();
+    // Serialized doc mappers of the doc mappings that passed validation, keyed by
+    // `doc_mapping_validation_key`.
+    let mut validated_doc_mapper_strs: HashMap<String, String> = HashMap::new();
 
     for index_metadata in indexes_metadata {
-        let doc_mapping = &index_metadata.index_config.doc_mapping;
+        let doc_mapping = without_doc_mapping_uid(&index_metadata.index_config.doc_mapping);
         let search_settings = &index_metadata.index_config.search_settings;
-        let validation_key = doc_mapping_validation_key(doc_mapping, search_settings)?;
+        let validation_key = doc_mapping_validation_key(&doc_mapping, search_settings)?;
 
-        let validated_doc_mapper = match validated_doc_mappers.entry(validation_key) {
-            Entry::Occupied(entry) => entry.into_mut(),
+        let doc_mapper_str = match validated_doc_mapper_strs.entry(validation_key) {
+            Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => {
                 let doc_mapper = validate_request_against_doc_mapping(
-                    doc_mapping,
+                    &doc_mapping,
                     search_settings,
                     &query_ast,
                     search_request,
@@ -228,11 +232,12 @@ fn validate_request_and_build_metadata(
                     &mut timestamp_field_opt,
                     &mut sort_fields_is_datetime,
                 )?;
-                entry.insert(doc_mapper)
+                let doc_mapper_str = serde_json::to_string(&doc_mapper).map_err(|err| {
+                    SearchError::Internal(format!("failed to serialize doc mapper. cause: {err}"))
+                })?;
+                entry.insert(doc_mapper_str).clone()
             }
         };
-        let doc_mapper_str =
-            serialize_doc_mapper_with_uid(validated_doc_mapper, doc_mapping.doc_mapping_uid)?;
         let index_metadata_for_leaf_search = IndexMetasForLeafSearch {
             index_uri: index_metadata.index_uri().clone(),
             doc_mapper_str,
@@ -257,15 +262,23 @@ fn validate_request_and_build_metadata(
     })
 }
 
-/// Returns a key that is equal for two indexes if and only if validating a request against them
-/// yields the same outcome: their doc mappings are equal up to the doc mapping UID, and their
-/// search settings are equal.
-fn doc_mapping_validation_key(
-    doc_mapping: &DocMapping,
-    search_settings: &SearchSettings,
-) -> crate::Result<String> {
+/// Returns a copy of the doc mapping with its UID reset to the default value.
+///
+/// The UID is random for each index, even when indexes share the same doc mapping, and searches
+/// do not use it.
+fn without_doc_mapping_uid(doc_mapping: &DocMapping) -> DocMapping {
     let mut doc_mapping_without_uid = doc_mapping.clone();
     doc_mapping_without_uid.doc_mapping_uid = DocMappingUid::default();
+    doc_mapping_without_uid
+}
+
+/// Returns a key that is equal for two indexes if and only if validating a request against them
+/// yields the same outcome: their doc mappings without UID are equal, and their search settings
+/// are equal.
+fn doc_mapping_validation_key(
+    doc_mapping_without_uid: &DocMapping,
+    search_settings: &SearchSettings,
+) -> crate::Result<String> {
     serde_json::to_string(&(doc_mapping_without_uid, search_settings)).map_err(|err| {
         SearchError::Internal(format!("failed to serialize doc mapping. cause: {err}"))
     })
@@ -346,21 +359,6 @@ fn validate_request_against_doc_mapping(
     )?;
 
     Ok(doc_mapper)
-}
-
-/// Serializes a doc mapper as if it had been built from a doc mapping with the given UID.
-///
-/// This produces the same output as serializing a doc mapper built from the index's own doc
-/// mapping, without having to build one per index.
-fn serialize_doc_mapper_with_uid(
-    doc_mapper: &DocMapper,
-    doc_mapping_uid: DocMappingUid,
-) -> crate::Result<String> {
-    let mut doc_mapper_builder = DocMapperBuilder::from(doc_mapper.clone());
-    doc_mapper_builder.doc_mapping.doc_mapping_uid = doc_mapping_uid;
-    serde_json::to_string(&doc_mapper_builder).map_err(|err| {
-        SearchError::Internal(format!("failed to serialize doc mapper. cause: {err}"))
-    })
 }
 
 fn validate_secondary_time(index_metadata: &[IndexMetadata]) -> crate::Result<Option<String>> {
@@ -2193,26 +2191,51 @@ mod tests {
             validate_request_and_build_metadata(&indexes_metadata, &search_request).unwrap();
 
         assert_eq!(request_metadata.indexes_meta_for_leaf_search.len(), 3);
+        // The doc mapper sent to the leaves is the same for all indexes, without UID.
+        let expected_doc_mapper = build_doc_mapper(
+            &without_doc_mapping_uid(&indexes_metadata[0].index_config.doc_mapping),
+            &indexes_metadata[0].index_config.search_settings,
+        )
+        .unwrap();
+        let expected_doc_mapper_str = serde_json::to_string(&expected_doc_mapper).unwrap();
         for index_metadata in &indexes_metadata {
             let index_meta_for_leaf_search =
                 &request_metadata.indexes_meta_for_leaf_search[&index_metadata.index_uid];
-            // The doc mapper sent to the leaves is the one of the index, UID included.
-            let expected_doc_mapper = build_doc_mapper(
-                &index_metadata.index_config.doc_mapping,
-                &index_metadata.index_config.search_settings,
-            )
-            .unwrap();
             assert_eq!(
                 index_meta_for_leaf_search.doc_mapper_str,
-                serde_json::to_string(&expected_doc_mapper).unwrap()
-            );
-            let doc_mapper: DocMapper =
-                serde_json::from_str(&index_meta_for_leaf_search.doc_mapper_str).unwrap();
-            assert_eq!(
-                doc_mapper.doc_mapping_uid(),
-                index_metadata.index_config.doc_mapping.doc_mapping_uid
+                expected_doc_mapper_str
             );
         }
+        let doc_mapper: DocMapper = serde_json::from_str(&expected_doc_mapper_str).unwrap();
+        assert_eq!(doc_mapper.doc_mapping_uid(), DocMappingUid::default());
+
+        // A leaf request targeting the three indexes carries a single doc mapper.
+        let jobs: Vec<SearchJob> = indexes_metadata
+            .iter()
+            .enumerate()
+            .map(|(i, index_metadata)| SearchJob {
+                index_uid: index_metadata.index_uid.clone(),
+                cost: 1,
+                offsets: SplitIdAndFooterOffsets {
+                    split_id: format!("split-{i}"),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        let leaf_request = jobs_to_leaf_request(
+            &search_request,
+            &request_metadata.indexes_meta_for_leaf_search,
+            jobs,
+        )
+        .unwrap();
+        assert_eq!(leaf_request.doc_mappers, vec![expected_doc_mapper_str]);
+        assert_eq!(leaf_request.leaf_requests.len(), 3);
+        assert!(
+            leaf_request
+                .leaf_requests
+                .iter()
+                .all(|leaf_request_ref| leaf_request_ref.doc_mapper_ord == 0)
+        );
     }
 
     #[test]
@@ -2220,29 +2243,24 @@ mod tests {
         let index_metadata = index_metadata_for_multi_indexes_test("test-index", "ram:///test");
         let doc_mapping = &index_metadata.index_config.doc_mapping;
         let search_settings = &index_metadata.index_config.search_settings;
-        let key = doc_mapping_validation_key(doc_mapping, search_settings).unwrap();
+        let key_for = |doc_mapping: &DocMapping, search_settings: &SearchSettings| {
+            doc_mapping_validation_key(&without_doc_mapping_uid(doc_mapping), search_settings)
+                .unwrap()
+        };
+        let key = key_for(doc_mapping, search_settings);
 
         let mut doc_mapping_other_uid = doc_mapping.clone();
         doc_mapping_other_uid.doc_mapping_uid = DocMappingUid::random();
-        assert_eq!(
-            doc_mapping_validation_key(&doc_mapping_other_uid, search_settings).unwrap(),
-            key
-        );
+        assert_eq!(key_for(&doc_mapping_other_uid, search_settings), key);
 
         let mut doc_mapping_other_timestamp = doc_mapping.clone();
         doc_mapping_other_timestamp.timestamp_field = None;
-        assert_ne!(
-            doc_mapping_validation_key(&doc_mapping_other_timestamp, search_settings).unwrap(),
-            key
-        );
+        assert_ne!(key_for(&doc_mapping_other_timestamp, search_settings), key);
 
         let other_search_settings = SearchSettings {
             default_search_fields: Vec::new(),
         };
-        assert_ne!(
-            doc_mapping_validation_key(doc_mapping, &other_search_settings).unwrap(),
-            key
-        );
+        assert_ne!(key_for(doc_mapping, &other_search_settings), key);
     }
 
     #[test]
