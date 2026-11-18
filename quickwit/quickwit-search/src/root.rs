@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -25,9 +26,9 @@ use quickwit_common::shared_consts;
 use quickwit_common::slow_poll::DetectSlowPollExt;
 use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_common::uri::Uri;
-use quickwit_config::build_doc_mapper;
-use quickwit_doc_mapper::DYNAMIC_FIELD_NAME;
+use quickwit_config::{DocMapping, SearchSettings, build_doc_mapper};
 use quickwit_doc_mapper::tag_pruning::extract_tags_from_query;
+use quickwit_doc_mapper::{DYNAMIC_FIELD_NAME, DocMapper};
 use quickwit_metastore::{IndexMetadata, ListIndexesMetadataResponseExt, SplitMetadata};
 use quickwit_proto::metastore::{
     ListIndexesMetadataRequest, MetastoreService, MetastoreServiceClient,
@@ -37,7 +38,7 @@ use quickwit_proto::search::{
     LeafSearchResponse, PartialHit, SearchPlanResponse, SearchRequest, SearchResponse,
     SnippetRequest, SortDatetimeFormat, SortField, SortOrder, SortValue, SplitIdAndFooterOffsets,
 };
-use quickwit_proto::types::{IndexUid, SplitId};
+use quickwit_proto::types::{DocMappingUid, IndexUid, SplitId};
 use quickwit_query::query_ast::{
     BoolQuery, QueryAst, QueryAstVisitor, RangeQuery, TermQuery, TermSetQuery,
 };
@@ -159,6 +160,9 @@ pub struct IndexMetasForLeafSearch {
     /// Index URI.
     pub index_uri: Uri,
     /// Doc mapper json string.
+    ///
+    /// The doc mapping UID is reset to its default value: the leaves do not use it, and leaving
+    /// it out lets indexes that share a doc mapping share a single doc mapper in leaf requests.
     pub doc_mapper_str: String,
 }
 
@@ -188,6 +192,11 @@ struct RequestMetadata {
 /// needed for leaf search requests.
 /// Note: the requirements on timestamp fields and resolved query ASTs can be lifted
 /// but it adds complexity that does not seem needed right now.
+///
+/// The validation outcome only depends on the doc mapping (minus its UID) and the search
+/// settings, so it runs once per distinct pair rather than once per index. Building the query
+/// compiles one automaton per regex or wildcard sub-query, which is expensive enough that
+/// repeating it for hundreds of indexes sharing the same doc mapping can take minutes.
 fn validate_request_and_build_metadata(
     indexes_metadata: &[IndexMetadata],
     search_request: &SearchRequest,
@@ -202,78 +211,36 @@ fn validate_request_and_build_metadata(
     let mut query_ast_resolved_opt: Option<QueryAst> = None;
     let mut timestamp_field_opt: Option<String> = None;
     let mut sort_fields_is_datetime: SortFieldsIsDatetime = HashMap::new();
+    // Serialized doc mappers of the doc mappings that passed validation, keyed by
+    // `doc_mapping_validation_key`.
+    let mut validated_doc_mapper_strs: HashMap<String, String> = HashMap::new();
 
     for index_metadata in indexes_metadata {
-        let doc_mapper = build_doc_mapper(
-            &index_metadata.index_config.doc_mapping,
-            &index_metadata.index_config.search_settings,
-        )
-        .map_err(|err| {
-            SearchError::Internal(format!("failed to build doc mapper. cause: {err}"))
-        })?;
-        let query_ast_resolved_for_index = query_ast
-            .clone()
-            .parse_user_query(doc_mapper.default_search_fields())
-            // We convert the error to return a 400 to the user (and not a 500).
-            .map_err(|err| SearchError::InvalidQuery(err.to_string()))?;
+        let doc_mapping = without_doc_mapping_uid(&index_metadata.index_config.doc_mapping);
+        let search_settings = &index_metadata.index_config.search_settings;
+        let validation_key = doc_mapping_validation_key(&doc_mapping, search_settings)?;
 
-        // Reject queries with an excessive number of regex/wildcard sub-queries
-        // before building them against each index schema below, which compiles
-        // one automaton per pattern and can take minutes for degenerate queries.
-        query_cost_classifier::check_automaton_query_count(&query_ast_resolved_for_index)?;
-
-        // Validate uniqueness of resolved query AST.
-        if let Some(query_ast_resolved) = &query_ast_resolved_opt {
-            if query_ast_resolved != &query_ast_resolved_for_index {
-                return Err(SearchError::InvalidQuery(
-                    "resolved query ASTs must be the same across indexes. resolving queries with \
-                     different default fields are different between indexes is not supported"
-                        .to_string(),
-                ));
+        let doc_mapper_str = match validated_doc_mapper_strs.entry(validation_key) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                let doc_mapper = validate_request_against_doc_mapping(
+                    &doc_mapping,
+                    search_settings,
+                    &query_ast,
+                    search_request,
+                    &mut query_ast_resolved_opt,
+                    &mut timestamp_field_opt,
+                    &mut sort_fields_is_datetime,
+                )?;
+                let doc_mapper_str = serde_json::to_string(&doc_mapper).map_err(|err| {
+                    SearchError::Internal(format!("failed to serialize doc mapper. cause: {err}"))
+                })?;
+                entry.insert(doc_mapper_str).clone()
             }
-        } else {
-            query_ast_resolved_opt = Some(query_ast_resolved_for_index.clone());
-        }
-
-        // Validate uniqueness of timestamp field if any.
-        if let Some(timestamp_field_for_index) = doc_mapper.timestamp_field_name() {
-            match timestamp_field_opt {
-                Some(timestamp_field) if timestamp_field != timestamp_field_for_index => {
-                    return Err(SearchError::InvalidQuery(
-                        "the timestamp field (if present) must be the same for all indexes"
-                            .to_string(),
-                    ));
-                }
-                None => {
-                    timestamp_field_opt = Some(timestamp_field_for_index.to_string());
-                }
-                _ => {}
-            }
-        }
-
-        // Validate request against the current index schema.
-        let schema = doc_mapper.schema();
-        validate_request(&schema, &doc_mapper.timestamp_field_name(), search_request)?;
-
-        validate_sort_field_types(
-            &schema,
-            &search_request.sort_fields,
-            &mut sort_fields_is_datetime,
-        )?;
-
-        // Validates the query by effectively building it against the current schema.
-        doc_mapper.query(
-            doc_mapper.schema(),
-            query_ast_resolved_for_index,
-            true,
-            None,
-        )?;
-
+        };
         let index_metadata_for_leaf_search = IndexMetasForLeafSearch {
             index_uri: index_metadata.index_uri().clone(),
-            doc_mapper_str: serde_json::to_string(&doc_mapper).map_err(|err| {
-                SearchError::Internal(format!("failed to serialize doc mapper. cause: {err}"))
-            })?,
+            doc_mapper_str,
         };
         indexes_meta_for_leaf_search.insert(
             index_metadata.index_uid.clone(),
@@ -293,6 +260,105 @@ fn validate_request_and_build_metadata(
         indexes_meta_for_leaf_search,
         sort_fields_is_datetime,
     })
+}
+
+/// Returns a copy of the doc mapping with its UID reset to the default value.
+///
+/// The UID is random for each index, even when indexes share the same doc mapping, and searches
+/// do not use it.
+fn without_doc_mapping_uid(doc_mapping: &DocMapping) -> DocMapping {
+    let mut doc_mapping_without_uid = doc_mapping.clone();
+    doc_mapping_without_uid.doc_mapping_uid = DocMappingUid::default();
+    doc_mapping_without_uid
+}
+
+/// Returns a key that is equal for two indexes if and only if validating a request against them
+/// yields the same outcome: their doc mappings without UID are equal, and their search settings
+/// are equal.
+fn doc_mapping_validation_key(
+    doc_mapping_without_uid: &DocMapping,
+    search_settings: &SearchSettings,
+) -> crate::Result<String> {
+    serde_json::to_string(&(doc_mapping_without_uid, search_settings)).map_err(|err| {
+        SearchError::Internal(format!("failed to serialize doc mapping. cause: {err}"))
+    })
+}
+
+/// Validates the request against one doc mapping, and checks that the resolved query AST and the
+/// timestamp field match the ones of the doc mappings validated before.
+///
+/// Returns the doc mapper built from the doc mapping.
+fn validate_request_against_doc_mapping(
+    doc_mapping: &DocMapping,
+    search_settings: &SearchSettings,
+    query_ast: &QueryAst,
+    search_request: &SearchRequest,
+    query_ast_resolved_opt: &mut Option<QueryAst>,
+    timestamp_field_opt: &mut Option<String>,
+    sort_fields_is_datetime: &mut SortFieldsIsDatetime,
+) -> crate::Result<Arc<DocMapper>> {
+    let doc_mapper = build_doc_mapper(doc_mapping, search_settings).map_err(|err| {
+        SearchError::Internal(format!("failed to build doc mapper. cause: {err}"))
+    })?;
+    let query_ast_resolved_for_index = query_ast
+        .clone()
+        .parse_user_query(doc_mapper.default_search_fields())
+        // We convert the error to return a 400 to the user (and not a 500).
+        .map_err(|err| SearchError::InvalidQuery(err.to_string()))?;
+
+    // Validate uniqueness of resolved query AST.
+    if let Some(query_ast_resolved) = query_ast_resolved_opt {
+        if query_ast_resolved != &query_ast_resolved_for_index {
+            return Err(SearchError::InvalidQuery(
+                "resolved query ASTs must be the same across indexes. resolving queries with \
+                 different default fields are different between indexes is not supported"
+                    .to_string(),
+            ));
+        }
+    } else {
+        // Reject queries with an excessive number of regex/wildcard sub-queries
+        // before building them against the index schema below, which compiles
+        // one automaton per pattern and can take minutes for degenerate queries.
+        // The resolved query AST is the same for all indexes, so checking it once
+        // is enough.
+        query_cost_classifier::check_automaton_query_count(&query_ast_resolved_for_index)?;
+        *query_ast_resolved_opt = Some(query_ast_resolved_for_index.clone());
+    }
+
+    // Validate uniqueness of timestamp field if any.
+    if let Some(timestamp_field_for_index) = doc_mapper.timestamp_field_name() {
+        match timestamp_field_opt {
+            Some(timestamp_field) if timestamp_field != timestamp_field_for_index => {
+                return Err(SearchError::InvalidQuery(
+                    "the timestamp field (if present) must be the same for all indexes".to_string(),
+                ));
+            }
+            None => {
+                *timestamp_field_opt = Some(timestamp_field_for_index.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    // Validate request against the current index schema.
+    let schema = doc_mapper.schema();
+    validate_request(&schema, &doc_mapper.timestamp_field_name(), search_request)?;
+
+    validate_sort_field_types(
+        &schema,
+        &search_request.sort_fields,
+        sort_fields_is_datetime,
+    )?;
+
+    // Validates the query by effectively building it against the current schema.
+    doc_mapper.query(
+        doc_mapper.schema(),
+        query_ast_resolved_for_index,
+        true,
+        None,
+    )?;
+
+    Ok(doc_mapper)
 }
 
 fn validate_secondary_time(index_metadata: &[IndexMetadata]) -> crate::Result<Option<String>> {
@@ -2096,6 +2162,105 @@ mod tests {
             request_metadata.sort_fields_is_datetime.get("_doc"),
             Some(&false)
         );
+    }
+
+    #[test]
+    fn test_validate_request_and_build_metadatas_shared_doc_mapping() {
+        let search_request = quickwit_proto::search::SearchRequest {
+            index_id_patterns: vec!["test-index-*".to_string()],
+            query_ast: qast_json_helper("body:te*st", &[]),
+            max_hits: 10,
+            ..Default::default()
+        };
+        // Same doc mapping, but each index gets its own random doc mapping UID.
+        let indexes_metadata: Vec<IndexMetadata> = (0..3)
+            .map(|i| {
+                index_metadata_for_multi_indexes_test(
+                    &format!("test-index-{i}"),
+                    &format!("ram:///test-index-{i}"),
+                )
+            })
+            .collect();
+        let doc_mapping_uids: HashSet<DocMappingUid> = indexes_metadata
+            .iter()
+            .map(|index_metadata| index_metadata.index_config.doc_mapping.doc_mapping_uid)
+            .collect();
+        assert_eq!(doc_mapping_uids.len(), 3);
+
+        let request_metadata =
+            validate_request_and_build_metadata(&indexes_metadata, &search_request).unwrap();
+
+        assert_eq!(request_metadata.indexes_meta_for_leaf_search.len(), 3);
+        // The doc mapper sent to the leaves is the same for all indexes, without UID.
+        let expected_doc_mapper = build_doc_mapper(
+            &without_doc_mapping_uid(&indexes_metadata[0].index_config.doc_mapping),
+            &indexes_metadata[0].index_config.search_settings,
+        )
+        .unwrap();
+        let expected_doc_mapper_str = serde_json::to_string(&expected_doc_mapper).unwrap();
+        for index_metadata in &indexes_metadata {
+            let index_meta_for_leaf_search =
+                &request_metadata.indexes_meta_for_leaf_search[&index_metadata.index_uid];
+            assert_eq!(
+                index_meta_for_leaf_search.doc_mapper_str,
+                expected_doc_mapper_str
+            );
+        }
+        let doc_mapper: DocMapper = serde_json::from_str(&expected_doc_mapper_str).unwrap();
+        assert_eq!(doc_mapper.doc_mapping_uid(), DocMappingUid::default());
+
+        // A leaf request targeting the three indexes carries a single doc mapper.
+        let jobs: Vec<SearchJob> = indexes_metadata
+            .iter()
+            .enumerate()
+            .map(|(i, index_metadata)| SearchJob {
+                index_uid: index_metadata.index_uid.clone(),
+                cost: 1,
+                offsets: SplitIdAndFooterOffsets {
+                    split_id: format!("split-{i}"),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        let leaf_request = jobs_to_leaf_request(
+            &search_request,
+            &request_metadata.indexes_meta_for_leaf_search,
+            jobs,
+        )
+        .unwrap();
+        assert_eq!(leaf_request.doc_mappers, vec![expected_doc_mapper_str]);
+        assert_eq!(leaf_request.leaf_requests.len(), 3);
+        assert!(
+            leaf_request
+                .leaf_requests
+                .iter()
+                .all(|leaf_request_ref| leaf_request_ref.doc_mapper_ord == 0)
+        );
+    }
+
+    #[test]
+    fn test_doc_mapping_validation_key() {
+        let index_metadata = index_metadata_for_multi_indexes_test("test-index", "ram:///test");
+        let doc_mapping = &index_metadata.index_config.doc_mapping;
+        let search_settings = &index_metadata.index_config.search_settings;
+        let key_for = |doc_mapping: &DocMapping, search_settings: &SearchSettings| {
+            doc_mapping_validation_key(&without_doc_mapping_uid(doc_mapping), search_settings)
+                .unwrap()
+        };
+        let key = key_for(doc_mapping, search_settings);
+
+        let mut doc_mapping_other_uid = doc_mapping.clone();
+        doc_mapping_other_uid.doc_mapping_uid = DocMappingUid::random();
+        assert_eq!(key_for(&doc_mapping_other_uid, search_settings), key);
+
+        let mut doc_mapping_other_timestamp = doc_mapping.clone();
+        doc_mapping_other_timestamp.timestamp_field = None;
+        assert_ne!(key_for(&doc_mapping_other_timestamp, search_settings), key);
+
+        let other_search_settings = SearchSettings {
+            default_search_fields: Vec::new(),
+        };
+        assert_ne!(key_for(doc_mapping, &other_search_settings), key);
     }
 
     #[test]
