@@ -207,7 +207,6 @@ mod tests {
 
     use super::*;
     use crate::create_default_quickwit_tokenizer_manager;
-    use crate::query_ast::{AutomatonMemoryBudget, BuildTantivyAst};
 
     fn single_text_field_schema(field_name: &str, tokenizer: &str) -> TantivySchema {
         let mut schema_builder = TantivySchema::builder();
@@ -257,38 +256,6 @@ mod tests {
             assert_eq!(regex, "mystring wh1ch.a\\.normal tokenizer would.*cut");
             assert!(path.is_none());
         }
-    }
-
-    #[test]
-    fn test_wildcard_query_charges_automaton_memory_budget() {
-        let schema = single_text_field_schema("text_field", "raw");
-        let query = WildcardQuery {
-            field: "text_field".to_string(),
-            value: "*powershell*".to_string(),
-            lenient: false,
-            case_insensitive: true,
-        };
-
-        let budget = AutomatonMemoryBudget::new(usize::MAX);
-        let context = BuildTantivyAstContext {
-            automaton_memory_budget: Some(&budget),
-            ..BuildTantivyAstContext::for_test(&schema)
-        };
-        query.build_tantivy_ast_call(&context).unwrap();
-        let automaton_memory_bytes = budget.used_bytes();
-        // A case-insensitive pattern with a leading wildcard takes well over 10 KiB.
-        assert!(automaton_memory_bytes > 10 * 1024);
-
-        let budget = AutomatonMemoryBudget::new(automaton_memory_bytes - 1);
-        let context = BuildTantivyAstContext {
-            automaton_memory_budget: Some(&budget),
-            ..BuildTantivyAstContext::for_test(&schema)
-        };
-        let error = query.build_tantivy_ast_call(&context).unwrap_err();
-        assert!(matches!(
-            error,
-            InvalidQuery::AutomatonMemoryLimitExceeded { .. }
-        ));
     }
 
     #[test]

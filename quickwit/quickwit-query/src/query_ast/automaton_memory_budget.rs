@@ -56,7 +56,69 @@ impl AutomatonMemoryBudget {
 
 #[cfg(test)]
 mod tests {
+    use tantivy::schema::{Schema, TEXT};
+
     use super::*;
+    use crate::query_ast::{
+        BoolQuery, BuildTantivyAst, BuildTantivyAstContext, QueryAst, RegexQuery, WildcardQuery,
+    };
+
+    fn build_with_budget(
+        query_ast: &QueryAst,
+        schema: &Schema,
+        limit_bytes: usize,
+    ) -> (Result<(), InvalidQuery>, usize) {
+        let budget = AutomatonMemoryBudget::new(limit_bytes);
+        let context = BuildTantivyAstContext {
+            automaton_memory_budget: Some(&budget),
+            ..BuildTantivyAstContext::for_test(schema)
+        };
+        let build_res = query_ast.build_tantivy_ast_call(&context).map(|_| ());
+        (build_res, budget.used_bytes())
+    }
+
+    #[test]
+    fn test_regex_and_wildcard_queries_charge_automaton_memory_budget() {
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("body", TEXT);
+        let schema = schema_builder.build();
+
+        let regex: QueryAst = RegexQuery {
+            field: "body".to_string(),
+            regex: "(?i).*powershell.*".to_string(),
+        }
+        .into();
+        let wildcard: QueryAst = WildcardQuery {
+            field: "body".to_string(),
+            value: "*mimikatz*".to_string(),
+            lenient: false,
+            case_insensitive: true,
+        }
+        .into();
+        let both: QueryAst = BoolQuery {
+            should: vec![regex.clone(), wildcard.clone()],
+            ..Default::default()
+        }
+        .into();
+
+        let (regex_res, regex_bytes) = build_with_budget(&regex, &schema, usize::MAX);
+        regex_res.unwrap();
+        let (wildcard_res, wildcard_bytes) = build_with_budget(&wildcard, &schema, usize::MAX);
+        wildcard_res.unwrap();
+        // Case-insensitive patterns with a leading wildcard take well over 10 KiB each.
+        assert!(regex_bytes > 10 * 1024);
+        assert!(wildcard_bytes > 10 * 1024);
+
+        let (both_res, both_bytes) = build_with_budget(&both, &schema, usize::MAX);
+        both_res.unwrap();
+        assert_eq!(both_bytes, regex_bytes + wildcard_bytes);
+
+        let (both_res, _) = build_with_budget(&both, &schema, both_bytes - 1);
+        assert!(matches!(
+            both_res.unwrap_err(),
+            InvalidQuery::AutomatonMemoryLimitExceeded { .. }
+        ));
+    }
 
     #[test]
     fn test_automaton_memory_budget() {
