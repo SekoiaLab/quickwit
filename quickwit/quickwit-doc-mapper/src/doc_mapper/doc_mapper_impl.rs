@@ -692,13 +692,14 @@ impl DocMapper {
 
     /// Validates the query by building it against the doc mapper schema.
     ///
-    /// The memory of the automatons built for its regex and wildcard queries is charged to
-    /// `automaton_memory_budget`, and the validation fails as soon as the budget is exceeded.
+    /// Fails as soon as the automatons built for its regex and wildcard queries take more than
+    /// `max_automaton_memory_bytes`. Returns the memory these automatons take otherwise.
     pub fn validate_query(
         &self,
         query_ast: QueryAst,
-        automaton_memory_budget: &AutomatonMemoryBudget,
-    ) -> Result<(), QueryParserError> {
+        max_automaton_memory_bytes: usize,
+    ) -> Result<usize, QueryParserError> {
+        let automaton_memory_budget = AutomatonMemoryBudget::new(max_automaton_memory_bytes);
         build_query(
             query_ast,
             &BuildTantivyAstContext {
@@ -706,11 +707,11 @@ impl DocMapper {
                 tokenizer_manager: self.tokenizer_manager(),
                 search_fields: &self.default_search_field_names[..],
                 with_validation: true,
-                automaton_memory_budget: Some(automaton_memory_budget),
+                automaton_memory_budget: Some(&automaton_memory_budget),
             },
             None,
         )?;
-        Ok(())
+        Ok(automaton_memory_budget.used_bytes())
     }
 
     /// Returns the list of search fields to search into, when no field is specified.
@@ -786,7 +787,7 @@ mod tests {
     use itertools::Itertools;
     use quickwit_common::PathHasher;
     use quickwit_query::InvalidQuery;
-    use quickwit_query::query_ast::{AutomatonMemoryBudget, QueryAst, query_ast_from_user_text};
+    use quickwit_query::query_ast::{QueryAst, query_ast_from_user_text};
     use serde_json::{self, Value as JsonValue, json};
     use tantivy::schema::{
         FieldType, IndexRecordOption, OwnedValue as TantivyValue, OwnedValue, Type, Value,
@@ -2175,16 +2176,15 @@ mod tests {
         }
         .into();
 
-        let budget = AutomatonMemoryBudget::new(usize::MAX);
-        doc_mapper
-            .validate_query(query_ast.clone(), &budget)
+        let automaton_memory_bytes = doc_mapper
+            .validate_query(query_ast.clone(), usize::MAX)
             .unwrap();
-        let automaton_memory_bytes = budget.used_bytes();
         assert!(automaton_memory_bytes > 0);
 
-        // A budget that only fits the first regex.
-        let budget = AutomatonMemoryBudget::new(automaton_memory_bytes - 1);
-        let error = doc_mapper.validate_query(query_ast, &budget).unwrap_err();
+        // A limit that only fits the first regex.
+        let error = doc_mapper
+            .validate_query(query_ast, automaton_memory_bytes - 1)
+            .unwrap_err();
         assert!(matches!(
             error,
             QueryParserError::InvalidQuery(InvalidQuery::AutomatonMemoryLimitExceeded { .. })

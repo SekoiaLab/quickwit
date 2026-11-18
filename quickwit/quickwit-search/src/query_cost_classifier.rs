@@ -44,7 +44,7 @@ static MAX_AUTOMATON_MEMORY: LazyLock<ByteSize> = LazyLock::new(|| {
 /// The root enforces it when validating the request against each distinct doc mapping, which
 /// bounds the memory and the CPU time spent compiling automatons during planning. Leaves build
 /// the same automatons for each split they search.
-pub fn max_automaton_memory_bytes() -> usize {
+pub(crate) fn max_automaton_memory_bytes() -> usize {
     MAX_AUTOMATON_MEMORY.as_u64() as usize
 }
 

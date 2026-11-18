@@ -40,8 +40,7 @@ use quickwit_proto::search::{
 };
 use quickwit_proto::types::{DocMappingUid, IndexUid, SplitId};
 use quickwit_query::query_ast::{
-    AutomatonMemoryBudget, BoolQuery, QueryAst, QueryAstVisitor, RangeQuery, TermQuery,
-    TermSetQuery,
+    BoolQuery, QueryAst, QueryAstVisitor, RangeQuery, TermQuery, TermSetQuery,
 };
 use serde::{Deserialize, Serialize};
 use tantivy::TantivyError;
@@ -392,11 +391,12 @@ fn validate_request_against_doc_mapping(
 
     // Validates the query by effectively building it against the current schema, within a
     // budget for the memory of the automatons of its regex and wildcard sub-queries.
-    let automaton_memory_budget =
-        AutomatonMemoryBudget::new(query_cost_classifier::max_automaton_memory_bytes());
-    doc_mapper.validate_query(query_ast_resolved_for_index, &automaton_memory_budget)?;
+    let automaton_memory_bytes = doc_mapper.validate_query(
+        query_ast_resolved_for_index,
+        query_cost_classifier::max_automaton_memory_bytes(),
+    )?;
 
-    Ok((doc_mapper, automaton_memory_budget.used_bytes()))
+    Ok((doc_mapper, automaton_memory_bytes))
 }
 
 fn validate_secondary_time(index_metadata: &[IndexMetadata]) -> crate::Result<Option<String>> {
