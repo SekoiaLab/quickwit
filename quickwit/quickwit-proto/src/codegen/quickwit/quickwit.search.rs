@@ -274,6 +274,8 @@ pub struct LeafSearchRequest {
     #[prost(message, repeated, tag = "7")]
     pub leaf_requests: ::prost::alloc::vec::Vec<LeafRequestRef>,
     /// List of unique doc_mappers serialized as json.
+    ///
+    /// The doc mapping UID is set to 0, leaves must not rely on it.
     #[prost(string, repeated, tag = "8")]
     pub doc_mappers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// List of index uris

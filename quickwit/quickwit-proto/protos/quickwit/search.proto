@@ -356,6 +356,8 @@ message LeafSearchRequest {
   repeated LeafRequestRef leaf_requests = 7;
 
   // List of unique doc_mappers serialized as json.
+  //
+  // The doc mapping UID is set to 0, leaves must not rely on it.
   repeated string doc_mappers = 8;
 
   // List of index uris
