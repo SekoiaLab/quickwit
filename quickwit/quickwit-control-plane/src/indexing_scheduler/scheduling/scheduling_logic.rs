@@ -74,7 +74,7 @@ fn log_phase(
 fn log_solve_setup(problem: &SchedulingProblem, previous_solution: &SchedulingSolution) {
     tracing::info!(
         pb_sources = problem.num_sources(),
-        pb_shards = problem.sources().map(|s| s.num_shards).sum::<u32>(),
+        pb_shards = problem.total_num_shards(),
         pb_indexers = problem.num_indexers(),
         pb_load = problem.total_load(),
         scaled_capacity = %problem.total_node_capacities(),
@@ -119,6 +119,10 @@ pub fn solve(
     // within their capacity.
     log_phase("enforce indexer cpu capacity", &mut solution, |sol| {
         enforce_indexers_cpu_capacity(&problem, sol)
+    });
+    // After a scale down, some indexers may also have more shards than allowed.
+    log_phase("enforce indexer max num shards", &mut solution, |sol| {
+        enforce_indexers_max_num_shards(&problem, sol)
     });
     // The solution now meets the constraint, but it does not necessarily
     // contains all of the shards that we need to assign.
@@ -267,6 +271,38 @@ fn enforce_indexer_cpu_capacity(
     assert_enforce_nodes_cpu_capacity_post_condition(problem, indexer_assignment);
 }
 
+fn enforce_indexers_max_num_shards(problem: &SchedulingProblem, solution: &mut SchedulingSolution) {
+    for indexer_assignment in &mut solution.indexer_assignments {
+        enforce_indexer_max_num_shards(problem.indexer_max_num_shards(), indexer_assignment);
+    }
+}
+
+fn enforce_indexer_max_num_shards(max_num_shards: u32, indexer_assignment: &mut IndexerAssignment) {
+    let mut num_shards_to_remove = indexer_assignment
+        .total_num_shards()
+        .saturating_sub(max_num_shards);
+    if num_shards_to_remove == 0 {
+        return;
+    }
+    // Similarly to cpu capacity enforcement, we remove shards from the sources
+    // with the fewest shards first.
+    let mut source_num_shards: Vec<(u32, SourceOrd)> = indexer_assignment
+        .num_shards_per_source
+        .iter()
+        .map(|(&source_ord, &num_shards)| (num_shards, source_ord))
+        .collect();
+    source_num_shards.sort();
+    for (num_shards, source_ord) in source_num_shards {
+        let num_shards_removed = num_shards.min(num_shards_to_remove);
+        indexer_assignment.remove_shards(source_ord, num_shards_removed);
+        num_shards_to_remove -= num_shards_removed;
+        if num_shards_to_remove == 0 {
+            break;
+        }
+    }
+    assert!(indexer_assignment.total_num_shards() <= max_num_shards);
+}
+
 fn assert_enforce_nodes_cpu_capacity_post_condition(
     problem: &SchedulingProblem,
     indexer_assignment: &IndexerAssignment,
@@ -298,8 +334,11 @@ fn assert_enforce_nodes_cpu_capacity_post_condition(
 // In the second pass, we just put as many shards as possible on the node
 // with the highest available capacity.
 //
-// If this algorithm fails to place all remaining shards, we inflate
+// If this algorithm fails to place all remaining shards because of cpu capacity, we inflate
 // the node capacities by 20% in the scheduling problem and start from the beginning.
+//
+// Shards that cannot be placed because indexers reached their maximum number of shards
+// are left unassigned.
 
 #[derive(Debug, PartialEq, Eq)]
 struct PlacementCandidate {
@@ -363,12 +402,13 @@ fn attempt_place_unassigned_shards(
             })
             .collect();
         placements.sort();
-        place_unassigned_shards_single_source(
-            source,
-            &placements,
-            problem.num_indexers(),
-            &mut solution,
-        )?;
+        let place_result =
+            place_unassigned_shards_single_source(source, &placements, problem, &mut solution);
+        // Inflating the cpu capacities does not help if the indexers reached their maximum
+        // number of shards: in that case, the remaining shards are left unassigned.
+        if let Err(NotEnoughCapacity { cpu_bound: true }) = place_result {
+            return Err(NotEnoughCapacity { cpu_bound: true });
+        }
     }
     assert_place_unassigned_shards_post_condition(problem, &solution);
     Ok(solution)
@@ -403,12 +443,7 @@ fn place_unassigned_shards_with_affinity(
             })
             .collect();
         placements.sort();
-        let _ = place_unassigned_shards_single_source(
-            source,
-            &placements,
-            problem.num_indexers(),
-            solution,
-        );
+        let _ = place_unassigned_shards_single_source(source, &placements, problem, solution);
     }
 }
 
@@ -450,7 +485,7 @@ fn place_unassigned_shards_ignoring_affinity(
                 solution.capacity_scaling_iterations = attempt_number;
                 return solution;
             }
-            Err(NotEnoughCapacity) => {
+            Err(NotEnoughCapacity { .. }) => {
                 let shards_after: Vec<u32> = partial_solution
                     .indexer_assignments
                     .iter()
@@ -479,34 +514,42 @@ fn assert_place_unassigned_shards_post_condition(
     problem: &SchedulingProblem,
     solution: &SchedulingSolution,
 ) {
-    // We make sure we all shard are as placed.
+    // We make sure we did not place more shards than necessary. Some shards may be left
+    // unassigned if the indexers reached their maximum number of shards.
     for source in problem.sources() {
         let num_assigned_shards: u32 = solution
             .indexer_assignments
             .iter()
             .map(|indexer_assignment| indexer_assignment.num_shards(source.source_ord))
             .sum();
-        assert_eq!(num_assigned_shards, source.num_shards);
+        assert!(num_assigned_shards <= source.num_shards);
     }
     // We make sure that the node capacity is respected.
     for indexer_assignment in &solution.indexer_assignments {
         // We call this function just to check that the indexer assignment does not exceed this
         // capacity. (it includes an assert that panics if it happens).
         assert_enforce_nodes_cpu_capacity_post_condition(problem, indexer_assignment);
+        assert!(indexer_assignment.total_num_shards() <= problem.indexer_max_num_shards());
     }
 }
 
-struct NotEnoughCapacity;
+struct NotEnoughCapacity {
+    /// True if at least one of the candidates could have received more shards with more cpu
+    /// capacity.
+    cpu_bound: bool,
+}
 
 /// Return Err(NotEnoughCapacity) iff the algorithm was unable to pack all of the sources
-/// amongst the node with their given node capacity.
+/// amongst the node with their given node capacity and maximum number of shards.
 fn place_unassigned_shards_single_source(
     source: &Source,
     sorted_candidates: &[PlacementCandidate],
-    num_indexers: usize,
+    problem: &SchedulingProblem,
     solution: &mut SchedulingSolution,
 ) -> Result<(), NotEnoughCapacity> {
+    let num_indexers = problem.num_indexers();
     let mut num_shards = source.num_shards;
+    let mut cpu_bound = false;
     // To ensure that merges can keep up, we try not to assign more than 3
     // pipelines per indexer for a source (except if there aren't enough nodes).
     let target_limit_num_shards_per_indexer_per_source =
@@ -524,9 +567,17 @@ fn place_unassigned_shards_single_source(
             available_capacity.cpu_millis() / source.load_per_shard;
         let num_placable_shards_for_limit =
             limit_num_shards_per_indexer_per_source.saturating_sub(*current_num_shards);
-        let num_shards_to_place = num_shards
-            .min(num_placable_shards_for_available_capacity)
-            .min(num_placable_shards_for_limit);
+        let num_placable_shards_for_max_num_shards = problem
+            .indexer_max_num_shards()
+            .saturating_sub(solution.indexer_assignments[*indexer_ord].total_num_shards());
+        let num_shards_to_place_ignoring_cpu = num_shards
+            .min(num_placable_shards_for_limit)
+            .min(num_placable_shards_for_max_num_shards);
+        if num_placable_shards_for_available_capacity < num_shards_to_place_ignoring_cpu {
+            cpu_bound = true;
+        }
+        let num_shards_to_place =
+            num_shards_to_place_ignoring_cpu.min(num_placable_shards_for_available_capacity);
         // Update the solution, the shard load, and the number of shards to place.
         solution.indexer_assignments[*indexer_ord]
             .add_shards(source.source_ord, num_shards_to_place);
@@ -535,7 +586,7 @@ fn place_unassigned_shards_single_source(
             return Ok(());
         }
     }
-    Err(NotEnoughCapacity)
+    Err(NotEnoughCapacity { cpu_bound })
 }
 
 /// Compute the sources/shards that have not been assigned to any indexer yet.
@@ -963,6 +1014,87 @@ mod tests {
             let has_solution_changed_again = solution_2.indexer_assignments != solution_3.indexer_assignments;
             assert!(!has_solution_changed_again, "solution unstable!!!\nSolution 1: {solution_1:?}\nSolution 2: {solution_2:?}\nSolution 3: {solution_3:?}");
         }
+    }
+
+    proptest! {
+        #[test]
+        fn test_proptest_max_num_shards_post_conditions(
+            (mut problem, solution) in problem_solution_strategy(),
+            max_num_shards in 0u32..6u32,
+        ) {
+            problem.set_indexer_max_num_shards(max_num_shards);
+            let solution = solve(problem.clone(), solution);
+            let num_shards = problem.total_num_shards();
+            let num_assigned_shards = solution.total_num_shards();
+            assert!(num_assigned_shards <= num_shards);
+            for indexer_assignment in &solution.indexer_assignments {
+                assert!(indexer_assignment.total_num_shards() <= max_num_shards);
+            }
+            // Shards can only be left unassigned if an indexer reached the limit.
+            if num_assigned_shards < num_shards {
+                assert!(solution
+                    .indexer_assignments
+                    .iter()
+                    .any(|indexer_assignment| indexer_assignment.total_num_shards() == max_num_shards));
+            }
+        }
+    }
+
+    #[test]
+    fn test_enforce_indexer_max_num_shards() {
+        let mut indexer_assignment = IndexerAssignment::new(0);
+        indexer_assignment.add_shards(0, 2);
+        indexer_assignment.add_shards(1, 6);
+        enforce_indexer_max_num_shards(5, &mut indexer_assignment);
+        assert_eq!(indexer_assignment.num_shards(0), 0);
+        assert_eq!(indexer_assignment.num_shards(1), 5);
+
+        enforce_indexer_max_num_shards(5, &mut indexer_assignment);
+        assert_eq!(indexer_assignment.num_shards(1), 5);
+    }
+
+    #[test]
+    fn test_solve_max_num_shards_leaves_shards_unassigned() {
+        let mut problem =
+            SchedulingProblem::with_indexer_cpu_capacities(vec![mcpu(4_000), mcpu(4_000)]);
+        problem.set_indexer_max_num_shards(5);
+        problem.add_source(12, NonZeroU32::new(100).unwrap());
+        let previous_solution = problem.new_solution();
+        let solution = solve(problem, previous_solution);
+        assert_eq!(solution.indexer_assignments[0].num_shards(0), 5);
+        assert_eq!(solution.indexer_assignments[1].num_shards(0), 5);
+    }
+
+    #[test]
+    fn test_solve_max_num_shards_trims_previous_solution() {
+        let mut problem =
+            SchedulingProblem::with_indexer_cpu_capacities(vec![mcpu(4_000), mcpu(4_000)]);
+        problem.set_indexer_max_num_shards(5);
+        problem.add_source(8, NonZeroU32::new(100).unwrap());
+        let mut previous_solution = problem.new_solution();
+        previous_solution.indexer_assignments[0].add_shards(0, 8);
+        let solution = solve(problem, previous_solution);
+        assert_eq!(solution.indexer_assignments[0].num_shards(0), 5);
+        assert_eq!(solution.indexer_assignments[1].num_shards(0), 3);
+    }
+
+    #[test]
+    fn test_solve_max_num_shards_with_per_source_limit() {
+        // Indexer 1 has room left, but it already holds the maximum number of
+        // shards for the source. Those shards cannot be placed and must not
+        // trigger a capacity scaling loop.
+        let mut problem =
+            SchedulingProblem::with_indexer_cpu_capacities(vec![mcpu(4_000), mcpu(4_000)]);
+        problem.set_indexer_max_num_shards(10);
+        let max_load_per_pipeline = NonZeroU32::new(MAX_LOAD_PER_PIPELINE.cpu_millis()).unwrap();
+        problem.add_source(12, max_load_per_pipeline);
+        problem.add_source(10, NonZeroU32::new(1).unwrap());
+        let mut previous_solution = problem.new_solution();
+        previous_solution.indexer_assignments[0].add_shards(1, 10);
+        let solution = solve(problem, previous_solution);
+        assert_eq!(solution.indexer_assignments[0].num_shards(1), 10);
+        assert_eq!(solution.indexer_assignments[0].num_shards(0), 0);
+        assert_eq!(solution.indexer_assignments[1].num_shards(0), 6);
     }
 
     #[test]
