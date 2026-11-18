@@ -682,6 +682,40 @@ Resets checkpoints of source `source id` of index ID `index id`.
 
 It returns an empty body.
 
+### Get source checkpoint
+
+```
+GET api/v1/indexes/<index id>/sources/<source id>/checkpoint
+```
+
+Gets the checkpoint of source `source id` of index ID `index id`.
+
+#### Response
+
+The response is a JSON object, and the content type is `application/json; charset=UTF-8.`
+
+| Field          | Description                                                       |     Type   |
+|----------------|-------------------------------------------------------------------|:----------:|
+| `index_id`     | The index ID of the source.                                       | `String`   |
+| `source_id`    | The source ID.                                                    | `String`   |
+| `checkpoint`   | Map of partition ID to the last processed position.               | `Object`   |
+
+```json
+{
+    "index_id": "hdfs-logs",
+    "source_id": "kafka-source",
+    "checkpoint": {
+        "00000000000000000000": "00000000000000000042"
+    }
+}
+```
+
+:::note
+
+Sources relying on shards (`ingest` source with ingest V2 and notification based `file` sources) do not store their positions in the index checkpoint, so their `checkpoint` is always empty. Their positions can be retrieved through the shards of the source.
+
+:::
+
 ### Delete a source
 
 ```

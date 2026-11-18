@@ -14,8 +14,9 @@
 
 #![allow(clippy::match_like_matches_macro)]
 
+use aws_config::retry::ErrorKind;
 use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
@@ -29,17 +30,36 @@ use aws_sdk_s3::operation::upload_part::UploadPartError;
 use crate::retry::AwsRetryable;
 
 impl<E> AwsRetryable for SdkError<E>
-where E: AwsRetryable
+where E: AwsRetryable + ProvideErrorMetadata
 {
     fn is_retryable(&self) -> bool {
         match self {
             SdkError::ConstructionFailure(_) => false,
             SdkError::TimeoutError(_) => true,
-            SdkError::DispatchFailure(_) => false,
+            SdkError::DispatchFailure(error) => {
+                error.is_io()
+                    || error.is_timeout()
+                    // the errors below seem unlikely to happen because they
+                    // should rather surface as is_io() or as ServiceError
+                    || matches!(
+                        error.as_other(),
+                        Some(
+                            ErrorKind::TransientError
+                                | ErrorKind::ThrottlingError
+                                | ErrorKind::ServerError
+                        )
+                    )
+            }
             SdkError::ResponseError(_) => true,
             SdkError::ServiceError(error) => error.err().is_retryable(),
             _ => false,
         }
+    }
+
+    /// Whether the service rejected the request because it is throttling requests, for instance
+    /// with an S3 `SlowDown` error.
+    fn is_throttling(&self) -> bool {
+        matches!(self.code(), Some(code) if THROTTLING_ERRORS.contains(&code))
     }
 }
 

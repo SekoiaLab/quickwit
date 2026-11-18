@@ -25,6 +25,7 @@ use quickwit_cli::jemalloc::start_jemalloc_metrics_loop;
 use quickwit_cli::logger::setup_logging_and_tracing;
 use quickwit_cli::{busy_detector, install_default_crypto_ring_provider};
 use quickwit_common::runtimes::scrape_tokio_runtime_metrics;
+use quickwit_common::slow_poll::configure_s3_task_poll_attribution;
 use quickwit_serve::BuildInfo;
 use tracing::error;
 
@@ -41,7 +42,9 @@ fn get_main_runtime_num_threads() -> usize {
 
 fn main() -> anyhow::Result<()> {
     let main_runtime_num_threads: usize = get_main_runtime_num_threads();
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    configure_s3_task_poll_attribution(&mut runtime_builder);
+    let rt = runtime_builder
         .enable_all()
         .on_thread_unpark(busy_detector::thread_unpark)
         .on_thread_park(busy_detector::thread_park)
@@ -77,7 +80,8 @@ async fn main_impl() -> anyhow::Result<()> {
     };
     register_build_info_metric();
 
-    let about_text = about_text();
+    let about_text = "Sub-second search & analytics engine on cloud storage.\n  Find more \
+                      information at https://quickwit.io/docs\n\n";
     let version_text = BuildInfo::get_version_text();
 
     let app = build_cli().about(about_text).version(version_text);
@@ -120,17 +124,6 @@ async fn main_impl() -> anyhow::Result<()> {
     }
 
     std::process::exit(return_code)
-}
-
-/// Return the about text with telemetry info.
-fn about_text() -> String {
-    let mut about_text = String::from(
-        "Sub-second search & analytics engine on cloud storage.\n  Find more information at https://quickwit.io/docs\n\n",
-    );
-    if !quickwit_telemetry::is_telemetry_disabled() {
-        about_text += "Telemetry: enabled";
-    }
-    about_text
 }
 
 #[cfg(test)]

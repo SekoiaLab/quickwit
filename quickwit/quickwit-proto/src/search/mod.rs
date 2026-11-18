@@ -17,6 +17,7 @@ use std::fmt;
 use std::io::{self, Read};
 
 use prost::Message;
+use quickwit_common::numeric_types::num_cmp;
 pub use sort_by_value::SortValue;
 
 include!("../codegen/quickwit/quickwit.search.rs");
@@ -83,6 +84,8 @@ impl SortByValue {
                 }
             }
             Some(SortValue::Boolean(b)) => Bool(b),
+            Some(SortValue::Str(s)) => String(s),
+            Some(SortValue::Datetime(dt)) => Number(dt.into()),
             None => Null,
         }
     }
@@ -104,18 +107,7 @@ impl SortByValue {
                     return None;
                 }
             }
-            // Strings that can be converted to a number are accepted.
-            // Some clients (like JS clients) can't easily handle large integers
-            // without losing precision, so we accept them as strings.
-            String(value) => {
-                if let Ok(number) = value.parse::<i64>() {
-                    Some(SortValue::I64(number))
-                } else if let Ok(number) = value.parse::<u64>() {
-                    Some(SortValue::U64(number))
-                } else {
-                    return None;
-                }
-            }
+            String(value) => Some(SortValue::Str(value)),
             Array(_) | Object(_) => return None,
         };
         Some(SortByValue { sort_value })
@@ -132,25 +124,33 @@ impl Eq for SortValue {}
 impl Ord for SortValue {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        // We make sure to end up with a total order.
-        match (*self, *other) {
+        match (self, other) {
             // Same types.
-            (SortValue::U64(left), SortValue::U64(right)) => left.cmp(&right),
-            (SortValue::I64(left), SortValue::I64(right)) => left.cmp(&right),
-            (SortValue::Boolean(left), SortValue::Boolean(right)) => left.cmp(&right),
-            // We half the logic by making sure we keep
-            // the "stronger" type on the left.
-            (SortValue::U64(left), SortValue::I64(right)) => {
-                if left > i64::MAX as u64 {
-                    return Ordering::Greater;
-                }
-                (left as i64).cmp(&right)
+            (SortValue::U64(left), SortValue::U64(right)) => left.cmp(right),
+            (SortValue::I64(left), SortValue::I64(right)) => left.cmp(right),
+            (SortValue::Boolean(left), SortValue::Boolean(right)) => left.cmp(right),
+            (SortValue::Str(left), SortValue::Str(right)) => left.cmp(right),
+            (SortValue::F64(left), SortValue::F64(right)) => left.total_cmp(right),
+            (SortValue::Datetime(left), SortValue::Datetime(right)) => left.cmp(right),
+            // Different numeric types but can still be compared.
+            (SortValue::U64(left), SortValue::F64(right)) => {
+                num_cmp::cmp_u64_f64(*left, *right).expect("unexpected float comparison")
             }
-            (SortValue::F64(left), SortValue::F64(right)) => left.total_cmp(&right),
-            (SortValue::F64(left), SortValue::U64(right)) => left.total_cmp(&(right as f64)),
-            (SortValue::F64(left), SortValue::I64(right)) => left.total_cmp(&(right as f64)),
-            (SortValue::Boolean(left), right) => SortValue::U64(left as u64).cmp(&right),
-            (left, right) => right.cmp(&left).reverse(),
+            (SortValue::F64(left), SortValue::U64(right)) => num_cmp::cmp_u64_f64(*right, *left)
+                .expect("unexpected float comparison")
+                .reverse(),
+            (SortValue::I64(left), SortValue::F64(right)) => {
+                num_cmp::cmp_i64_f64(*left, *right).expect("unexpected float comparison")
+            }
+            (SortValue::F64(left), SortValue::I64(right)) => num_cmp::cmp_i64_f64(*right, *left)
+                .expect("unexpected float comparison")
+                .reverse(),
+            (SortValue::I64(left), SortValue::U64(right)) => num_cmp::cmp_i64_u64(*left, *right),
+            (SortValue::U64(left), SortValue::I64(right)) => {
+                num_cmp::cmp_i64_u64(*right, *left).reverse()
+            }
+            // Incompatible types, they are sorted one after another.
+            (left, right) => left.type_sort_key().cmp(&right.type_sort_key()),
         }
     }
 }
@@ -163,9 +163,8 @@ impl PartialOrd for SortValue {
 
 impl std::hash::Hash for SortValue {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let this = self.normalize();
-        std::mem::discriminant(&this).hash(state);
-        match this {
+        std::mem::discriminant(self).hash(state);
+        match self {
             SortValue::U64(number) => {
                 number.hash(state);
             }
@@ -173,42 +172,33 @@ impl std::hash::Hash for SortValue {
                 number.hash(state);
             }
             SortValue::F64(number) => {
+                // `0.0 == -0.0`, so they must hash alike, while their bit
+                // representations differ.
+                let number = if *number == 0.0 { 0.0f64 } else { *number };
                 number.to_bits().hash(state);
             }
             SortValue::Boolean(b) => {
                 b.hash(state);
+            }
+            SortValue::Str(s) => {
+                s.hash(state);
+            }
+            SortValue::Datetime(dt) => {
+                dt.hash(state);
             }
         }
     }
 }
 
 impl SortValue {
-    /// Where multiple variant could represent the same logical value, convert to a canonical form.
-    ///
-    /// For number, we prefer to represent them, in order, as i64, then as u64 and finally as f64.
-    pub fn normalize(&self) -> Self {
+    pub fn type_sort_key(&self) -> TypeSortKey {
         match self {
-            SortValue::I64(_) => *self,
-            SortValue::Boolean(_) => *self,
-            SortValue::U64(number) => {
-                if let Ok(number) = (*number).try_into() {
-                    SortValue::I64(number)
-                } else {
-                    *self
-                }
-            }
-            SortValue::F64(number) => {
-                let number = *number;
-                if number.ceil() == number {
-                    // number is not NaN, and is a natural number
-                    if number >= i64::MIN as f64 && number <= i64::MAX as f64 {
-                        return SortValue::I64(number as i64);
-                    } else if number.is_sign_positive() && number <= u64::MAX as f64 {
-                        return SortValue::U64(number as u64);
-                    }
-                }
-                *self
-            }
+            SortValue::U64(_) => TypeSortKey::Numeric,
+            SortValue::I64(_) => TypeSortKey::Numeric,
+            SortValue::F64(_) => TypeSortKey::Numeric,
+            SortValue::Boolean(_) => TypeSortKey::Boolean,
+            SortValue::Str(_) => TypeSortKey::Str,
+            SortValue::Datetime(_) => TypeSortKey::DateTime,
         }
     }
 }
@@ -216,12 +206,24 @@ impl SortValue {
 impl PartialHit {
     /// Helper to get access to the 1st sort value
     pub fn sort_value(&self) -> Option<SortValue> {
-        if let Some(sort_value) = self.sort_value {
-            sort_value.sort_value
+        if let Some(sort_value) = &self.sort_value {
+            sort_value.sort_value.clone()
         } else {
             None
         }
     }
+}
+
+/// Defines the order between types when sorting on a field with multiple types.
+/// Expected order:
+/// - Asc: numeric -> string -> boolean -> datetime
+/// - Desc: datetime -> boolean -> string -> numeric
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TypeSortKey {
+    Numeric,
+    Str,
+    Boolean,
+    DateTime,
 }
 
 /// Serializes the Split fields.

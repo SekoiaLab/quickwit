@@ -27,7 +27,7 @@ use quickwit_proto::types::IndexUid;
 use serde::Serialize;
 use tracing::{debug, error, info};
 
-use crate::retention_policy_execution::run_execute_retention_policy;
+use crate::retention_policy_execution::{RetentionTimestampMode, run_execute_retention_policy};
 
 const RUN_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hours
 
@@ -60,6 +60,7 @@ pub struct RetentionPolicyExecutor {
     /// This act as local cache that is periodically updated while taking into
     /// account deleted indexes, updated or removed retention policy on indexes.
     index_configs: HashMap<String, IndexConfig>,
+    timestamp_mode: RetentionTimestampMode,
     counters: RetentionPolicyExecutorCounters,
 }
 
@@ -68,6 +69,7 @@ impl RetentionPolicyExecutor {
         Self {
             metastore,
             index_configs: HashMap::new(),
+            timestamp_mode: RetentionTimestampMode::from_env(),
             counters: RetentionPolicyExecutorCounters::default(),
         }
     }
@@ -211,6 +213,11 @@ impl Handler<Execute> for RetentionPolicyExecutor {
             message.index_uid.clone(),
             self.metastore.clone(),
             retention_policy,
+            self.timestamp_mode,
+            index_config
+                .doc_mapping
+                .secondary_timestamp_field
+                .as_deref(),
             ctx,
         )
         .await;
@@ -500,5 +507,144 @@ mod tests {
         universe.assert_quit().await;
 
         Ok(())
+    }
+
+    fn make_split_with_secondary(
+        split_id: &str,
+        time_range: RangeInclusive<i64>,
+        secondary_time_range: RangeInclusive<i64>,
+    ) -> Split {
+        let mut split = make_split(split_id, Some(time_range));
+        split.split_metadata.secondary_time_range = Some(secondary_time_range);
+        split
+    }
+
+    /// Returns `primary-only` for primary queries and `secondary-only` for secondary
+    /// queries, plus `both` for either. Secondary queries are rejected when the index has no
+    /// secondary timestamp field.
+    fn mock_metastore_for_timestamp_mode(
+        secondary_timestamp_field_opt: Option<&'static str>,
+        expected_marked_split_ids: &'static [&'static str],
+    ) -> MockMetastoreService {
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_list_indexes_metadata()
+            .times(..)
+            .returning(move |_list_indexes_request| {
+                let mut index_config = make_index("index-1", Some("1 hour"));
+                index_config.doc_mapping.secondary_timestamp_field =
+                    secondary_timestamp_field_opt.map(str::to_string);
+                let indexes_metadata = vec![IndexMetadata::new(index_config)];
+                Ok(ListIndexesMetadataResponse::for_test(indexes_metadata))
+            });
+        mock_metastore
+            .expect_list_splits()
+            .times(..)
+            .returning(move |list_splits_request| {
+                let query = list_splits_request.deserialize_list_splits_query().unwrap();
+                assert_eq!(query.split_states, &[SplitState::Published]);
+                let splits = match (query.max_time_range_end, query.max_secondary_time_range_end) {
+                    (Some(_), None) => vec![
+                        make_split_with_secondary("both", 1000..=2000, 1000..=2000),
+                        make_split_with_secondary("primary-only", 1000..=2000, i64::MAX..=i64::MAX),
+                    ],
+                    (None, Some(_)) => {
+                        assert!(
+                            secondary_timestamp_field_opt.is_some(),
+                            "secondary filter used without a secondary timestamp field"
+                        );
+                        vec![
+                            make_split_with_secondary("both", 1000..=2000, 1000..=2000),
+                            make_split_with_secondary(
+                                "secondary-only",
+                                i64::MAX..=i64::MAX,
+                                1000..=2000,
+                            ),
+                        ]
+                    }
+                    filters => panic!("unexpected retention filters: {filters:?}"),
+                };
+                let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
+                Ok(ServiceStream::from(vec![Ok(splits_response)]))
+            });
+        mock_metastore
+            .expect_mark_splits_for_deletion()
+            .times(1..)
+            .returning(move |mark_splits_for_deletion_request| {
+                assert_eq!(
+                    mark_splits_for_deletion_request.split_ids,
+                    expected_marked_split_ids
+                );
+                Ok(EmptyResponse {})
+            });
+        mock_metastore
+    }
+
+    async fn run_once_with_timestamp_mode(
+        timestamp_mode: RetentionTimestampMode,
+        secondary_timestamp_field_opt: Option<&'static str>,
+        expected_marked_split_ids: &'static [&'static str],
+    ) {
+        let mock_metastore = mock_metastore_for_timestamp_mode(
+            secondary_timestamp_field_opt,
+            expected_marked_split_ids,
+        );
+        let mut retention_policy_executor =
+            RetentionPolicyExecutor::new(MetastoreServiceClient::from_mock(mock_metastore));
+        retention_policy_executor.timestamp_mode = timestamp_mode;
+        let universe = Universe::with_accelerated_time();
+        let (_mailbox, handle) = universe.spawn_builder().spawn(retention_policy_executor);
+        handle.process_pending_and_observe().await;
+
+        universe.sleep(shift_time_by()).await;
+        let counters = handle.process_pending_and_observe().await.state;
+        // Depending on the wall clock, the hourly schedule can fire more than once.
+        assert!(counters.num_execution_passes >= 1);
+        assert_eq!(
+            counters.num_expired_splits,
+            2 * counters.num_execution_passes
+        );
+        universe.assert_quit().await;
+    }
+
+    #[tokio::test]
+    async fn test_retention_policy_execution_primary_mode() {
+        run_once_with_timestamp_mode(
+            RetentionTimestampMode::Primary,
+            Some("ingestion_time"),
+            &["both", "primary-only"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_retention_policy_execution_secondary_dry_run_mode() {
+        // The dry run lists both sets but only marks the primary one.
+        run_once_with_timestamp_mode(
+            RetentionTimestampMode::SecondaryDryRun,
+            Some("ingestion_time"),
+            &["both", "primary-only"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_retention_policy_execution_secondary_mode() {
+        run_once_with_timestamp_mode(
+            RetentionTimestampMode::Secondary,
+            Some("ingestion_time"),
+            &["both", "secondary-only"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_retention_policy_execution_secondary_modes_without_secondary_field() {
+        for timestamp_mode in [
+            RetentionTimestampMode::SecondaryDryRun,
+            RetentionTimestampMode::Secondary,
+        ] {
+            run_once_with_timestamp_mode(timestamp_mode, None, &["both", "primary-only"]).await;
+        }
     }
 }

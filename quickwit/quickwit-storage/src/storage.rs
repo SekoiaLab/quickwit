@@ -19,9 +19,10 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use quickwit_common::uri::Uri;
+use quickwit_config::StorageTimeoutPolicy;
 use tempfile::TempPath;
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tracing::error;
 
 use crate::{BulkDeleteError, OwnedBytes, PutPayload, StorageErrorKind, StorageResult};
@@ -137,6 +138,11 @@ pub trait Storage: fmt::Debug + Send + Sync + 'static {
 
     /// Returns an URI identifying the storage
     fn uri(&self) -> &Uri;
+
+    /// Returns the timeout policy that the storage applies to its requests itself, if any.
+    fn timeout_policy(&self) -> Option<StorageTimeoutPolicy> {
+        None
+    }
 }
 
 async fn default_copy_to_file<S: Storage + ?Sized>(
@@ -151,10 +157,15 @@ async fn default_copy_to_file<S: Storage + ?Sized>(
     Ok(num_bytes)
 }
 
+/// Every write to a `tokio::fs::File` is dispatched to the blocking thread pool, and downloads
+/// typically arrive in chunks of a few KiB. Buffering amortizes that dispatch over large writes.
+/// Matches the largest write `tokio::fs::File` performs per blocking call by default.
+const DOWNLOAD_WRITE_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
+
 struct DownloadTempFile {
     target_filepath: PathBuf,
     temp_filepath: PathBuf,
-    file: File,
+    file: BufWriter<File>,
     has_attempted_deletion: bool,
 }
 
@@ -175,12 +186,14 @@ impl DownloadTempFile {
         Ok(DownloadTempFile {
             target_filepath,
             temp_filepath,
-            file,
+            file: BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER_CAPACITY, file),
             has_attempted_deletion: false,
         })
     }
 
     pub async fn persist(mut self) -> io::Result<u64> {
+        // should be noop but flush just in case.
+        self.file.flush().await?;
         TempPath::from_path(&self.temp_filepath).persist(&self.target_filepath)?;
         self.has_attempted_deletion = true;
         let num_bytes = std::fs::metadata(&self.target_filepath)?.len();
@@ -203,8 +216,8 @@ impl Drop for DownloadTempFile {
     }
 }
 
-impl AsMut<File> for DownloadTempFile {
-    fn as_mut(&mut self) -> &mut File {
+impl AsMut<BufWriter<File>> for DownloadTempFile {
+    fn as_mut(&mut self) -> &mut BufWriter<File> {
         &mut self.file
     }
 }
@@ -235,6 +248,44 @@ mod tests {
         assert_eq!(num_bytes, 11);
         let content = std::fs::read(&dest_filepath).unwrap();
         assert_eq!(&content, CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_copy_to_file_larger_than_write_buffer() {
+        let ram_storage = RamStorage::default();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_filepath = temp_dir.path().join("bar");
+        let path = Path::new("foo/bar");
+        let content: Vec<u8> = (0..DOWNLOAD_WRITE_BUFFER_CAPACITY * 2 + 12_345)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        ram_storage
+            .put(path, Box::new(content.clone()))
+            .await
+            .unwrap();
+        let num_bytes = ram_storage
+            .copy_to_file(path, &dest_filepath)
+            .await
+            .unwrap();
+        assert_eq!(num_bytes, content.len() as u64);
+        assert_eq!(std::fs::read(&dest_filepath).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_download_temp_file_persist_flushes_buffered_writes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_filepath = temp_dir.path().join("bar");
+        let mut download_temp_file = DownloadTempFile::with_target_path(dest_filepath.clone())
+            .await
+            .unwrap();
+        download_temp_file
+            .as_mut()
+            .write_all(CONTENT)
+            .await
+            .unwrap();
+        let num_bytes = download_temp_file.persist().await.unwrap();
+        assert_eq!(num_bytes, CONTENT.len() as u64);
+        assert_eq!(std::fs::read(&dest_filepath).unwrap(), CONTENT);
     }
 
     #[tokio::test]
