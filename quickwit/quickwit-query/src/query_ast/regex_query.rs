@@ -96,6 +96,9 @@ impl BuildTantivyAst for RegexQuery {
     ) -> Result<TantivyQueryAst, InvalidQuery> {
         let (field, path, regex) = self.to_field_and_regex(context.schema)?;
         let regex = tantivy_fst::Regex::new(&regex).context("failed to parse regex")?;
+        if let Some(automaton_memory_budget) = context.automaton_memory_budget {
+            automaton_memory_budget.charge(regex.memory_usage())?;
+        }
         let regex_automaton_with_path = JsonPathPrefix {
             prefix: path.unwrap_or_default(),
             automaton: regex.into(),

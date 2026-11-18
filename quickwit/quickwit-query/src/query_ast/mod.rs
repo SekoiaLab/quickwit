@@ -19,6 +19,7 @@ use tantivy::schema::{Field, Schema as TantivySchema};
 
 use crate::tokenizers::TokenizerManager;
 
+mod automaton_memory_budget;
 mod bool_query;
 mod cache_node;
 mod field_presence;
@@ -34,6 +35,7 @@ pub(crate) mod utils;
 mod visitor;
 mod wildcard_query;
 
+pub use automaton_memory_budget::AutomatonMemoryBudget;
 pub use bool_query::BoolQuery;
 pub use cache_node::{CacheNode, HitSet, PredicateCache, PredicateCacheInjector};
 pub use field_presence::FieldPresenceQuery;
@@ -178,6 +180,9 @@ pub struct BuildTantivyAstContext<'a> {
     pub tokenizer_manager: &'a TokenizerManager,
     pub search_fields: &'a [String],
     pub with_validation: bool,
+    /// If set, the memory of the automatons built for regex and wildcard queries is charged to
+    /// this budget, and building the query fails when it is exceeded.
+    pub automaton_memory_budget: Option<&'a AutomatonMemoryBudget>,
 }
 
 impl<'a> BuildTantivyAstContext<'a> {
@@ -193,6 +198,7 @@ impl<'a> BuildTantivyAstContext<'a> {
             tokenizer_manager: &DEFAULT_TOKENIZER_MANAGER,
             search_fields: &[],
             with_validation: true,
+            automaton_memory_budget: None,
         }
     }
 
