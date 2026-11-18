@@ -40,7 +40,8 @@ use quickwit_proto::search::{
 };
 use quickwit_proto::types::{DocMappingUid, IndexUid, SplitId};
 use quickwit_query::query_ast::{
-    BoolQuery, QueryAst, QueryAstVisitor, RangeQuery, TermQuery, TermSetQuery,
+    AutomatonMemoryBudget, BoolQuery, QueryAst, QueryAstVisitor, RangeQuery, TermQuery,
+    TermSetQuery,
 };
 use serde::{Deserialize, Serialize};
 use tantivy::TantivyError;
@@ -180,6 +181,9 @@ struct RequestMetadata {
     query_ast_resolved: QueryAst,
     indexes_meta_for_leaf_search: IndexesMetasForLeafSearch,
     sort_fields_is_datetime: SortFieldsIsDatetime,
+    /// Largest memory of the automatons built for the regex and wildcard sub-queries when
+    /// validating the query against one doc mapping.
+    automaton_memory_bytes: usize,
 }
 
 /// Validates request against each index's doc mapper and ensures that:
@@ -197,6 +201,11 @@ struct RequestMetadata {
 /// settings, so it runs once per distinct pair rather than once per index. Building the query
 /// compiles one automaton per regex or wildcard sub-query, which is expensive enough that
 /// repeating it for hundreds of indexes sharing the same doc mapping can take minutes.
+///
+/// The memory of these automatons is bounded by
+/// [`query_cost_classifier::max_automaton_memory_bytes`] for each doc mapping. Even within that
+/// bound, compiling them can take a while, so async callers should use
+/// [`validate_request_and_build_metadata_on_search_pool`].
 fn validate_request_and_build_metadata(
     indexes_metadata: &[IndexMetadata],
     search_request: &SearchRequest,
@@ -214,6 +223,7 @@ fn validate_request_and_build_metadata(
     // Serialized doc mappers of the doc mappings that passed validation, keyed by
     // `doc_mapping_validation_key`.
     let mut validated_doc_mapper_strs: HashMap<String, String> = HashMap::new();
+    let mut automaton_memory_bytes = 0;
 
     for index_metadata in indexes_metadata {
         let doc_mapping = without_doc_mapping_uid(&index_metadata.index_config.doc_mapping);
@@ -223,15 +233,18 @@ fn validate_request_and_build_metadata(
         let doc_mapper_str = match validated_doc_mapper_strs.entry(validation_key) {
             Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => {
-                let doc_mapper = validate_request_against_doc_mapping(
-                    &doc_mapping,
-                    search_settings,
-                    &query_ast,
-                    search_request,
-                    &mut query_ast_resolved_opt,
-                    &mut timestamp_field_opt,
-                    &mut sort_fields_is_datetime,
-                )?;
+                let (doc_mapper, doc_mapping_automaton_memory_bytes) =
+                    validate_request_against_doc_mapping(
+                        &doc_mapping,
+                        search_settings,
+                        &query_ast,
+                        search_request,
+                        &mut query_ast_resolved_opt,
+                        &mut timestamp_field_opt,
+                        &mut sort_fields_is_datetime,
+                    )?;
+                automaton_memory_bytes =
+                    automaton_memory_bytes.max(doc_mapping_automaton_memory_bytes);
                 let doc_mapper_str = serde_json::to_string(&doc_mapper).map_err(|err| {
                     SearchError::Internal(format!("failed to serialize doc mapper. cause: {err}"))
                 })?;
@@ -259,7 +272,33 @@ fn validate_request_and_build_metadata(
         query_ast_resolved,
         indexes_meta_for_leaf_search,
         sort_fields_is_datetime,
+        automaton_memory_bytes,
     })
+}
+
+/// Runs [`validate_request_and_build_metadata`] on the search thread pool, so that compiling the
+/// automatons of regex and wildcard sub-queries does not block the async runtime.
+///
+/// Returns the indexes metadata along with the request metadata, as the validation needs to own
+/// them.
+async fn validate_request_and_build_metadata_on_search_pool(
+    indexes_metadata: Vec<IndexMetadata>,
+    search_request: &SearchRequest,
+) -> crate::Result<(RequestMetadata, Vec<IndexMetadata>)> {
+    let search_request = search_request.clone();
+    let (request_metadata_res, indexes_metadata) = crate::search_thread_pool()
+        .run_cpu_intensive_with_priority(
+            Priority::High,
+            move || {
+                let request_metadata_res =
+                    validate_request_and_build_metadata(&indexes_metadata, &search_request);
+                (request_metadata_res, indexes_metadata)
+            },
+            "root_validate_request",
+        )
+        .await
+        .context("search request validation panicked")?;
+    Ok((request_metadata_res?, indexes_metadata))
 }
 
 /// Returns a copy of the doc mapping with its UID reset to the default value.
@@ -287,7 +326,8 @@ fn doc_mapping_validation_key(
 /// Validates the request against one doc mapping, and checks that the resolved query AST and the
 /// timestamp field match the ones of the doc mappings validated before.
 ///
-/// Returns the doc mapper built from the doc mapping.
+/// Returns the doc mapper built from the doc mapping, and the memory of the automatons built for
+/// the regex and wildcard sub-queries.
 fn validate_request_against_doc_mapping(
     doc_mapping: &DocMapping,
     search_settings: &SearchSettings,
@@ -296,7 +336,7 @@ fn validate_request_against_doc_mapping(
     query_ast_resolved_opt: &mut Option<QueryAst>,
     timestamp_field_opt: &mut Option<String>,
     sort_fields_is_datetime: &mut SortFieldsIsDatetime,
-) -> crate::Result<Arc<DocMapper>> {
+) -> crate::Result<(Arc<DocMapper>, usize)> {
     let doc_mapper = build_doc_mapper(doc_mapping, search_settings).map_err(|err| {
         SearchError::Internal(format!("failed to build doc mapper. cause: {err}"))
     })?;
@@ -350,15 +390,13 @@ fn validate_request_against_doc_mapping(
         sort_fields_is_datetime,
     )?;
 
-    // Validates the query by effectively building it against the current schema.
-    doc_mapper.query(
-        doc_mapper.schema(),
-        query_ast_resolved_for_index,
-        true,
-        None,
-    )?;
+    // Validates the query by effectively building it against the current schema, within a
+    // budget for the memory of the automatons of its regex and wildcard sub-queries.
+    let automaton_memory_budget =
+        AutomatonMemoryBudget::new(query_cost_classifier::max_automaton_memory_bytes());
+    doc_mapper.validate_query(query_ast_resolved_for_index, &automaton_memory_budget)?;
 
-    Ok(doc_mapper)
+    Ok((doc_mapper, automaton_memory_budget.used_bytes()))
 }
 
 fn validate_secondary_time(index_metadata: &[IndexMetadata]) -> crate::Result<Option<String>> {
@@ -1307,6 +1345,7 @@ async fn plan_splits_for_root_search(
     search_request: &mut SearchRequest,
     metastore: &mut MetastoreServiceClient,
     max_splits_per_search: Option<usize>,
+    req_span: &tracing::Span,
 ) -> crate::Result<(Vec<SplitMetadata>, IndexesMetasForLeafSearch)> {
     let list_indexes_metadatas_request = ListIndexesMetadataRequest {
         index_id_patterns: search_request.index_id_patterns.clone(),
@@ -1328,7 +1367,11 @@ async fn plan_splits_for_root_search(
         return Ok((Vec::new(), HashMap::default()));
     }
 
-    let request_metadata = validate_request_and_build_metadata(&indexes_metadata, search_request)?;
+    let (request_metadata, indexes_metadata) =
+        validate_request_and_build_metadata_on_search_pool(indexes_metadata, search_request)
+            .await?;
+    let automaton_memory_bytes = request_metadata.automaton_memory_bytes;
+    record_all!(req_span, automaton_memory_bytes);
     let secondary_timestamp_field_opt = validate_secondary_time(&indexes_metadata)?;
     let split_metadatas = refine_and_list_matches(
         metastore,
@@ -1369,6 +1412,7 @@ fn record_request_span(search_request: &SearchRequest) -> tracing::Span {
         targeted_splits_bytes = tracing::field::Empty,
         num_targeted_splits = tracing::field::Empty,
         query_complexity_factor = tracing::field::Empty,
+        automaton_memory_bytes = tracing::field::Empty,
     );
     if let Some(agg) = search_request.aggregation_request.as_ref() {
         record_all!(span, agg = %agg);
@@ -1405,6 +1449,7 @@ pub async fn root_search(
             &mut search_request,
             &mut metastore,
             searcher_context.searcher_config.max_splits_per_search,
+            &req_span,
         )
         .detect_slow_poll("root_search:plan_splits"),
         status: None,
@@ -1486,7 +1531,9 @@ pub async fn search_plan(
     )
     .map_err(|err| SearchError::Internal(format!("failed to build doc mapper. cause: {err}")))?;
 
-    let request_metadata = validate_request_and_build_metadata(&indexes_metadata, &search_request)?;
+    let (request_metadata, indexes_metadata) =
+        validate_request_and_build_metadata_on_search_pool(indexes_metadata, &search_request)
+            .await?;
     let secondary_timestamp_field_opt = validate_secondary_time(&indexes_metadata)?;
     let split_metadatas = refine_and_list_matches(
         &mut metastore,
@@ -2153,6 +2200,8 @@ mod tests {
         );
         assert_eq!(request_metadata.query_ast_resolved, request_query_ast);
         assert_eq!(request_metadata.indexes_meta_for_leaf_search.len(), 3);
+        // No regex or wildcard sub-query, so no automaton.
+        assert_eq!(request_metadata.automaton_memory_bytes, 0);
         assert_eq!(request_metadata.sort_fields_is_datetime.len(), 2);
         assert_eq!(
             request_metadata.sort_fields_is_datetime.get("timestamp"),
@@ -2191,6 +2240,8 @@ mod tests {
             validate_request_and_build_metadata(&indexes_metadata, &search_request).unwrap();
 
         assert_eq!(request_metadata.indexes_meta_for_leaf_search.len(), 3);
+        // The wildcard is compiled to an automaton when validating the query.
+        assert!(request_metadata.automaton_memory_bytes > 0);
         // The doc mapper sent to the leaves is the same for all indexes, without UID.
         let expected_doc_mapper = build_doc_mapper(
             &without_doc_mapping_uid(&indexes_metadata[0].index_config.doc_mapping),

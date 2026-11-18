@@ -19,6 +19,7 @@
 
 use std::sync::LazyLock;
 
+use bytesize::ByteSize;
 use quickwit_proto::search::SearchRequest;
 use quickwit_query::query_ast::{QueryAst, QueryAstVisitor, RegexQuery, WildcardQuery};
 
@@ -30,6 +31,22 @@ use crate::cost::compute_query_complexity_factor;
 static MAX_AUTOMATON_QUERIES_PER_REQUEST: LazyLock<usize> = LazyLock::new(|| {
     quickwit_common::get_from_env("QW_MAX_AUTOMATON_QUERIES_PER_REQUEST", 200, false)
 });
+
+/// Maximum memory of the automatons built for the regex and wildcard sub-queries of a search
+/// request, when validating it against a doc mapping. See [`max_automaton_memory_bytes`].
+static MAX_AUTOMATON_MEMORY: LazyLock<ByteSize> = LazyLock::new(|| {
+    quickwit_common::get_from_env("QW_MAX_AUTOMATON_MEMORY", ByteSize::mib(128), false)
+});
+
+/// Returns the maximum memory, in bytes, of the automatons built for the regex and wildcard
+/// sub-queries of a search request.
+///
+/// The root enforces it when validating the request against each distinct doc mapping, which
+/// bounds the memory and the CPU time spent compiling automatons during planning. Leaves build
+/// the same automatons for each split they search.
+pub fn max_automaton_memory_bytes() -> usize {
+    MAX_AUTOMATON_MEMORY.as_u64() as usize
+}
 
 /// Returns the complexity factor of a search request, see [`compute_query_complexity_factor`].
 ///

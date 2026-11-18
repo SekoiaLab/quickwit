@@ -20,7 +20,7 @@ use anyhow::{Context, bail};
 use fnv::FnvHashSet;
 use quickwit_proto::types::DocMappingUid;
 use quickwit_query::create_default_quickwit_tokenizer_manager;
-use quickwit_query::query_ast::{BuildTantivyAstContext, QueryAst};
+use quickwit_query::query_ast::{AutomatonMemoryBudget, BuildTantivyAstContext, QueryAst};
 use quickwit_query::tokenizers::TokenizerManager;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value as JsonValue};
@@ -684,9 +684,33 @@ impl DocMapper {
                 tokenizer_manager: self.tokenizer_manager(),
                 search_fields: &self.default_search_field_names[..],
                 with_validation,
+                automaton_memory_budget: None,
             },
             cache_context,
         )
+    }
+
+    /// Validates the query by building it against the doc mapper schema.
+    ///
+    /// The memory of the automatons built for its regex and wildcard queries is charged to
+    /// `automaton_memory_budget`, and the validation fails as soon as the budget is exceeded.
+    pub fn validate_query(
+        &self,
+        query_ast: QueryAst,
+        automaton_memory_budget: &AutomatonMemoryBudget,
+    ) -> Result<(), QueryParserError> {
+        build_query(
+            query_ast,
+            &BuildTantivyAstContext {
+                schema: &self.schema,
+                tokenizer_manager: self.tokenizer_manager(),
+                search_fields: &self.default_search_field_names[..],
+                with_validation: true,
+                automaton_memory_budget: Some(automaton_memory_budget),
+            },
+            None,
+        )?;
+        Ok(())
     }
 
     /// Returns the list of search fields to search into, when no field is specified.
@@ -761,7 +785,8 @@ mod tests {
 
     use itertools::Itertools;
     use quickwit_common::PathHasher;
-    use quickwit_query::query_ast::query_ast_from_user_text;
+    use quickwit_query::InvalidQuery;
+    use quickwit_query::query_ast::{AutomatonMemoryBudget, QueryAst, query_ast_from_user_text};
     use serde_json::{self, Value as JsonValue, json};
     use tantivy::schema::{
         FieldType, IndexRecordOption, OwnedValue as TantivyValue, OwnedValue, Type, Value,
@@ -771,7 +796,7 @@ mod tests {
     use crate::doc_mapper::field_mapping_entry::{DEFAULT_TOKENIZER_NAME, RAW_TOKENIZER_NAME};
     use crate::{
         DOCUMENT_SIZE_FIELD_NAME, DYNAMIC_FIELD_NAME, DocMapperBuilder, DocParsingError,
-        FIELD_PRESENCE_FIELD_NAME, SOURCE_FIELD_NAME,
+        FIELD_PRESENCE_FIELD_NAME, QueryParserError, SOURCE_FIELD_NAME,
     };
 
     fn example_json_doc_value() -> JsonValue {
@@ -2123,6 +2148,47 @@ mod tests {
             .query(doc_mapper.schema(), query_ast, true, None)
             .map_err(|err| err.to_string())?;
         Ok(format!("{query:?}"))
+    }
+
+    #[test]
+    fn test_doc_mapper_validate_query_automaton_memory_budget() {
+        let doc_mapper: DocMapper = serde_json::from_str(
+            r#"{
+            "field_mappings": [{"name": "body", "type": "text"}],
+            "mode": "dynamic"
+        }"#,
+        )
+        .unwrap();
+        let regexes: Vec<QueryAst> = ["(?i).*powershell.*", "(?i).*mimikatz.*"]
+            .into_iter()
+            .map(|regex| {
+                quickwit_query::query_ast::RegexQuery {
+                    field: "body".to_string(),
+                    regex: regex.to_string(),
+                }
+                .into()
+            })
+            .collect();
+        let query_ast: QueryAst = quickwit_query::query_ast::BoolQuery {
+            should: regexes,
+            ..Default::default()
+        }
+        .into();
+
+        let budget = AutomatonMemoryBudget::new(usize::MAX);
+        doc_mapper
+            .validate_query(query_ast.clone(), &budget)
+            .unwrap();
+        let automaton_memory_bytes = budget.used_bytes();
+        assert!(automaton_memory_bytes > 0);
+
+        // A budget that only fits the first regex.
+        let budget = AutomatonMemoryBudget::new(automaton_memory_bytes - 1);
+        let error = doc_mapper.validate_query(query_ast, &budget).unwrap_err();
+        assert!(matches!(
+            error,
+            QueryParserError::InvalidQuery(InvalidQuery::AutomatonMemoryLimitExceeded { .. })
+        ));
     }
 
     #[test]
