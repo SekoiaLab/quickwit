@@ -325,7 +325,7 @@ impl SortingFieldExtractorComponent {
         &self,
         sort_by_value: &SortByValue,
         sort_order: SortOrder,
-    ) -> tantivy::Result<InternalValueRepr<V>> {
+    ) -> tantivy::Result<ProjectedSearchAfter<V>> {
         let SortByValue {
             sort_value: sort_value_opt,
         } = sort_by_value;
@@ -333,10 +333,10 @@ impl SortingFieldExtractorComponent {
             (SortingFieldExtractorComponent::DocId, _) => {
                 // Doc id sorts are handled at the compound sort value level
                 debug_assert!(V::is_elided());
-                Ok(InternalValueRepr::new_missing())
+                Ok(InternalValueRepr::new_missing().into())
             }
             (SortingFieldExtractorComponent::FastField(_), None) => {
-                Ok(InternalValueRepr::new_missing())
+                Ok(InternalValueRepr::new_missing().into())
             }
             (
                 SortingFieldExtractorComponent::FastField(FastFieldExtractor {
@@ -345,7 +345,7 @@ impl SortingFieldExtractorComponent {
                 Some(sort_value),
             ) => project_search_after_sort_value(sort_columns, sort_value, sort_order),
             (SortingFieldExtractorComponent::Score, Some(SortValue::F64(val))) => {
-                Ok(InternalValueRepr::new(val.to_u64(), 0, sort_order))
+                Ok(InternalValueRepr::new(val.to_u64(), 0, sort_order).into())
             }
             (SortingFieldExtractorComponent::Score, _) => {
                 Err(tantivy::TantivyError::InvalidArgument(
@@ -356,35 +356,64 @@ impl SortingFieldExtractorComponent {
     }
 }
 
+/// A search after value projected onto the sort columns of a segment.
+struct ProjectedSearchAfter<V: ElidableU64> {
+    repr: InternalValueRepr<V>,
+    /// False when the search after value does not exist in the column and `repr` holds the
+    /// neighbouring column value that sorts *before* it. Documents with that value were already
+    /// returned, so they must all be skipped, whatever their following sort dimensions.
+    exact: bool,
+}
+
+impl<V: ElidableU64> From<InternalValueRepr<V>> for ProjectedSearchAfter<V> {
+    fn from(repr: InternalValueRepr<V>) -> Self {
+        ProjectedSearchAfter { repr, exact: true }
+    }
+}
+
+impl<V: ElidableU64> ProjectedSearchAfter<V> {
+    fn preceding_value(repr: InternalValueRepr<V>) -> Self {
+        ProjectedSearchAfter { repr, exact: false }
+    }
+}
+
 fn projected_number_internal_repr<T: MonotonicallyMappableToU64, V: ElidableU64>(
     projected: ProjectedNumber<T>,
     order: SortOrder,
     accessor_idx: u8,
-) -> InternalValueRepr<V> {
+) -> ProjectedSearchAfter<V> {
     match (projected, order) {
         (ProjectedNumber::Exact(val), _) => {
-            InternalValueRepr::new(val.to_u64(), accessor_idx, order)
+            InternalValueRepr::new(val.to_u64(), accessor_idx, order).into()
         }
         (ProjectedNumber::AfterLast, SortOrder::Asc) => {
-            InternalValueRepr::new_skip_column(accessor_idx, order)
+            InternalValueRepr::new_skip_column(accessor_idx, order).into()
         }
         (ProjectedNumber::AfterLast, SortOrder::Desc) => {
-            InternalValueRepr::new_keep_column(accessor_idx, order)
+            InternalValueRepr::new_keep_column(accessor_idx, order).into()
         }
         (ProjectedNumber::Next(val), SortOrder::Asc) => {
             let val_u64 = val.to_u64();
             if val_u64 == 0 {
-                InternalValueRepr::new_keep_column(accessor_idx, order)
+                InternalValueRepr::new_keep_column(accessor_idx, order).into()
             } else {
-                InternalValueRepr::new(val_u64 - 1, accessor_idx, order)
+                ProjectedSearchAfter::preceding_value(InternalValueRepr::new(
+                    val_u64 - 1,
+                    accessor_idx,
+                    order,
+                ))
             }
         }
         (ProjectedNumber::Next(val), SortOrder::Desc) => {
             let val_u64 = val.to_u64();
             if val_u64 == 0 {
-                InternalValueRepr::new_skip_column(accessor_idx, order)
+                InternalValueRepr::new_skip_column(accessor_idx, order).into()
             } else {
-                InternalValueRepr::new(val_u64, accessor_idx, order)
+                ProjectedSearchAfter::preceding_value(InternalValueRepr::new(
+                    val_u64,
+                    accessor_idx,
+                    order,
+                ))
             }
         }
     }
@@ -394,7 +423,7 @@ fn project_search_after_sort_value<V: ElidableU64>(
     sort_columns: &[(Column<u64>, SortFieldType)],
     sort_value: &SortValue,
     sort_order: SortOrder,
-) -> tantivy::Result<InternalValueRepr<V>> {
+) -> tantivy::Result<ProjectedSearchAfter<V>> {
     let col_iter = match sort_order {
         SortOrder::Asc => Either::Left(sort_columns.iter().enumerate()),
         SortOrder::Desc => Either::Right(sort_columns.iter().enumerate().rev()),
@@ -403,7 +432,7 @@ fn project_search_after_sort_value<V: ElidableU64>(
         let internal_repr = match (&sort_column.1, sort_value) {
             // project to u64 column
             (SortFieldType::U64, SortValue::U64(val)) => {
-                InternalValueRepr::new(*val, idx as u8, sort_order)
+                InternalValueRepr::new(*val, idx as u8, sort_order).into()
             }
             (SortFieldType::U64, SortValue::F64(val)) => {
                 projected_number_internal_repr(f64_to_u64(*val), sort_order, idx as u8)
@@ -413,7 +442,7 @@ fn project_search_after_sort_value<V: ElidableU64>(
             }
             // project to i64 column
             (SortFieldType::I64, SortValue::I64(val)) => {
-                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order)
+                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order).into()
             }
             (SortFieldType::I64, SortValue::F64(val)) => {
                 projected_number_internal_repr(f64_to_i64(*val), sort_order, idx as u8)
@@ -423,7 +452,7 @@ fn project_search_after_sort_value<V: ElidableU64>(
             }
             // project to f64 column
             (SortFieldType::F64, SortValue::F64(val)) => {
-                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order)
+                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order).into()
             }
             (SortFieldType::F64, SortValue::I64(val)) => {
                 projected_number_internal_repr(i64_to_f64(*val), sort_order, idx as u8)
@@ -433,26 +462,32 @@ fn project_search_after_sort_value<V: ElidableU64>(
             }
             // other types
             (SortFieldType::DateTime, SortValue::Datetime(val)) => {
-                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order)
+                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order).into()
             }
             (SortFieldType::Bool, SortValue::Boolean(val)) => {
-                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order)
+                InternalValueRepr::new(val.to_u64(), idx as u8, sort_order).into()
             }
             (SortFieldType::String(str_column), SortValue::Str(val)) => {
                 let term_dict = str_column.dictionary();
                 let hit = term_dict.term_ord_or_next(val.as_str().as_bytes())?;
                 match (hit, sort_order) {
                     (TermOrdHit::Exact(ord), _) => {
-                        InternalValueRepr::new(ord, idx as u8, sort_order)
+                        InternalValueRepr::new(ord, idx as u8, sort_order).into()
                     }
                     (TermOrdHit::Next(ord), SortOrder::Desc) => {
-                        InternalValueRepr::new(ord, idx as u8, sort_order)
+                        ProjectedSearchAfter::preceding_value(InternalValueRepr::new(
+                            ord, idx as u8, sort_order,
+                        ))
                     }
                     (TermOrdHit::Next(0), SortOrder::Asc) => {
-                        InternalValueRepr::new_keep_column(idx as u8, sort_order)
+                        InternalValueRepr::new_keep_column(idx as u8, sort_order).into()
                     }
                     (TermOrdHit::Next(ord), SortOrder::Asc) => {
-                        InternalValueRepr::new(ord - 1, idx as u8, sort_order)
+                        ProjectedSearchAfter::preceding_value(InternalValueRepr::new(
+                            ord - 1,
+                            idx as u8,
+                            sort_order,
+                        ))
                     }
                 }
             }
@@ -486,7 +521,7 @@ fn project_search_after_sort_value<V: ElidableU64>(
                     SortOrder::Asc => column_key > value_key,
                 };
                 if column_comes_after {
-                    InternalValueRepr::new_keep_column(idx as u8, sort_order)
+                    InternalValueRepr::new_keep_column(idx as u8, sort_order).into()
                 } else {
                     continue;
                 }
@@ -494,7 +529,7 @@ fn project_search_after_sort_value<V: ElidableU64>(
         };
         return Ok(internal_repr);
     }
-    Ok(InternalValueRepr::new_skip_all_but_missing())
+    Ok(InternalValueRepr::new_skip_all_but_missing().into())
 }
 
 pub(crate) struct SortingFieldExtractorPair<V1: ElidableU64, V2: ElidableU64> {
@@ -532,8 +567,17 @@ impl<V1: ElidableU64, V2: ElidableU64> SortingFieldExtractorPair<V1, V2> {
             self.first
                 .project_to_internal_search_after(sort_by_value, self.first_order)?
         } else {
-            InternalValueRepr::new_missing()
+            InternalValueRepr::new_missing().into()
         };
+        if !sort_1.exact {
+            // The cursor's first value is absent from this segment and was replaced by the
+            // value preceding it: skip all documents having that value.
+            return Ok(InternalSortValueRepr::new_skip_doc_ids(
+                sort_1.repr,
+                InternalValueRepr::new_skip_all(),
+            ));
+        }
+        let sort_1 = sort_1.repr;
         let sort_2 = if let Some(sort_by_value) = &partial_hit.sort_value2 {
             self.second
                 .as_ref()
@@ -544,8 +588,13 @@ impl<V1: ElidableU64, V2: ElidableU64> SortingFieldExtractorPair<V1, V2> {
                 })?
                 .project_to_internal_search_after(sort_by_value, self.second_order)?
         } else {
-            InternalValueRepr::new_missing()
+            InternalValueRepr::new_missing().into()
         };
+        if !sort_2.exact {
+            // Same as above for the second dimension: the doc id tie-breaker must not apply.
+            return Ok(InternalSortValueRepr::new_skip_doc_ids(sort_1, sort_2.repr));
+        }
+        let sort_2 = sort_2.repr;
 
         let internal_repr = if partial_hit.split_id.is_empty() {
             // When split_id is empty, the search_after is a pure sort-value
