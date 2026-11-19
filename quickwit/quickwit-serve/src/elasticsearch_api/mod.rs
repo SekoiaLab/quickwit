@@ -302,6 +302,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_msearch_api_with_scroll() {
+        let config = Arc::new(NodeConfig::for_test());
+        let mut mock_search_service = MockSearchService::new();
+        mock_search_service
+            .expect_root_search()
+            .with(predicate::function(
+                |search_request: &quickwit_proto::search::SearchRequest| {
+                    (search_request.index_id_patterns == vec!["index-1".to_string()]
+                        && search_request.scroll_ttl_secs == Some(60))
+                        || (search_request.index_id_patterns == vec!["index-2".to_string()]
+                            && search_request.scroll_ttl_secs.is_none())
+                },
+            ))
+            .times(2)
+            .returning(|search_request| {
+                let scroll_id = search_request
+                    .scroll_ttl_secs
+                    .map(|_| "scroll-1".to_string());
+                Ok(quickwit_proto::search::SearchResponse {
+                    scroll_id,
+                    ..Default::default()
+                })
+            });
+        let ingest_router = IngestRouterServiceClient::mocked();
+        let index_service =
+            IndexService::new(metastore_for_test(), StorageResolver::unconfigured());
+        let es_search_api_handler = super::elastic_api_handlers(
+            mock_cluster().await,
+            config,
+            Arc::new(mock_search_service),
+            ingest_service_client(),
+            ingest_router,
+            MetastoreServiceClient::mocked(),
+            index_service,
+            true,
+            false,
+        );
+        let msearch_payload = r#"
+            {"index":"index-1","scroll":"1m"}
+            {"query":{"query_string":{"query":"test"}}}
+            {"index":"index-2"}
+            {"query":{"query_string":{"query":"test"}}}
+            "#;
+        let resp = warp::test::request()
+            .path("/_elastic/_msearch")
+            .method("POST")
+            .body(msearch_payload)
+            .reply(&es_search_api_handler)
+            .await;
+        assert_eq!(resp.status(), 200);
+        let es_msearch_response: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let responses = es_msearch_response
+            .get("responses")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].get("status").unwrap().as_u64().unwrap(), 200);
+        assert_eq!(
+            responses[0].get("_scroll_id").unwrap().as_str().unwrap(),
+            "scroll-1"
+        );
+        assert_eq!(responses[1].get("status").unwrap().as_u64().unwrap(), 200);
+        assert_eq!(responses[1].get("_scroll_id"), None);
+    }
+
+    #[tokio::test]
+    async fn test_msearch_api_return_400_with_invalid_scroll() {
+        let config = Arc::new(NodeConfig::for_test());
+        let mock_search_service = MockSearchService::new();
+        let ingest_router = IngestRouterServiceClient::mocked();
+        let index_service =
+            IndexService::new(metastore_for_test(), StorageResolver::unconfigured());
+        let es_search_api_handler = super::elastic_api_handlers(
+            mock_cluster().await,
+            config,
+            Arc::new(mock_search_service),
+            ingest_service_client(),
+            ingest_router,
+            MetastoreServiceClient::mocked(),
+            index_service,
+            true,
+            false,
+        );
+        let msearch_payload = r#"
+            {"index":"index-1","scroll":"notaduration"}
+            {"query":{"query_string":{"query":"test"}}}
+            "#;
+        let resp = warp::test::request()
+            .path("/_elastic/_msearch")
+            .method("POST")
+            .body(msearch_payload)
+            .reply(&es_search_api_handler)
+            .await;
+        assert_eq!(resp.status(), 400);
+        let es_error: ElasticsearchError = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(
+            es_error.error.reason.unwrap(),
+            "Invalid argument: invalid scroll duration: `notaduration`"
+        );
+    }
+
+    #[tokio::test]
     async fn test_msearch_api_return_400_with_malformed_request_header() {
         let config = Arc::new(NodeConfig::for_test());
         let mock_search_service = MockSearchService::new();

@@ -1,0 +1,67 @@
+# `scroll` is not supported in elasticsearch' msearch.
+# This parameter is quickwit specific: it starts a scroll whose
+# subsequent pages are fetched through `_search/scroll`.
+endpoint: "_msearch"
+engines: ["quickwit"]
+method: POST
+ndjson:
+  - {"index":"gharchive","scroll":"30m"}
+  - {"query":{"match_all":{}},"size":1,"sort":[{"actor.id":{"order":"desc"}}]}
+expected:
+  responses:
+    - status: 200
+      _scroll_id:
+        $expect: "len(val) > 4"
+      hits:
+        hits:
+          - _source: {actor: {login: "miyuotsuki"}}
+        total:
+          value: 100
+          relation: "eq"
+---
+engines: ["quickwit"]
+method: GET
+endpoint: "_search/scroll"
+params:
+  scroll: 30m
+json:
+  scroll_id:
+    $previous: "val[\"responses\"][0][\"_scroll_id\"]"
+expected:
+  _scroll_id:
+    $expect: "len(val) > 4"
+  hits:
+    hits:
+      - _source: {actor: {login: "ScottThiessen"}}
+    total:
+      value: 100
+---
+engines: ["quickwit"]
+method: GET
+endpoint: "_search/scroll"
+params:
+  scroll: 30m
+json:
+  scroll_id:
+    $previous: "val[\"_scroll_id\"]"
+expected:
+  hits:
+    hits:
+      - _source: {actor: {login: "seenajon"}}
+---
+# The scroll TTL is capped: the error is reported for that search only.
+endpoint: "_msearch"
+engines: ["quickwit"]
+method: POST
+ndjson:
+  - {"index":"gharchive","scroll":"31m"}
+  - {"query":{"match_all":{}},"size":1}
+  - {"index":"gharchive"}
+  - {"query":{"match_all":{}},"size":1}
+expected:
+  responses:
+    - status: 400
+      error:
+        reason:
+          $expect: "'1800 secs' in val"
+    - status: 200

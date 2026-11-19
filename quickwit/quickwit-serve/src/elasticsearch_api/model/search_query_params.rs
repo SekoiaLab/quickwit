@@ -339,6 +339,7 @@ impl From<MultiSearchHeader> for SearchQueryParams {
             routing: multi_search_header.routing,
             request_cache: multi_search_header.request_cache,
             preference: multi_search_header.preference,
+            scroll: multi_search_header.scroll,
             ..Default::default()
         }
     }

@@ -103,6 +103,8 @@ pub struct MultiSearchHeader {
     pub request_cache: Option<bool>,
     #[serde(default)]
     pub routing: Option<Vec<String>>,
+    #[serde(default)]
+    pub scroll: Option<String>,
 }
 
 impl MultiSearchHeader {
