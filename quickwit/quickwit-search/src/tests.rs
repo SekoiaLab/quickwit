@@ -2793,3 +2793,208 @@ async fn test_single_node_splits_by_outcome() -> anyhow::Result<()> {
     test_sandbox.assert_quit().await;
     Ok(())
 }
+
+/// Pages through an index with `search_after` while sorting on a datetime field and a UUID
+/// keyword field, building each cursor only from the previous page's sort values (round-tripped
+/// through JSON, as the Elasticsearch-compatible API does). Checks every document comes back
+/// exactly once, in the expected order.
+async fn check_search_after_datetime_and_uuid(
+    fast_precision: &str,
+    sort_datetime_format: Option<SortDatetimeFormat>,
+    datetime_first: bool,
+    ts_order: SortOrder,
+    uuid_order: SortOrder,
+) -> anyhow::Result<()> {
+    let index_id = format!(
+        "search-after-dt-uuid-{fast_precision}-{datetime_first}-{}-{}",
+        ts_order.as_str_name(),
+        uuid_order.as_str_name()
+    )
+    .to_lowercase()
+    .replace('_', "-");
+    let doc_mapping_yaml = format!(
+        r#"
+            field_mappings:
+              - name: ts
+                type: datetime
+                fast: true
+                fast_precision: {fast_precision}
+                input_formats: [rfc3339]
+              - name: uuid
+                type: text
+                tokenizer: raw
+                fast: true
+            timestamp_field: ts
+        "#
+    );
+    let test_sandbox = TestSandbox::create(&index_id, &doc_mapping_yaml, "{}", &["uuid"]).await?;
+
+    // Microsecond offsets chosen to create ties at every precision: same second, same
+    // millisecond, sub-millisecond differences, and values straddling second boundaries.
+    let base_micros: i64 = 1_700_000_000 * 1_000_000;
+    let offsets_micros: [i64; 9] = [
+        0, 1, 500, 1_000, 1_700, 999_999, 1_000_000, 1_000_500, 2_000_000,
+    ];
+    let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next_rand = || {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        rng_state
+    };
+    let mut all_docs: Vec<(i64, String)> = Vec::new();
+    for _split in 0..3 {
+        let mut split_docs = Vec::new();
+        for _ in 0..15 {
+            let ts_micros = base_micros + offsets_micros[(next_rand() >> 33) as usize % 9];
+            let (a, b) = (next_rand(), next_rand());
+            let uuid = format!(
+                "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+                a >> 32,
+                (a >> 16) & 0xffff,
+                a & 0xfff,
+                (b >> 48) & 0xfff,
+                b & 0xffff_ffff_ffff
+            );
+            let ts_rfc3339 = OffsetDateTime::from_unix_timestamp_nanos(ts_micros as i128 * 1_000)
+                .unwrap()
+                .format(&tantivy::time::format_description::well_known::Rfc3339)
+                .unwrap();
+            split_docs.push(json!({"ts": ts_rfc3339, "uuid": uuid}));
+            all_docs.push((ts_micros, uuid));
+        }
+        test_sandbox.add_documents(split_docs).await?;
+    }
+
+    let truncate_micros = match fast_precision {
+        "seconds" => 1_000_000,
+        "milliseconds" => 1_000,
+        "microseconds" => 1,
+        _ => unreachable!(),
+    };
+    let apply_order = |ordering: Ordering, order: SortOrder| match order {
+        SortOrder::Asc => ordering,
+        SortOrder::Desc => ordering.reverse(),
+    };
+    let mut expected = all_docs.clone();
+    expected.sort_by(|(ts_a, uuid_a), (ts_b, uuid_b)| {
+        let ts_cmp = apply_order(
+            (ts_a / truncate_micros).cmp(&(ts_b / truncate_micros)),
+            ts_order,
+        );
+        let uuid_cmp = apply_order(uuid_a.cmp(uuid_b), uuid_order);
+        if datetime_first {
+            ts_cmp.then(uuid_cmp)
+        } else {
+            uuid_cmp.then(ts_cmp)
+        }
+    });
+    let expected_uuids: Vec<String> = expected.into_iter().map(|(_, uuid)| uuid).collect();
+
+    let ts_sort_field = SortField {
+        field_name: "ts".to_string(),
+        sort_order: ts_order as i32,
+        sort_datetime_format: sort_datetime_format.map(|format| format as i32),
+    };
+    let uuid_sort_field = SortField {
+        field_name: "uuid".to_string(),
+        sort_order: uuid_order as i32,
+        sort_datetime_format: None,
+    };
+    let sort_fields = if datetime_first {
+        vec![ts_sort_field, uuid_sort_field]
+    } else {
+        vec![uuid_sort_field, ts_sort_field]
+    };
+
+    let mut search_after: Option<PartialHit> = None;
+    let mut actual_uuids: Vec<String> = Vec::new();
+    for _page in 0..100 {
+        let response = single_node_search(
+            SearchRequest {
+                index_id_patterns: vec![index_id.clone()],
+                query_ast: qast_json_helper("*", &["uuid"]),
+                max_hits: 4,
+                sort_fields: sort_fields.clone(),
+                search_after: search_after.clone(),
+                ..Default::default()
+            },
+            test_sandbox.metastore(),
+            test_sandbox.storage_resolver(),
+        )
+        .await?;
+        let Some(last_hit) = response.hits.last() else {
+            break;
+        };
+        for hit in &response.hits {
+            let partial_hit = hit.partial_hit.as_ref().unwrap();
+            let uuid_sort_value = if datetime_first {
+                &partial_hit.sort_value2
+            } else {
+                &partial_hit.sort_value
+            };
+            let Some(SortValue::Str(uuid)) = uuid_sort_value.clone().unwrap().sort_value else {
+                panic!("expected a string uuid sort value, got {uuid_sort_value:?}");
+            };
+            actual_uuids.push(uuid);
+        }
+        // Mimic an Elasticsearch client: only the sort values travel back, as JSON.
+        let last_partial_hit = last_hit.partial_hit.as_ref().unwrap();
+        let roundtrip = |value: &Option<SortByValue>| {
+            SortByValue::try_from_json(value.clone().unwrap().into_json())
+        };
+        search_after = Some(PartialHit {
+            sort_value: roundtrip(&last_partial_hit.sort_value),
+            sort_value2: roundtrip(&last_partial_hit.sort_value2),
+            ..Default::default()
+        });
+    }
+
+    assert_eq!(
+        actual_uuids, expected_uuids,
+        "precision={fast_precision} datetime_first={datetime_first} ts={ts_order:?} \
+         uuid={uuid_order:?}"
+    );
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_search_after_datetime_and_uuid() -> anyhow::Result<()> {
+    for fast_precision in ["seconds", "milliseconds"] {
+        for datetime_first in [true, false] {
+            for ts_order in [SortOrder::Desc, SortOrder::Asc] {
+                for uuid_order in [SortOrder::Asc, SortOrder::Desc] {
+                    check_search_after_datetime_and_uuid(
+                        fast_precision,
+                        None,
+                        datetime_first,
+                        ts_order,
+                        uuid_order,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// With sub-millisecond fast precision, the default millisecond cursor is lossy (documents get
+/// skipped), so the cursor must be requested in nanoseconds.
+#[tokio::test]
+async fn test_search_after_datetime_microseconds_and_uuid() -> anyhow::Result<()> {
+    for datetime_first in [true, false] {
+        for ts_order in [SortOrder::Desc, SortOrder::Asc] {
+            check_search_after_datetime_and_uuid(
+                "microseconds",
+                Some(SortDatetimeFormat::UnixTimestampNanos),
+                datetime_first,
+                ts_order,
+                SortOrder::Asc,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
