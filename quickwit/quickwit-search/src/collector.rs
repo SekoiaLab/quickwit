@@ -2308,6 +2308,58 @@ mod tests {
         }
     }
 
+    /// The cursor's second value ("c") is absent from the split, so it gets projected onto a
+    /// neighbouring value ("b" or "d") that sorts before it. The cursor carries a split id and doc
+    /// id for which the doc id tie-breaker would keep documents tying with the cursor: documents
+    /// with the neighbouring value must still be skipped.
+    #[test]
+    fn test_single_split_search_after_absent_second_value_with_split_id() {
+        let dataset: Vec<serde_json::Value> = vec![
+            serde_json::json!({"kv": {"n": 1, "s": "a"}}), // doc 0
+            serde_json::json!({"kv": {"n": 1, "s": "b"}}), // doc 1
+            serde_json::json!({"kv": {"n": 1, "s": "d"}}), // doc 2
+            serde_json::json!({"kv": {"n": 2, "s": "a"}}), // doc 3
+            serde_json::json!({"kv": {"n": 0, "s": "z"}}), // doc 4
+        ];
+        let index = make_index(&dataset);
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        // The doc id order follows the first sort order. The split being searched is
+        // "fake_split_id": with a desc doc id order, documents of a split sorting before the
+        // cursor's are kept, and documents of the cursor's split with a smaller doc id are kept
+        // (the other way around for asc).
+        let keep_cursors_desc = [("zzz", 0), ("fake_split_id", 100)];
+        let keep_cursors_asc = [("aaa", 0), ("fake_split_id", 0)];
+        for (sort_str, keep_cursors, expected_order) in [
+            // (2,a) (1,d) | (1,b) (1,a) (0,z)
+            ("kv.n,kv.s", keep_cursors_desc, vec![1, 0, 4]),
+            // (2,a) (1,a) (1,b) | (1,d) (0,z)
+            ("kv.n,-kv.s", keep_cursors_desc, vec![2, 4]),
+            // (0,z) (1,a) (1,b) | (1,d) (2,a)
+            ("-kv.n,-kv.s", keep_cursors_asc, vec![2, 3]),
+            // (0,z) (1,d) | (1,b) (1,a) (2,a)
+            ("-kv.n,kv.s", keep_cursors_asc, vec![1, 0, 3]),
+        ] {
+            for (split_id, doc_id) in keep_cursors {
+                assert_search_after_results(
+                    &searcher,
+                    dataset.len(),
+                    sort_str,
+                    PartialHit {
+                        sort_value: Some(SortValue::I64(1).into()),
+                        sort_value2: Some(SortValue::Str("c".to_string()).into()),
+                        split_id: split_id.to_string(),
+                        segment_ord: 0,
+                        doc_id,
+                    },
+                    &expected_order,
+                    &format!("\"{sort_str}\" split_id={split_id} doc_id={doc_id}"),
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_single_split_search_after_exogeneous_type_with_null() {
         let dataset: Vec<serde_json::Value> = vec![
