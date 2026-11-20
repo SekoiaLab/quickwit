@@ -24,7 +24,6 @@
 #![warn(missing_docs)]
 #![deny(clippy::disallowed_methods)]
 
-mod blocking_storage_directory;
 mod bundle_directory;
 mod caching_directory;
 mod debug_proxy_directory;
@@ -32,7 +31,6 @@ mod hot_directory;
 mod storage_directory;
 mod union_directory;
 
-pub use self::blocking_storage_directory::BlockingStorageDirectory;
 pub use self::bundle_directory::{BundleDirectory, get_hotcache_from_split, read_split_footer};
 pub use self::caching_directory::CachingDirectory;
 pub use self::debug_proxy_directory::{DebugProxyDirectory, ReadOperation};

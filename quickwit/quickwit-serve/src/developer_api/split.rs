@@ -36,7 +36,7 @@ use http_body::Frame;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use quickwit_common::split_file;
-use quickwit_directories::{BlockingStorageDirectory, HotDirectory};
+use quickwit_directories::{HotDirectory, StorageDirectory};
 use quickwit_metastore::{
     IndexMetadataResponseExt, ListSplitsQuery, ListSplitsRequestExt,
     MetastoreServiceStreamSplitsExt, SplitMetadata,
@@ -47,11 +47,12 @@ use quickwit_proto::metastore::{
 };
 use quickwit_storage::{BundleStorage, Storage, StorageError, StorageErrorKind, StorageResolver};
 use serde::{Deserialize, Serialize};
-use tantivy::directory::FileSlice;
-use tantivy::space_usage::SearcherSpaceUsage;
-use tantivy::{Index, ReloadPolicy};
+use tantivy::columnar::{ColumnType, DynamicColumnHandle};
+use tantivy::directory::{CompositeFile, FileSlice};
+use tantivy::index::SegmentComponent;
+use tantivy::schema::FieldType;
+use tantivy::{Index, IndexReader, ReloadPolicy, Searcher, SegmentReader};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::runtime::Handle;
 use tokio::time::Instant;
 use tower::{BoxError, Layer, Service};
 use warp::{Filter, Rejection, Reply};
@@ -179,7 +180,7 @@ pub struct SplitComponentsSpaceUsage {
 }
 
 /// Space usage of a split. Per field sizes do not include the doc store, which is shared by all
-/// the fields.
+/// the fields. The fast fields of a JSON field are summed under the name of the field.
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SplitSpaceUsage {
     pub index_id: String,
@@ -193,54 +194,163 @@ pub struct SplitSpaceUsage {
     pub fields: Vec<FieldSpaceUsage>,
 }
 
-fn summarize_space_usage(
+fn field_space_usage<'a>(
+    fields: &'a mut BTreeMap<String, FieldSpaceUsage>,
+    field_name: &str,
+) -> &'a mut FieldSpaceUsage {
+    fields
+        .entry(field_name.to_string())
+        .or_insert_with(|| FieldSpaceUsage {
+            field: field_name.to_string(),
+            ..Default::default()
+        })
+}
+
+/// Adds the per field sizes of one of the composite files of a segment (term dictionary,
+/// postings, positions or fieldnorms) to `fields`, and returns the size of the file.
+///
+/// Only the footer of the composite file is read, which the hotcache holds.
+fn add_composite_file_space_usage(
+    segment_reader: &SegmentReader,
+    component: SegmentComponent,
+    fields: &mut BTreeMap<String, FieldSpaceUsage>,
+    add: fn(&mut FieldSpaceUsage, u64),
+) -> anyhow::Result<u64> {
+    let file_slice = segment_reader.open_read(component)?;
+    let space_usage = CompositeFile::open(&file_slice)?.space_usage(segment_reader.schema());
+    for field_usage in space_usage.fields() {
+        add(
+            field_space_usage(fields, field_usage.field_name()),
+            field_usage.total().get_bytes(),
+        );
+    }
+    Ok(space_usage.total().get_bytes())
+}
+
+/// Returns the size of the dictionary of a text or bytes fast field column.
+///
+/// Such a column is laid out as `[dictionary][column][dictionary length: u32 LE]` (see
+/// `open_column_bytes` in `tantivy-columnar`): only the last 4 bytes are read, whereas
+/// `DynamicColumnHandle::space_usage` reads the whole column.
+async fn fast_field_dictionary_num_bytes(column_handle: &DynamicColumnHandle) -> io::Result<u64> {
+    let num_bytes = column_handle.num_bytes().get_bytes();
+    if num_bytes < 4 {
+        return Ok(0);
+    }
+    let dictionary_len_bytes = column_handle
+        .file_slice()
+        .slice_from_end(4)
+        .read_bytes_async()
+        .await?;
+    let dictionary_len_array: [u8; 4] = dictionary_len_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| io::Error::other("failed to read the dictionary length"))?;
+    let dictionary_num_bytes = u64::from(u32::from_le_bytes(dictionary_len_array));
+    Ok(dictionary_num_bytes.min(num_bytes))
+}
+
+/// Adds the fast field sizes of a segment to `fields`, and returns their sum.
+///
+/// The hotcache does not hold the list of columns nor the columns themselves: they are read
+/// asynchronously, a few bytes per text column.
+async fn add_fast_fields_space_usage(
+    segment_reader: &SegmentReader,
+    fields: &mut BTreeMap<String, FieldSpaceUsage>,
+) -> anyhow::Result<u64> {
+    let fast_field_readers = segment_reader.fast_fields();
+    let mut total_num_bytes = 0;
+    for (_field, field_entry) in segment_reader.schema().fields() {
+        if !field_entry.is_fast() {
+            continue;
+        }
+        let field_name = field_entry.name();
+        let mut column_handles = fast_field_readers
+            .list_dynamic_column_handles(field_name)
+            .await?;
+        if matches!(field_entry.field_type(), FieldType::JsonObject(_)) {
+            column_handles.extend(
+                fast_field_readers
+                    .list_subpath_dynamic_column_handles(field_name)
+                    .await?,
+            );
+        }
+        for column_handle in column_handles {
+            let num_bytes = column_handle.num_bytes().get_bytes();
+            let dictionary_num_bytes = match column_handle.column_type() {
+                ColumnType::Str | ColumnType::Bytes => {
+                    fast_field_dictionary_num_bytes(&column_handle).await?
+                }
+                _ => 0,
+            };
+            let field = field_space_usage(fields, field_name);
+            field.fast_field += num_bytes;
+            field.fast_field_dictionary += dictionary_num_bytes;
+            field.fast_field_column += num_bytes - dictionary_num_bytes;
+            total_num_bytes += num_bytes;
+        }
+    }
+    Ok(total_num_bytes)
+}
+
+/// Computes the space usage of a split, without `Searcher::space_usage`: tantivy computes it
+/// synchronously and reads every fast field column in full, while the split is in the object
+/// storage and only its hotcache is in memory.
+async fn compute_space_usage(
     index_id: String,
     split_id: String,
     split_num_bytes: u64,
-    space_usage: &SearcherSpaceUsage,
-) -> SplitSpaceUsage {
+    searcher: &Searcher,
+) -> anyhow::Result<SplitSpaceUsage> {
     let mut components = SplitComponentsSpaceUsage::default();
     let mut fields: BTreeMap<String, FieldSpaceUsage> = BTreeMap::new();
     let mut num_docs = 0u64;
 
-    for segment in space_usage.segments() {
-        num_docs += u64::from(segment.num_docs());
-        components.termdict += segment.termdict().total().get_bytes();
-        components.postings += segment.postings().total().get_bytes();
-        components.positions += segment.positions().total().get_bytes();
-        components.fast_fields += segment.fast_fields().total().get_bytes();
-        components.fieldnorms += segment.fieldnorms().total().get_bytes();
-        components.store += segment.store().total().get_bytes();
-        components.deletes += segment.deletes().get_bytes();
-        components.total += segment.total().get_bytes();
-
-        for field_usage in segment.termdict().fields() {
-            field_space_usage(&mut fields, field_usage.field_name()).termdict +=
-                field_usage.total().get_bytes();
-        }
-        for field_usage in segment.postings().fields() {
-            field_space_usage(&mut fields, field_usage.field_name()).postings +=
-                field_usage.total().get_bytes();
-        }
-        for field_usage in segment.positions().fields() {
-            field_space_usage(&mut fields, field_usage.field_name()).positions +=
-                field_usage.total().get_bytes();
-        }
-        for field_usage in segment.fieldnorms().fields() {
-            field_space_usage(&mut fields, field_usage.field_name()).fieldnorms +=
-                field_usage.total().get_bytes();
-        }
-        for field_usage in segment.fast_fields().fields() {
-            let field = field_space_usage(&mut fields, field_usage.field_name());
-            field.fast_field += field_usage.total().get_bytes();
-            if let Some(column_num_bytes) = field_usage.column_num_bytes() {
-                field.fast_field_column += column_num_bytes.get_bytes();
-            }
-            if let Some(dictionary_num_bytes) = field_usage.dictionary_num_bytes() {
-                field.fast_field_dictionary += dictionary_num_bytes.get_bytes();
-            }
-        }
+    for segment_reader in searcher.segment_readers() {
+        num_docs += u64::from(segment_reader.num_docs());
+        components.termdict += add_composite_file_space_usage(
+            segment_reader,
+            SegmentComponent::Terms,
+            &mut fields,
+            |field, num_bytes| field.termdict += num_bytes,
+        )?;
+        components.postings += add_composite_file_space_usage(
+            segment_reader,
+            SegmentComponent::Postings,
+            &mut fields,
+            |field, num_bytes| field.postings += num_bytes,
+        )?;
+        components.positions += add_composite_file_space_usage(
+            segment_reader,
+            SegmentComponent::Positions,
+            &mut fields,
+            |field, num_bytes| field.positions += num_bytes,
+        )?;
+        components.fieldnorms += add_composite_file_space_usage(
+            segment_reader,
+            SegmentComponent::FieldNorms,
+            &mut fields,
+            |field, num_bytes| field.fieldnorms += num_bytes,
+        )?;
+        components.store += segment_reader
+            .get_store_reader(0)?
+            .space_usage()
+            .total()
+            .get_bytes();
+        components.deletes += segment_reader
+            .alive_bitset()
+            .map(|alive_bitset| alive_bitset.space_usage().get_bytes())
+            .unwrap_or_default();
+        components.fast_fields += add_fast_fields_space_usage(segment_reader, &mut fields).await?;
     }
+    components.total = components.termdict
+        + components.postings
+        + components.positions
+        + components.fast_fields
+        + components.fieldnorms
+        + components.store
+        + components.deletes;
+
     let mut fields: Vec<FieldSpaceUsage> = fields
         .into_values()
         .map(|mut field| {
@@ -258,27 +368,15 @@ fn summarize_space_usage(
             .cmp(&left.total)
             .then_with(|| left.field.cmp(&right.field))
     });
-    SplitSpaceUsage {
+    Ok(SplitSpaceUsage {
         index_id,
         split_id,
         num_docs,
-        num_segments: space_usage.segments().len(),
+        num_segments: searcher.segment_readers().len(),
         split_num_bytes,
         components,
         fields,
-    }
-}
-
-fn field_space_usage<'a>(
-    fields: &'a mut BTreeMap<String, FieldSpaceUsage>,
-    field_name: &str,
-) -> &'a mut FieldSpaceUsage {
-    fields
-        .entry(field_name.to_string())
-        .or_insert_with(|| FieldSpaceUsage {
-            field: field_name.to_string(),
-            ..Default::default()
-        })
+    })
 }
 
 async fn split_space_usage(
@@ -305,29 +403,21 @@ async fn split_space_usage(
     )
     .map_err(internal_error("failed to open the split bundle"))?;
 
-    // tantivy computes the space usage synchronously: the reads that the hotcache does not answer
-    // block on the storage, on a thread where blocking is allowed.
-    let runtime_handle = Handle::current();
-    let space_usage = tokio::task::spawn_blocking(move || -> anyhow::Result<SearcherSpaceUsage> {
-        let directory = BlockingStorageDirectory::new(Arc::new(bundle_storage), runtime_handle);
+    // Opening the index only reads from the hotcache.
+    let open_searcher = || -> anyhow::Result<Searcher> {
+        let directory = StorageDirectory::new(Arc::new(bundle_storage));
         let hot_directory = HotDirectory::open(directory, hotcache.read_bytes()?)?;
         let index = Index::open(hot_directory)?;
-        let reader = index
+        let reader: IndexReader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
-        Ok(reader.searcher().space_usage()?)
-    })
-    .await
-    .map_err(|error| SplitApiError::Internal(format!("space usage task failed: {error}")))?
-    .map_err(internal_error("failed to compute the split space usage"))?;
-
-    Ok(summarize_space_usage(
-        index_id,
-        split_id,
-        footer_offsets.end,
-        &space_usage,
-    ))
+        Ok(reader.searcher())
+    };
+    let searcher = open_searcher().map_err(internal_error("failed to open the split"))?;
+    compute_space_usage(index_id, split_id, footer_offsets.end, &searcher)
+        .await
+        .map_err(internal_error("failed to compute the split space usage"))
 }
 
 #[utoipa::path(
@@ -345,8 +435,8 @@ async fn split_space_usage(
 )]
 /// Get the space used by each field and data structure of a split.
 ///
-/// Only the hotcache and the metadata of the split are read from the object storage, not the
-/// whole split.
+/// Besides the hotcache, only the list of fast field columns and 4 bytes per text fast field
+/// column are read from the object storage.
 pub(super) fn split_space_usage_handler(
     metastore: MetastoreServiceClient,
     storage_resolver: StorageResolver,
@@ -646,6 +736,7 @@ mod tests {
     use quickwit_storage::SplitPayloadBuilder;
     use tantivy::directory::MmapDirectory;
     use tantivy::schema::{FAST, STORED, STRING, Schema, TEXT};
+    use tantivy::space_usage::{PerFieldSpaceUsage, SearcherSpaceUsage};
     use tantivy::{IndexWriter, doc};
     use tower::ServiceExt;
 
@@ -654,28 +745,35 @@ mod tests {
     const INDEX_URI: &str = "ram:///indexes/test-index";
 
     /// Builds a split of `num_docs` documents, writes it to the index storage of `resolver`, and
-    /// returns its footer offsets.
+    /// returns its footer offsets, with tantivy's own space usage of the split.
     async fn put_test_split(
         storage_resolver: &StorageResolver,
         split_id: &str,
         num_docs: usize,
-    ) -> Range<u64> {
+    ) -> (Range<u64>, SearcherSpaceUsage) {
         let tempdir = tempfile::tempdir().unwrap();
         let mut schema_builder = Schema::builder();
         let event_id = schema_builder.add_text_field("event.id", STRING | FAST | STORED);
         let message = schema_builder.add_text_field("message", TEXT | STORED);
+        let attributes = schema_builder.add_json_field("attributes", STORED | FAST);
         let index = Index::create_in_dir(tempdir.path(), schema_builder.build()).unwrap();
         let mut index_writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        const COLORS: [&str; 3] = ["red", "green", "blue"];
         for doc_id in 0..num_docs {
             index_writer
                 .add_document(doc!(
                     event_id => format!("event-{doc_id:08}"),
                     message => format!("message number {doc_id}"),
+                    attributes => serde_json::json!({
+                        "color": COLORS[doc_id % COLORS.len()],
+                        "size": doc_id,
+                    }),
                 ))
                 .unwrap();
         }
         index_writer.commit().unwrap();
         index_writer.wait_merging_threads().unwrap();
+        let space_usage = index.reader().unwrap().searcher().space_usage().unwrap();
 
         let mut hotcache = Vec::new();
         write_hotcache(MmapDirectory::open(tempdir.path()).unwrap(), &mut hotcache).unwrap();
@@ -695,7 +793,7 @@ mod tests {
             .put(Path::new(&split_file(split_id)), Box::new(split_payload))
             .await
             .unwrap();
-        footer_range
+        (footer_range, space_usage)
     }
 
     /// Metastore holding the test index and, if given, one split.
@@ -775,7 +873,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_split_space_usage_handler() {
         let storage_resolver = StorageResolver::for_test();
-        let footer_offsets = put_test_split(&storage_resolver, "split-1", 1_000).await;
+        let (footer_offsets, expected) = put_test_split(&storage_resolver, "split-1", 1_000).await;
         let metastore = test_metastore(Some(("split-1", footer_offsets.clone())));
         let handler = split_space_usage_handler(metastore, storage_resolver);
 
@@ -790,16 +888,75 @@ mod tests {
         assert_eq!(space_usage.split_id, "split-1");
         assert_eq!(space_usage.num_docs, 1_000);
         assert_eq!(space_usage.split_num_bytes, footer_offsets.end);
-        assert!(space_usage.components.store > 0);
-        assert!(space_usage.components.total < space_usage.split_num_bytes);
+        assert_eq!(space_usage.num_segments, expected.segments().len());
 
-        let event_id = space_usage
-            .fields
-            .iter()
-            .find(|field| field.field == "event.id")
+        // The sizes match tantivy's `space_usage`, computed with the whole split at hand.
+        let segment = &expected.segments()[0];
+        let components = &space_usage.components;
+        assert_eq!(components.termdict, segment.termdict().total().get_bytes());
+        assert_eq!(components.postings, segment.postings().total().get_bytes());
+        assert_eq!(
+            components.positions,
+            segment.positions().total().get_bytes()
+        );
+        assert_eq!(
+            components.fieldnorms,
+            segment.fieldnorms().total().get_bytes()
+        );
+        assert_eq!(
+            components.fast_fields,
+            segment.fast_fields().total().get_bytes()
+        );
+        assert_eq!(components.store, segment.store().total().get_bytes());
+        assert_eq!(components.total, segment.total().get_bytes());
+        assert!(components.total < space_usage.split_num_bytes);
+
+        let field = |name: &str| {
+            space_usage
+                .fields
+                .iter()
+                .find(|field| field.field == name)
+                .unwrap()
+        };
+        let expected_field = |per_field: &PerFieldSpaceUsage, name: &str| {
+            per_field
+                .fields()
+                .find(|field_usage| field_usage.field_name() == name)
+                .map(|field_usage| field_usage.total().get_bytes())
+                .unwrap_or_default()
+        };
+        let event_id = field("event.id");
+        assert_eq!(
+            event_id.termdict,
+            expected_field(segment.termdict(), "event.id")
+        );
+        assert_eq!(
+            event_id.postings,
+            expected_field(segment.postings(), "event.id")
+        );
+        let expected_event_id_fast_field = segment
+            .fast_fields()
+            .fields()
+            .find(|field_usage| field_usage.field_name() == "event.id")
             .unwrap();
-        assert!(event_id.termdict > 0);
-        assert!(event_id.postings > 0);
+        assert_eq!(
+            event_id.fast_field,
+            expected_event_id_fast_field.total().get_bytes()
+        );
+        assert_eq!(
+            event_id.fast_field_dictionary,
+            expected_event_id_fast_field
+                .dictionary_num_bytes()
+                .unwrap()
+                .get_bytes()
+        );
+        assert_eq!(
+            event_id.fast_field_column,
+            expected_event_id_fast_field
+                .column_num_bytes()
+                .unwrap()
+                .get_bytes()
+        );
         assert!(event_id.fast_field_dictionary > 0);
         assert_eq!(
             event_id.total,
@@ -809,13 +966,25 @@ mod tests {
                 + event_id.fieldnorms
                 + event_id.fast_field
         );
-        let message = space_usage
-            .fields
-            .iter()
-            .find(|field| field.field == "message")
-            .unwrap();
+
+        let message = field("message");
+        assert_eq!(
+            message.positions,
+            expected_field(segment.positions(), "message")
+        );
         assert!(message.positions > 0);
         assert_eq!(message.fast_field, 0);
+
+        // tantivy reports a JSON fast field per path: here they are summed under the field name.
+        let attributes = field("attributes");
+        let expected_attributes_fast_field: u64 = segment
+            .fast_fields()
+            .fields()
+            .filter(|field_usage| field_usage.field_name().starts_with("attributes."))
+            .map(|field_usage| field_usage.total().get_bytes())
+            .sum();
+        assert!(expected_attributes_fast_field > 0);
+        assert_eq!(attributes.fast_field, expected_attributes_fast_field);
     }
 
     #[tokio::test]
@@ -865,7 +1034,7 @@ mod tests {
     #[tokio::test]
     async fn test_split_download_layer() {
         let storage_resolver = StorageResolver::for_test();
-        let footer_offsets = put_test_split(&storage_resolver, "split-1", 100).await;
+        let (footer_offsets, _) = put_test_split(&storage_resolver, "split-1", 100).await;
         let metastore = test_metastore(Some(("split-1", footer_offsets.clone())));
         let storage = storage_resolver
             .resolve(&Uri::for_test(INDEX_URI))
