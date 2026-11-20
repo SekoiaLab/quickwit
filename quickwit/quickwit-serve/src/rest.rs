@@ -308,10 +308,17 @@ pub(crate) async fn start_rest_server(
 
     let service = ServiceBuilder::new()
         .layer(HttpMetricsLayer)
-        // Outside the compression layer: split files are already compressed.
+        .layer(cors)
+        // Inside the CORS layer, outside the compression layer: split files are already
+        // compressed.
         .layer(SplitDownloadLayer::new(
             quickwit_services.metastore_client.clone(),
             quickwit_services.storage_resolver.clone(),
+            quickwit_services
+                .node_config
+                .rest_config
+                .extra_headers
+                .clone(),
         ))
         .layer(
             CompressionLayer::new()
@@ -320,7 +327,6 @@ pub(crate) async fn start_rest_server(
                 .quality(tower_http::CompressionLevel::Fastest)
                 .compress_when(compression_predicate),
         )
-        .layer(cors)
         .service(warp_service);
 
     let rest_listen_addr = tcp_listener.local_addr()?;

@@ -31,7 +31,7 @@ use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::{Stream, TryStreamExt};
 use http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
-use http::{HeaderValue, Method, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body::Frame;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -542,22 +542,26 @@ pub(super) fn split_download_handler() {}
 /// Tower layer serving `GET /api/developer/splits/{index_id}/{split_id}/download` with a streamed
 /// body, and passing every other request to the inner service.
 ///
-/// It goes outside the compression layer: the split file is already compressed, and its
-/// `Content-Length` must stay exact.
+/// It goes inside the CORS layer, but outside the compression layer: the split file is already
+/// compressed, and its `Content-Length` must stay exact. The REST config extra headers are added
+/// by warp to the other responses, so this layer adds them to its own.
 #[derive(Clone)]
 pub(crate) struct SplitDownloadLayer {
     metastore: MetastoreServiceClient,
     storage_resolver: StorageResolver,
+    extra_headers: HeaderMap,
 }
 
 impl SplitDownloadLayer {
     pub(crate) fn new(
         metastore: MetastoreServiceClient,
         storage_resolver: StorageResolver,
+        extra_headers: HeaderMap,
     ) -> Self {
         Self {
             metastore,
             storage_resolver,
+            extra_headers,
         }
     }
 }
@@ -570,6 +574,7 @@ impl<S> Layer<S> for SplitDownloadLayer {
             inner,
             metastore: self.metastore.clone(),
             storage_resolver: self.storage_resolver.clone(),
+            extra_headers: self.extra_headers.clone(),
         }
     }
 }
@@ -579,6 +584,7 @@ pub(crate) struct SplitDownloadService<S> {
     inner: S,
     metastore: MetastoreServiceClient,
     storage_resolver: StorageResolver,
+    extra_headers: HeaderMap,
 }
 
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for SplitDownloadService<S>
@@ -605,11 +611,13 @@ where
             let query = request.uri().query().map(str::to_string);
             let metastore = self.metastore.clone();
             let storage_resolver = self.storage_resolver.clone();
+            let extra_headers = self.extra_headers.clone();
             return Box::pin(async move {
-                let response =
+                let mut response =
                     download_split(index_id, split_id, query, metastore, storage_resolver)
                         .await
                         .unwrap_or_else(error_response);
+                response.headers_mut().extend(extra_headers);
                 Ok(response)
             });
         }
@@ -834,7 +842,9 @@ mod tests {
         let inner = tower::service_fn(|_request: http::Request<String>| async {
             Ok::<_, Infallible>(http::Response::new(Full::new(Bytes::from_static(b"inner"))))
         });
-        SplitDownloadLayer::new(metastore, storage_resolver).layer(inner)
+        let mut extra_headers = HeaderMap::new();
+        extra_headers.insert("x-extra-header", HeaderValue::from_static("extra-value"));
+        SplitDownloadLayer::new(metastore, storage_resolver, extra_headers).layer(inner)
     }
 
     async fn call(
@@ -881,6 +891,7 @@ mod tests {
             "attachment; filename=\"split-1.split\""
         );
         assert_eq!(body.as_ref(), split_bytes.as_slice());
+        assert_eq!(response.headers()["x-extra-header"], "extra-value");
 
         // Default rate.
         let (response, body) = call(
@@ -911,6 +922,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["x-extra-header"], "extra-value");
 
         // Other requests go to the inner service.
         let (response, body) = call(
