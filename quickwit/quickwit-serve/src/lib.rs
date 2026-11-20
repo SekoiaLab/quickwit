@@ -230,6 +230,8 @@ struct QuickwitServices {
     /// the root requests.
     pub search_service: Arc<dyn SearchService>,
 
+    pub storage_resolver: StorageResolver,
+
     pub env_filter_reload_fn: EnvFilterReloadFn,
 
     /// The control plane listens to various events.
@@ -806,6 +808,7 @@ pub async fn serve_quickwit(
         otlp_logs_service_opt,
         otlp_traces_service_opt,
         search_service,
+        storage_resolver,
         env_filter_reload_fn,
     });
     // Setup and start gRPC server.

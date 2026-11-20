@@ -43,7 +43,7 @@ use warp::{Filter, Rejection, Reply, redirect};
 use crate::cluster_api::cluster_handler;
 use crate::decompression::{CorruptedData, UnsupportedEncoding};
 use crate::delete_task_api::delete_task_api_handlers;
-use crate::developer_api::developer_api_routes;
+use crate::developer_api::{SplitDownloadLayer, developer_api_routes};
 use crate::elasticsearch_api::elastic_api_handlers;
 use crate::health_check_api::health_check_handlers;
 use crate::index_api::index_management_handlers;
@@ -268,6 +268,8 @@ pub(crate) async fn start_rest_server(
     let developer_routes = developer_api_routes(
         quickwit_services.cluster.clone(),
         quickwit_services.env_filter_reload_fn.clone(),
+        quickwit_services.metastore_client.clone(),
+        quickwit_services.storage_resolver.clone(),
     )
     .boxed();
 
@@ -306,6 +308,18 @@ pub(crate) async fn start_rest_server(
 
     let service = ServiceBuilder::new()
         .layer(HttpMetricsLayer)
+        .layer(cors)
+        // Inside the CORS layer, outside the compression layer: split files are already
+        // compressed.
+        .layer(SplitDownloadLayer::new(
+            quickwit_services.metastore_client.clone(),
+            quickwit_services.storage_resolver.clone(),
+            quickwit_services
+                .node_config
+                .rest_config
+                .extra_headers
+                .clone(),
+        ))
         .layer(
             CompressionLayer::new()
                 .zstd(true)
@@ -313,7 +327,6 @@ pub(crate) async fn start_rest_server(
                 .quality(tower_http::CompressionLevel::Fastest)
                 .compress_when(compression_predicate),
         )
-        .layer(cors)
         .service(warp_service);
 
     let rest_listen_addr = tcp_listener.local_addr()?;
@@ -967,6 +980,7 @@ mod tests {
             metastore_server_opt: None,
             node_config: Arc::new(node_config.clone()),
             search_service: Arc::new(MockSearchService::new()),
+            storage_resolver: StorageResolver::unconfigured(),
             jaeger_service_opt: None,
             env_filter_reload_fn: crate::do_nothing_env_filter_reload_fn(),
         };
