@@ -28,8 +28,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use futures::future::{BoxFuture, try_join_all};
-use futures::{Stream, TryStreamExt};
+use futures::future::BoxFuture;
+use futures::{Stream, StreamExt, TryStreamExt};
 use http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body::Frame;
@@ -64,6 +64,9 @@ const DEFAULT_DOWNLOAD_MAX_BYTES_PER_SEC: u64 = 125_000_000;
 
 /// Size of the chunks the split download is streamed and throttled with.
 const DOWNLOAD_CHUNK_NUM_BYTES: usize = 1 << 20;
+
+/// Maximum number of concurrent object storage reads of one split space usage request.
+const SPACE_USAGE_MAX_CONCURRENT_READS: usize = 20;
 
 #[derive(Debug)]
 enum SplitApiError {
@@ -259,8 +262,9 @@ async fn add_fast_fields_space_usage(
     fields: &mut BTreeMap<String, FieldSpaceUsage>,
 ) -> anyhow::Result<u64> {
     let fast_field_readers = segment_reader.fast_fields();
-    // Like the search warmups, all the reads are issued at once: the object storage client caps
-    // the number of concurrent requests.
+    // The reads are concurrent, like in the search warmups, but at most
+    // `SPACE_USAGE_MAX_CONCURRENT_READS` at a time: this is a developer endpoint, served by nodes
+    // that also serve searches.
     let list_column_handles_futures = segment_reader
         .schema()
         .fields()
@@ -278,8 +282,12 @@ async fn add_fast_fields_space_usage(
                 );
             }
             anyhow::Ok((field_name, column_handles))
-        });
-    let column_handles_per_field = try_join_all(list_column_handles_futures).await?;
+        })
+        .collect::<Vec<_>>();
+    let column_handles_per_field: Vec<_> = futures::stream::iter(list_column_handles_futures)
+        .buffer_unordered(SPACE_USAGE_MAX_CONCURRENT_READS)
+        .try_collect()
+        .await?;
 
     let column_space_usage_futures = column_handles_per_field
         .iter()
@@ -297,8 +305,12 @@ async fn add_fast_fields_space_usage(
                 _ => 0,
             };
             io::Result::Ok((field_name, num_bytes, dictionary_num_bytes))
-        });
-    let column_space_usages = try_join_all(column_space_usage_futures).await?;
+        })
+        .collect::<Vec<_>>();
+    let column_space_usages: Vec<_> = futures::stream::iter(column_space_usage_futures)
+        .buffer_unordered(SPACE_USAGE_MAX_CONCURRENT_READS)
+        .try_collect()
+        .await?;
 
     let mut total_num_bytes = 0;
     for (field_name, num_bytes, dictionary_num_bytes) in column_space_usages {
