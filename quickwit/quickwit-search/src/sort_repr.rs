@@ -122,6 +122,12 @@ impl<V: ElidableU64> InternalValueRepr<V> {
             SortOrder::Desc => Self(accessor_idx * 2 + 2, V::from_u64(0)),
         }
     }
+    /// A sentinel value that sorts after every document value, including missing ones. Used as
+    /// a search after boundary for a sort dimension, it skips all documents that tie on the
+    /// preceding dimensions.
+    pub fn new_skip_all() -> Self {
+        Self(0, V::from_u64(0))
+    }
     /// A sentinel value that can be instantiated as search after boundary to indicate
     /// that all documents should be skipped.
     pub fn new_skip_all_but_missing() -> Self {
