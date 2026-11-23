@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use once_cell::sync::Lazy;
-use quickwit_common::metrics::{Histogram, IntCounter, new_counter, new_histogram};
+use quickwit_common::metrics::{
+    Histogram, IntCounter, IntCounterVec, new_counter, new_counter_vec, new_histogram,
+};
 
 /// Metrics for the DNS resolution performed when opening a connection to an AWS endpoint.
 ///
@@ -50,3 +52,28 @@ impl Default for DnsMetrics {
 }
 
 pub static DNS_METRICS: Lazy<DnsMetrics> = Lazy::new(DnsMetrics::default);
+
+/// Metrics of the S3 client only, recorded by [`crate::http_client::S3RemoteIpInterceptor`].
+pub struct S3Metrics {
+    pub response_body_num_bytes: IntCounterVec<1>,
+}
+
+impl Default for S3Metrics {
+    fn default() -> Self {
+        S3Metrics {
+            response_body_num_bytes: new_counter_vec(
+                "object_storage_response_body_num_bytes_by_ip",
+                "Bytes of S3 response bodies read by Quickwit, by remote IP of the connection \
+                 that served them. Covers every S3 operation (GetObject bodies dominate). Bytes \
+                 are counted as they are read, so a download dropped midway only counts what was \
+                 read. Beyond a fixed number of distinct IPs per process, new IPs are reported as \
+                 `other`; `unknown` means the connection address was not available.",
+                "storage",
+                &[],
+                ["remote_ip"],
+            ),
+        }
+    }
+}
+
+pub static S3_METRICS: Lazy<S3Metrics> = Lazy::new(S3Metrics::default);

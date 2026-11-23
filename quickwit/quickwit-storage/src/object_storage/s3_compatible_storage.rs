@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use aws_config::timeout::TimeoutConfig;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::config::{Credentials, Region, SharedInterceptor};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
 use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
@@ -36,7 +36,7 @@ use base64::prelude::{BASE64_STANDARD, Engine};
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use once_cell::sync::{Lazy, OnceCell};
-use quickwit_aws::http_client::s3_http_client;
+use quickwit_aws::http_client::{S3RemoteIpInterceptor, s3_http_client};
 use quickwit_aws::retry::AwsRetryable;
 use quickwit_aws::{aws_behavior_version, get_aws_config};
 use quickwit_common::metrics::OwnedGaugeGuard;
@@ -263,6 +263,7 @@ pub async fn create_s3_client(s3_storage_config: &S3StorageConfig) -> S3Client {
     // Records the S3 connection pool's background tasks (socket reads, TLS, HTTP parsing) as
     // `s3` rather than attributing them to whichever caller opened each connection.
     s3_config.set_http_client(aws_config.http_client().map(s3_http_client));
+    s3_config.push_interceptor(SharedInterceptor::new(S3RemoteIpInterceptor));
     s3_config.set_retry_config(aws_config.retry_config().cloned());
     s3_config.set_sleep_impl(aws_config.sleep_impl());
     s3_config.set_stalled_stream_protection(aws_config.stalled_stream_protection());
