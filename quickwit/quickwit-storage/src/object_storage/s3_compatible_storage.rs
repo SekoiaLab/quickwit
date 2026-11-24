@@ -341,9 +341,10 @@ impl S3CompatibleObjectStorage {
     }
 
     /// Applies `timeout_policy` to each attempt to download a slice, response body included. A
-    /// timed-out attempt is retried, `max_num_retries` times at most, like any transient error:
-    /// waiting for a connection permit and the delays between attempts are not counted in the
-    /// timeout. The whole download has a deadline of [`DEADLINE_FACTOR`] times the timeout.
+    /// timed-out attempt is retried, `max_num_retries` times at most, like any transient error,
+    /// then the download fails with [`Retry::TimedOut`]: waiting for a connection permit and the
+    /// delays between attempts are not counted in the timeout. The whole download has a
+    /// deadline of [`DEADLINE_FACTOR`] times the timeout.
     pub fn with_timeout_policy(self, timeout_policy: StorageTimeoutPolicy) -> Self {
         Self {
             timeout_policy: Some(timeout_policy),
@@ -840,7 +841,7 @@ impl S3CompatibleObjectStorage {
                     {
                         Err(Retry::Transient(error))
                     } else {
-                        Err(Retry::Permanent(error))
+                        Err(Retry::TimedOut(error))
                     }
                 })
             });

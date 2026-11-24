@@ -236,8 +236,9 @@ where
 }
 
 /// Runs an object store operation with [`aws_retry`] and records the number of attempts it took,
-/// by outcome: `success`, `exhausted` (every attempt failed with a retryable error),
-/// `permanent_error`, `cancelled_during_attempt` or `cancelled_during_backoff`.
+/// by outcome: `success`, `timed_out` (the attempts timed out too many times, see
+/// [`quickwit_common::retry::Retry::TimedOut`]), `exhausted` (every attempt failed with a
+/// retryable error), `permanent_error`, `cancelled_during_attempt` or `cancelled_during_backoff`.
 ///
 /// The cancellation outcomes record operations dropped by the caller, for instance on a timeout.
 /// A cancellation while waiting between two attempts is not visible in the request metrics.
@@ -264,6 +265,7 @@ where
     .await;
     attempts_tracker.outcome_opt = Some(match &result {
         Ok(_) => "success",
+        Err(error) if error.is_timeout() => "timed_out",
         Err(error) if error.is_retryable() => "exhausted",
         Err(_) => "permanent_error",
     });
@@ -768,11 +770,16 @@ mod tests {
     enum TestError {
         Retryable,
         Permanent,
+        TimedOut,
     }
 
     impl AwsRetryable for TestError {
         fn is_retryable(&self) -> bool {
             matches!(self, TestError::Retryable)
+        }
+
+        fn is_timeout(&self) -> bool {
+            matches!(self, TestError::TimedOut)
         }
     }
 
@@ -851,6 +858,22 @@ mod tests {
                 &retry_params,
                 ActionLabel::ListObjects,
                 fail_then_succeed(usize::MAX, || TestError::Permanent),
+            )
+            .await
+            .unwrap_err();
+        })
+        .await;
+        assert_eq!(recorded, (1, 1.0));
+    }
+
+    #[tokio::test]
+    async fn test_aws_retry_with_metrics_timed_out() {
+        let retry_params = RetryParams::for_test();
+        let recorded = record_operation("timed_out", async {
+            aws_retry_with_metrics(
+                &retry_params,
+                ActionLabel::ListObjects,
+                fail_then_succeed(usize::MAX, || TestError::TimedOut),
             )
             .await
             .unwrap_err();
