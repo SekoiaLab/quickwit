@@ -15,9 +15,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{fmt, io};
 
@@ -35,19 +33,17 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectI
 use base64::prelude::{BASE64_STANDARD, Engine};
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::OnceCell;
 use quickwit_aws::http_client::s3_http_client;
 use quickwit_aws::retry::AwsRetryable;
 use quickwit_aws::{aws_behavior_version, get_aws_config};
-use quickwit_common::metrics::OwnedGaugeGuard;
 use quickwit_common::retry::{Retry, RetryParams};
 use quickwit_common::thread_pool::with_priority::ThreadPoolWithPriority;
 use quickwit_common::uri::Uri;
 use quickwit_common::{chunk_range, into_u64_range, rate_limited_warn};
 use quickwit_config::{S3EncryptionConfig, S3StorageConfig, StorageTimeoutPolicy};
 use regex::Regex;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, instrument, warn};
 
 use crate::metrics::{STORAGE_METRICS, object_storage_get_slice_in_flight_guards};
@@ -56,104 +52,15 @@ use crate::metrics_wrappers::{
     collect_with_download_metrics, copy_with_download_metrics,
 };
 use crate::object_storage::MultiPartPolicy;
+use crate::object_storage::download_limiter::{
+    GetObjectAdmission, admit_get_object, validate_download_limits,
+};
 use crate::stable_deref_bytes::into_owned_bytes;
 use crate::storage::SendableAsync;
 use crate::{
     BulkDeleteError, DeleteFailure, OwnedBytes, Storage, StorageError, StorageErrorKind,
     StorageResolverError, StorageResult,
 };
-
-const MAX_GET_OBJECT_CONNECTIONS_ENV_KEY: &str = "QW_S3_MAX_GET_OBJECT_CONNECTIONS";
-
-/// Maximum number of GetObject attempts in flight at any time. Unlimited when
-/// `QW_S3_MAX_GET_OBJECT_CONNECTIONS` is not set. An invalid value is reported as an error
-/// when the storage is resolved, see [`S3CompatibleObjectStorage::from_uri_and_client`].
-static MAX_GET_OBJECT_CONNECTIONS: Lazy<Result<usize, String>> = Lazy::new(|| {
-    let value_opt = std::env::var(MAX_GET_OBJECT_CONNECTIONS_ENV_KEY).ok();
-    let max_connections_res = parse_max_get_object_connections(value_opt.as_deref());
-    if let (Some(_), Ok(max_connections)) = (&value_opt, &max_connections_res) {
-        info!(
-            max_connections,
-            "using environment variable `{MAX_GET_OBJECT_CONNECTIONS_ENV_KEY}` value"
-        );
-    }
-    max_connections_res
-});
-
-fn parse_max_get_object_connections(value_opt: Option<&str>) -> Result<usize, String> {
-    let Some(value_str) = value_opt else {
-        return Ok(Semaphore::MAX_PERMITS);
-    };
-    match value_str.trim().parse::<usize>() {
-        Ok(max_connections) if (1..=Semaphore::MAX_PERMITS).contains(&max_connections) => {
-            Ok(max_connections)
-        }
-        _ => Err(format!(
-            "environment variable `{MAX_GET_OBJECT_CONNECTIONS_ENV_KEY}` must be an integer \
-             between 1 and {}, got `{value_str}`",
-            Semaphore::MAX_PERMITS
-        )),
-    }
-}
-
-/// Semaphore limiting the number of GetObject attempts in flight at any time.
-static GET_OBJECT_CONNECTION_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| {
-    let num_permits = MAX_GET_OBJECT_CONNECTIONS
-        .clone()
-        .expect("the GetObject connection limit should be validated when resolving the storage");
-    Semaphore::new(num_permits)
-});
-
-/// A permit from `GET_OBJECT_CONNECTION_SEMAPHORE`. It must be held until the response body
-/// has been fully read or dropped.
-struct GetObjectConnectionPermit {
-    _permit: tokio::sync::SemaphorePermit<'static>,
-    _in_use_guard: OwnedGaugeGuard,
-}
-
-/// Acquires a connection permit for a GetObject request to `bucket`. The permits are shared by
-/// all buckets; the gauges are labelled by bucket to tell which ones hold or wait for them.
-async fn acquire_get_object_connection_permit(bucket: &str) -> GetObjectConnectionPermit {
-    let mut waiting_guard = OwnedGaugeGuard::from_gauge(
-        STORAGE_METRICS
-            .object_storage_get_object_connections_waiting
-            .with_label_values([bucket]),
-    );
-    waiting_guard.add(1);
-    let permit = GET_OBJECT_CONNECTION_SEMAPHORE
-        .acquire()
-        .await
-        .expect("the semaphore should never be closed");
-    drop(waiting_guard);
-    let mut in_use_guard = OwnedGaugeGuard::from_gauge(
-        STORAGE_METRICS
-            .object_storage_get_object_connections_in_use
-            .with_label_values([bucket]),
-    );
-    in_use_guard.add(1);
-    GetObjectConnectionPermit {
-        _permit: permit,
-        _in_use_guard: in_use_guard,
-    }
-}
-
-/// Wrap the async read handle together with the connection permit to keep the permit alive
-/// until the handle is dropped
-struct S3AsyncRead<T: AsyncRead + Send + Unpin> {
-    read: T,
-    _connection_permit: GetObjectConnectionPermit,
-}
-
-impl<T: AsyncRead + Send + Unpin> AsyncRead for S3AsyncRead<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let self_unpin = self.get_mut();
-        Pin::new(&mut self_unpin.read).poll_read(cx, buf)
-    }
-}
 
 /// Classifies an SDK error for the retry loop: throttled, transient or permanent.
 fn into_retry<E>(sdk_error: SdkError<E>) -> Retry<StorageError>
@@ -301,9 +208,7 @@ impl S3CompatibleObjectStorage {
             let message = format!("failed to extract bucket name from S3 URI: {uri}");
             StorageResolverError::InvalidUri(message)
         })?;
-        MAX_GET_OBJECT_CONNECTIONS
-            .as_ref()
-            .map_err(|message| StorageResolverError::InvalidConfig(message.clone()))?;
+        validate_download_limits().map_err(StorageResolverError::InvalidConfig)?;
         let retry_params = RetryParams::aggressive();
         let disable_multi_object_delete = s3_storage_config.disable_multi_object_delete;
         let disable_multipart_upload = s3_storage_config.disable_multipart_upload;
@@ -735,23 +640,13 @@ impl S3CompatibleObjectStorage {
         Ok(())
     }
 
-    /// Sends a single GetObject request. The returned permit must be kept alive until the body
-    /// has been consumed.
-    async fn get_object(
-        &self,
-        path: &Path,
-        range_opt: Option<Range<usize>>,
-    ) -> Result<(GetObjectOutput, GetObjectConnectionPermit), SdkError<GetObjectError>> {
-        let connection_permit = acquire_get_object_connection_permit(&self.bucket).await;
-        let get_object_output = self.send_get_object(path, range_opt).await?;
-        Ok((get_object_output, connection_permit))
-    }
-
-    /// Sends a single GetObject request, on a connection permit acquired by the caller.
+    /// Sends a single GetObject request, admitted by the caller. The body of the response holds
+    /// the admission, see [`GetObjectAdmission::into_body`].
     async fn send_get_object(
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
+        admission: GetObjectAdmission,
     ) -> Result<GetObjectOutput, SdkError<GetObjectError>> {
         let key = self.key(path);
         let range_str = range_opt.map(|range| format!("bytes={}-{}", range.start, range.end - 1));
@@ -775,10 +670,13 @@ impl S3CompatibleObjectStorage {
             }
             None => {}
         }
-        req_builder
+        let mut get_object_output = req_builder
             .send()
             .with_count_and_duration_metrics(ActionLabel::GetObject, &self.bucket)
-            .await
+            .await?;
+        let body = std::mem::take(&mut get_object_output.body);
+        get_object_output.body = admission.into_body(body);
+        Ok(get_object_output)
     }
 
     /// A single attempt of [`Self::get_to_bytes`]. The body is read within the attempt: a
@@ -788,7 +686,7 @@ impl S3CompatibleObjectStorage {
         &self,
         path: &Path,
         range_opt: Option<Range<usize>>,
-        _connection_permit: GetObjectConnectionPermit,
+        admission: GetObjectAdmission,
     ) -> Result<Bytes, Retry<StorageError>> {
         let download_kind = if range_opt.is_some() {
             DownloadKind::Slice
@@ -796,7 +694,7 @@ impl S3CompatibleObjectStorage {
             DownloadKind::Object
         };
         let get_object_output = self
-            .send_get_object(path, range_opt.clone())
+            .send_get_object(path, range_opt.clone(), admission)
             .await
             .map_err(into_retry)?;
         // only record ranged get request as being in flight
@@ -823,10 +721,10 @@ impl S3CompatibleObjectStorage {
         let last_attempt_timed_out = AtomicBool::new(false);
         let retry_fut =
             aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
-                // Waiting for a connection permit is local queueing: the attempt timeout starts
-                // once the permit is acquired.
-                let connection_permit = acquire_get_object_connection_permit(&self.bucket).await;
-                let attempt = self.get_to_bytes_attempt(path, range_opt.clone(), connection_permit);
+                // Waiting for admission is local queueing: the attempt timeout starts once the
+                // request is admitted.
+                let admission = admit_get_object(&self.bucket, range_opt.as_ref()).await;
+                let attempt = self.get_to_bytes_attempt(path, range_opt.clone(), admission);
                 let Some((range, timeout_policy)) = slice_timeout_policy_opt else {
                     return attempt.await;
                 };
@@ -1027,16 +925,15 @@ impl Storage for S3CompatibleObjectStorage {
     }
 
     async fn copy_to(&self, path: &Path, output: &mut dyn SendableAsync) -> StorageResult<()> {
-        let (get_object_output, connection_permit) =
-            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || {
-                self.get_object(path, None)
+        let get_object_output =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
+                let admission = admit_get_object(&self.bucket, None).await;
+                self.send_get_object(path, None, admission).await
             })
             .await?;
-        let mut body_read = BufReader::new(get_object_output.body.into_async_read());
-        copy_with_download_metrics(&mut body_read, output, DownloadKind::Object).await?;
-        // The body has been fully read: release the connection before flushing the output.
-        drop(body_read);
-        drop(connection_permit);
+        let body_read = BufReader::new(get_object_output.body.into_async_read());
+        // Takes the body: its connection permit is released before the output is flushed.
+        copy_with_download_metrics(body_read, output, DownloadKind::Object).await?;
         output.flush().await?;
         Ok(())
     }
@@ -1092,15 +989,14 @@ impl Storage for S3CompatibleObjectStorage {
         path: &Path,
         range: Range<usize>,
     ) -> crate::StorageResult<Box<dyn AsyncRead + Send + Unpin>> {
-        let (get_object_output, connection_permit) =
-            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || {
-                self.get_object(path, Some(range.clone()))
+        let get_object_output =
+            aws_retry_with_metrics(&self.retry_params, ActionLabel::GetObject, || async {
+                let admission = admit_get_object(&self.bucket, Some(&range)).await;
+                self.send_get_object(path, Some(range.clone()), admission)
+                    .await
             })
             .await?;
-        Ok(Box::new(S3AsyncRead {
-            read: get_object_output.body.into_async_read(),
-            _connection_permit: connection_permit,
-        }))
+        Ok(Box::new(get_object_output.body.into_async_read()))
     }
 
     #[instrument(level = "debug", skip(self), fields(num_bytes_fetched))]
@@ -1181,41 +1077,6 @@ mod tests {
         assert_eq!(md5, md5::compute(data));
 
         Ok(())
-    }
-
-    #[test]
-    fn test_parse_max_get_object_connections() {
-        assert_eq!(
-            parse_max_get_object_connections(None),
-            Ok(Semaphore::MAX_PERMITS)
-        );
-        assert_eq!(parse_max_get_object_connections(Some("2048")), Ok(2048));
-        assert_eq!(parse_max_get_object_connections(Some(" 1 ")), Ok(1));
-        let max_permits = Semaphore::MAX_PERMITS.to_string();
-        assert_eq!(
-            parse_max_get_object_connections(Some(&max_permits)),
-            Ok(Semaphore::MAX_PERMITS)
-        );
-        let too_many_permits = (Semaphore::MAX_PERMITS + 1).to_string();
-        for invalid_value in ["0", "-1", "", "abc", "1.5", too_many_permits.as_str()] {
-            parse_max_get_object_connections(Some(invalid_value)).unwrap_err();
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_object_connection_permit_gauges_by_bucket() {
-        // Buckets of their own: the gauges are shared with the other tests.
-        let in_use = |bucket| {
-            STORAGE_METRICS
-                .object_storage_get_object_connections_in_use
-                .with_label_values([bucket])
-                .get()
-        };
-        let permit = acquire_get_object_connection_permit("test-permit-gauges-a").await;
-        assert_eq!(in_use("test-permit-gauges-a"), 1);
-        assert_eq!(in_use("test-permit-gauges-b"), 0);
-        drop(permit);
-        assert_eq!(in_use("test-permit-gauges-a"), 0);
     }
 
     #[test]

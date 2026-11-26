@@ -405,9 +405,8 @@ impl Storage for AzureBlobStorage {
                 .map_err(FutureError::other)
                 .into_async_read()
                 .compat();
-            let mut body_stream_reader = BufReader::new(chunk_response_body_stream);
-            copy_with_download_metrics(&mut body_stream_reader, output, DownloadKind::Object)
-                .await?;
+            let body_stream_reader = BufReader::new(chunk_response_body_stream);
+            copy_with_download_metrics(body_stream_reader, output, DownloadKind::Object).await?;
         }
         output.flush().await?;
         Ok(())

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod download_limiter;
 mod error;
 
 mod s3_compatible_storage;

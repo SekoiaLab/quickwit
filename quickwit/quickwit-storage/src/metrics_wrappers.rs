@@ -470,7 +470,7 @@ impl Drop for DownloadMetricsGuard {
 #[pin_project(PinnedDrop)]
 struct DownloadMetricsWrapper<'a, R, W>
 where
-    R: AsyncBufRead + Unpin + ?Sized,
+    R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + ?Sized,
 {
     #[pin]
@@ -481,7 +481,7 @@ where
 #[pinned_drop]
 impl<'a, R, W> PinnedDrop for DownloadMetricsWrapper<'a, R, W>
 where
-    R: AsyncBufRead + Unpin + ?Sized,
+    R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + ?Sized,
 {
     fn drop(self: Pin<&mut Self>) {
@@ -495,7 +495,7 @@ where
 
 impl<'a, R, W> Future for DownloadMetricsWrapper<'a, R, W>
 where
-    R: AsyncBufRead + Unpin + ?Sized,
+    R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + ?Sized,
 {
     type Output = io::Result<u64>;
@@ -511,13 +511,15 @@ where
     }
 }
 
-pub async fn copy_with_download_metrics<'a, R, W>(
-    reader: &'a mut R,
-    writer: &'a mut W,
+/// Copies `reader` into `writer`, then drops `reader`: whatever it holds, such as the connection
+/// of a response body, is released before the function returns.
+pub async fn copy_with_download_metrics<R, W>(
+    reader: R,
+    writer: &mut W,
     kind: DownloadKind,
 ) -> io::Result<u64>
 where
-    R: AsyncBufRead + Unpin + ?Sized,
+    R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + ?Sized,
 {
     DownloadMetricsWrapper {
@@ -637,15 +639,15 @@ mod copy_buf {
 
     #[derive(Debug)]
     #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct CopyBuf<'a, R: ?Sized, W: ?Sized> {
-        pub reader: &'a mut R,
+    pub struct CopyBuf<'a, R, W: ?Sized> {
+        pub reader: R,
         pub writer: &'a mut W,
         pub amt: u64,
     }
 
     impl<R, W> Future for CopyBuf<'_, R, W>
     where
-        R: AsyncBufRead + Unpin + ?Sized,
+        R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin + ?Sized,
     {
         type Output = io::Result<u64>;
@@ -653,7 +655,7 @@ mod copy_buf {
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             loop {
                 let me = &mut *self;
-                let buffer = ready!(Pin::new(&mut *me.reader).poll_fill_buf(cx))?;
+                let buffer = ready!(Pin::new(&mut me.reader).poll_fill_buf(cx))?;
                 if buffer.is_empty() {
                     ready!(Pin::new(&mut self.writer).poll_flush(cx))?;
                     return Poll::Ready(Ok(self.amt));
@@ -664,7 +666,7 @@ mod copy_buf {
                     return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                 }
                 self.amt += i as u64;
-                Pin::new(&mut *self.reader).consume(i);
+                Pin::new(&mut self.reader).consume(i);
             }
         }
     }

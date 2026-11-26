@@ -18,6 +18,7 @@ bytes = { workspace = true }
 bytesize = { workspace = true }
 fnv = { workspace = true }
 futures = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true}
 hyper = { workspace = true }
 itertools = { workspace = true }
@@ -61,6 +62,7 @@ reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 http = { workspace = true }
+libc = { workspace = true }
 mockall = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
