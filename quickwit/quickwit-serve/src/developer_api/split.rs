@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body::Frame;
@@ -64,6 +64,9 @@ const DEFAULT_DOWNLOAD_MAX_BYTES_PER_SEC: u64 = 125_000_000;
 
 /// Size of the chunks the split download is streamed and throttled with.
 const DOWNLOAD_CHUNK_NUM_BYTES: usize = 1 << 20;
+
+/// Maximum number of concurrent object storage reads of one split space usage request.
+const SPACE_USAGE_MAX_CONCURRENT_READS: usize = 20;
 
 #[derive(Debug)]
 enum SplitApiError {
@@ -259,36 +262,63 @@ async fn add_fast_fields_space_usage(
     fields: &mut BTreeMap<String, FieldSpaceUsage>,
 ) -> anyhow::Result<u64> {
     let fast_field_readers = segment_reader.fast_fields();
-    let mut total_num_bytes = 0;
-    for (_field, field_entry) in segment_reader.schema().fields() {
-        if !field_entry.is_fast() {
-            continue;
-        }
-        let field_name = field_entry.name();
-        let mut column_handles = fast_field_readers
-            .list_dynamic_column_handles(field_name)
-            .await?;
-        if matches!(field_entry.field_type(), FieldType::JsonObject(_)) {
-            column_handles.extend(
-                fast_field_readers
-                    .list_subpath_dynamic_column_handles(field_name)
-                    .await?,
-            );
-        }
-        for column_handle in column_handles {
+    // The reads are concurrent, like in the search warmups, but at most
+    // `SPACE_USAGE_MAX_CONCURRENT_READS` at a time: this is a developer endpoint, served by nodes
+    // that also serve searches.
+    let list_column_handles_futures = segment_reader
+        .schema()
+        .fields()
+        .filter(|(_field, field_entry)| field_entry.is_fast())
+        .map(|(_field, field_entry)| async move {
+            let field_name = field_entry.name();
+            let mut column_handles = fast_field_readers
+                .list_dynamic_column_handles(field_name)
+                .await?;
+            if matches!(field_entry.field_type(), FieldType::JsonObject(_)) {
+                column_handles.extend(
+                    fast_field_readers
+                        .list_subpath_dynamic_column_handles(field_name)
+                        .await?,
+                );
+            }
+            anyhow::Ok((field_name, column_handles))
+        })
+        .collect::<Vec<_>>();
+    let column_handles_per_field: Vec<_> = futures::stream::iter(list_column_handles_futures)
+        .buffer_unordered(SPACE_USAGE_MAX_CONCURRENT_READS)
+        .try_collect()
+        .await?;
+
+    let column_space_usage_futures = column_handles_per_field
+        .iter()
+        .flat_map(|(field_name, column_handles)| {
+            column_handles
+                .iter()
+                .map(move |column_handle| (*field_name, column_handle))
+        })
+        .map(|(field_name, column_handle)| async move {
             let num_bytes = column_handle.num_bytes().get_bytes();
             let dictionary_num_bytes = match column_handle.column_type() {
                 ColumnType::Str | ColumnType::Bytes => {
-                    fast_field_dictionary_num_bytes(&column_handle).await?
+                    fast_field_dictionary_num_bytes(column_handle).await?
                 }
                 _ => 0,
             };
-            let field = field_space_usage(fields, field_name);
-            field.fast_field += num_bytes;
-            field.fast_field_dictionary += dictionary_num_bytes;
-            field.fast_field_column += num_bytes - dictionary_num_bytes;
-            total_num_bytes += num_bytes;
-        }
+            io::Result::Ok((field_name, num_bytes, dictionary_num_bytes))
+        })
+        .collect::<Vec<_>>();
+    let column_space_usages: Vec<_> = futures::stream::iter(column_space_usage_futures)
+        .buffer_unordered(SPACE_USAGE_MAX_CONCURRENT_READS)
+        .try_collect()
+        .await?;
+
+    let mut total_num_bytes = 0;
+    for (field_name, num_bytes, dictionary_num_bytes) in column_space_usages {
+        let field = field_space_usage(fields, field_name);
+        field.fast_field += num_bytes;
+        field.fast_field_dictionary += dictionary_num_bytes;
+        field.fast_field_column += num_bytes - dictionary_num_bytes;
+        total_num_bytes += num_bytes;
     }
     Ok(total_num_bytes)
 }
