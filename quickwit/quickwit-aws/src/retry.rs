@@ -23,14 +23,31 @@ pub trait AwsRetryable {
     fn is_retryable(&self) -> bool {
         false
     }
+
+    /// Whether the error signals that the service is throttling requests, see
+    /// [`Retryable::is_throttling`].
+    fn is_throttling(&self) -> bool {
+        false
+    }
+
+    /// Whether the operation gave up because its attempts timed out, see
+    /// [`Retryable::is_timeout`].
+    fn is_timeout(&self) -> bool {
+        false
+    }
 }
 
 impl<E> AwsRetryable for Retry<E> {
     fn is_retryable(&self) -> bool {
-        match self {
-            Retry::Transient(_) => true,
-            Retry::Permanent(_) => false,
-        }
+        Retryable::is_retryable(self)
+    }
+
+    fn is_throttling(&self) -> bool {
+        Retryable::is_throttling(self)
+    }
+
+    fn is_timeout(&self) -> bool {
+        Retryable::is_timeout(self)
     }
 }
 
@@ -42,6 +59,10 @@ where E: AwsRetryable
 {
     fn is_retryable(&self) -> bool {
         self.0.is_retryable()
+    }
+
+    fn is_throttling(&self) -> bool {
+        self.0.is_throttling()
     }
 }
 

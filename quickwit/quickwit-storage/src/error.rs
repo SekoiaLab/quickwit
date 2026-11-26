@@ -81,8 +81,8 @@ impl From<StorageError> for io::Error {
             StorageErrorKind::NotFound => io::ErrorKind::NotFound,
             _ => io::ErrorKind::Other,
         };
-        // TODO: This is swallowing the context of the source error.
-        io::Error::new(io_error_kind, storage_err.source.to_string())
+        // The alternate format keeps the whole chain of causes, not only the outermost context.
+        io::Error::new(io_error_kind, format!("{:#}", storage_err.source))
     }
 }
 
@@ -194,5 +194,23 @@ impl fmt::Display for BulkDeleteError {
             self.unattempted.len()
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_io_error_from_storage_error_keeps_the_causes() {
+        let storage_error = StorageErrorKind::Timeout.with_error(
+            anyhow::anyhow!("internal timeout on get_slice").context("get_slice failed"),
+        );
+        let io_error = io::Error::from(storage_error);
+        assert_eq!(io_error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            io_error.to_string(),
+            "get_slice failed: internal timeout on get_slice"
+        );
     }
 }

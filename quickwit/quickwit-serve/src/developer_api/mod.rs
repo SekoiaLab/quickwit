@@ -20,32 +20,52 @@ mod log_level;
 #[cfg_attr(not(feature = "pprof"), path = "pprof_disabled.rs")]
 mod pprof;
 mod server;
+mod split;
 
 use debug::debug_handler;
 use heap_prof::heap_prof_handlers;
 use log_level::log_level_handler;
 use pprof::pprof_handlers;
 use quickwit_cluster::Cluster;
+use quickwit_proto::metastore::MetastoreServiceClient;
+use quickwit_storage::StorageResolver;
 pub(crate) use server::DeveloperApiServer;
+pub(crate) use split::SplitDownloadLayer;
+use split::split_space_usage_handler;
 use warp::{Filter, Rejection};
 
 use crate::EnvFilterReloadFn;
 use crate::rest::recover_fn;
 
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(debug::debug_handler, log_level::log_level_handler))]
+#[openapi(
+    paths(
+        debug::debug_handler,
+        log_level::log_level_handler,
+        split::split_space_usage_handler,
+        split::split_download_handler,
+    ),
+    components(schemas(
+        split::SplitSpaceUsage,
+        split::SplitComponentsSpaceUsage,
+        split::FieldSpaceUsage,
+    ))
+)]
 pub struct DeveloperApi;
 
 pub(crate) fn developer_api_routes(
     cluster: Cluster,
     env_filter_reload_fn: EnvFilterReloadFn,
+    metastore: MetastoreServiceClient,
+    storage_resolver: StorageResolver,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     warp::path!("api" / "developer" / ..)
         .and(
             debug_handler(cluster.clone())
                 .or(log_level_handler(env_filter_reload_fn.clone()).boxed())
                 .or(pprof_handlers())
-                .or(heap_prof_handlers()),
+                .or(heap_prof_handlers())
+                .or(split_space_usage_handler(metastore, storage_resolver).boxed()),
         )
         .recover(recover_fn)
 }

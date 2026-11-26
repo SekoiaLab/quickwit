@@ -26,7 +26,9 @@ use crate::AzureBlobStorageFactory;
 use crate::GoogleCloudStorageFactory;
 use crate::local_file_storage::LocalFileStorageFactory;
 use crate::ram_storage::RamStorageFactory;
-use crate::{S3CompatibleObjectStorageFactory, Storage, StorageFactory, StorageResolverError};
+use crate::{
+    S3CompatibleObjectStorageFactory, S3NodeOptions, Storage, StorageFactory, StorageResolverError,
+};
 
 /// Returns the [`Storage`] instance associated with the protocol of a URI. The actual creation of
 /// storage objects is delegated to pre-registered [`StorageFactory`]. The resolver is only
@@ -86,12 +88,23 @@ impl StorageResolver {
 
     /// Creates and returns a [`StorageResolver`].
     pub fn configured(storage_configs: &StorageConfigs) -> Self {
+        Self::configured_with_s3_node_options(storage_configs, S3NodeOptions::default())
+    }
+
+    /// Same as [`StorageResolver::configured`], with S3 storage settings that are properties of
+    /// the node building the resolver rather than of the storage configs.
+    pub fn configured_with_s3_node_options(
+        storage_configs: &StorageConfigs,
+        s3_node_options: S3NodeOptions,
+    ) -> Self {
+        let s3_storage_factory = S3CompatibleObjectStorageFactory::new(
+            storage_configs.find_s3().cloned().unwrap_or_default(),
+        )
+        .with_node_options(s3_node_options);
         let mut builder = StorageResolver::builder()
             .register(LocalFileStorageFactory)
             .register(RamStorageFactory::default())
-            .register(S3CompatibleObjectStorageFactory::new(
-                storage_configs.find_s3().cloned().unwrap_or_default(),
-            ));
+            .register(s3_storage_factory);
         #[cfg(feature = "azure")]
         {
             builder = builder.register(AzureBlobStorageFactory::new(

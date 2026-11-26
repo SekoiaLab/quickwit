@@ -459,6 +459,29 @@ mod tests {
     }
 
     #[test]
+    fn test_user_input_query_multiline() {
+        let parse = |user_text: &str| {
+            UserInputQuery {
+                user_text: user_text.to_string(),
+                default_fields: None,
+                default_operator: BooleanOperand::And,
+                lenient: false,
+            }
+            .parse_user_query(&[])
+            .unwrap()
+        };
+        // operator alone on its line: used to fail to parse
+        assert_eq!(parse("a:1\r\n  OR\r\n  b:2"), parse("a:1 OR b:2"));
+        // operator glued to a parenthesis: used to fail to parse
+        assert_eq!(
+            parse("a:1 AND(b:2 OR(c:3))"),
+            parse("a:1 AND (b:2 OR (c:3))")
+        );
+        // newline after an operator: used to parse `OR\nb` as a field name
+        assert_eq!(parse("a:1 OR\nb:2"), parse("a:1 OR b:2"));
+    }
+
+    #[test]
     fn test_user_input_query_field_specified_in_user_input() {
         let ast = UserInputQuery {
             user_text: "myfield:hello".to_string(),

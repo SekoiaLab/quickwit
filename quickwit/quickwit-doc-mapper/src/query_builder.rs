@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use quickwit_proto::types::SplitId;
 use quickwit_query::query_ast::{
@@ -23,14 +23,19 @@ use quickwit_query::query_ast::{
     QueryAstTransformer, QueryAstVisitor, RangeQuery, RegexQuery, TermSetQuery, WildcardQuery,
 };
 use quickwit_query::tokenizers::TokenizerManager;
-use quickwit_query::{InvalidQuery, find_field_or_hit_dynamic};
+use quickwit_query::{InvalidQuery, JsonPath, find_field_or_hit_dynamic};
 use tantivy::Term;
 use tantivy::query::Query;
 use tantivy::schema::{Field, Schema};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::doc_mapper::FastFieldWarmupInfo;
-use crate::{Automaton, QueryParserError, TermRange, WarmupInfo};
+use crate::{Automaton, ExactSetAutomaton, QueryParserError, TermRange, WarmupInfo};
+
+/// Maximum number of distinct fields that can be targeted by regex queries in a
+/// single query. Multiple regexes targeting the same field count as one field.
+static MAX_REGEX_QUERY_FIELDS: LazyLock<usize> =
+    LazyLock::new(|| quickwit_common::get_from_env("QW_MAX_REGEX_QUERY_FIELDS", 20, false));
 
 #[derive(Default)]
 struct RangeQueryFields {
@@ -198,8 +203,7 @@ pub(crate) fn build_query(
 
     let query = query_ast.build_tantivy_query(context)?;
 
-    let term_set_query_fields = extract_term_set_query_fields(&query_ast, context.schema)?;
-    let (term_ranges_grouped_by_field, automatons_grouped_by_field) =
+    let (term_ranges_grouped_by_field, mut automatons_grouped_by_field) =
         extract_prefix_term_ranges_and_automaton(
             &query_ast,
             context.schema,
@@ -219,8 +223,33 @@ pub(crate) fn build_query(
             .or_default() |= need_position;
     });
 
+    coalesce_multi_term_fields_into_automatons(
+        &mut terms_grouped_by_field,
+        &mut automatons_grouped_by_field,
+        2,
+    )?;
+
+    coalesce_regexes_by_field(&mut automatons_grouped_by_field);
+
+    let regex_field_count = automatons_grouped_by_field
+        .values()
+        .flatten()
+        .filter(|automaton| matches!(automaton, Automaton::Regex(_, _)))
+        .count();
+    if regex_field_count > *MAX_REGEX_QUERY_FIELDS {
+        let error_msg = format!(
+            "query targets {} distinct fields with regexes, but at most {} are allowed",
+            regex_field_count, *MAX_REGEX_QUERY_FIELDS,
+        );
+        warn!(
+            count = regex_field_count,
+            max = *MAX_REGEX_QUERY_FIELDS,
+            "too many regexes on distinct paths"
+        );
+        return Err(InvalidQuery::Other(anyhow::anyhow!(error_msg)).into());
+    }
+
     let warmup_info = WarmupInfo {
-        term_dict_fields: term_set_query_fields,
         terms_grouped_by_field,
         term_ranges_grouped_by_field,
         fast_fields,
@@ -231,44 +260,86 @@ pub(crate) fn build_query(
     Ok((query, warmup_info))
 }
 
-struct ExtractTermSetFields<'a> {
-    term_dict_fields_to_warm_up: HashSet<Field>,
-    schema: &'a Schema,
-}
-
-impl<'a> ExtractTermSetFields<'a> {
-    fn new(schema: &'a Schema) -> Self {
-        ExtractTermSetFields {
-            term_dict_fields_to_warm_up: HashSet::new(),
-            schema,
+/// For any field with more than `term_threshold` non-positional terms, moves
+/// those terms into an `Automaton::TermSet` and removes them from
+/// `terms_grouped_by_field`.
+///
+/// This enables `warm_postings_automaton` to coalesce both the SSTable block
+/// fetches and the postings downloads into a small number of merged range
+/// requests, instead of N individual per-term requests.
+///
+/// A minimum of `term_threshold` terms is required because
+/// `warm_postings_automaton` has higher per-call overhead than a direct point
+/// lookup: spawning a CPU task and traversing the sstable twice. That overhead
+/// is only worth paying when there are enough terms to coalesce.
+///
+/// Terms that require positions are left in `terms_grouped_by_field` unchanged,
+/// as they must be fetched individually.
+///
+/// TODO: should positional terms also support some form of grouping?
+fn coalesce_multi_term_fields_into_automatons(
+    terms_grouped_by_field: &mut HashMap<Field, HashMap<Term, bool>>,
+    automatons_grouped_by_field: &mut HashMap<Field, HashSet<Automaton>>,
+    term_threshold: usize,
+) -> anyhow::Result<()> {
+    let fields: Vec<Field> = terms_grouped_by_field.keys().copied().collect();
+    for field in fields {
+        let no_pos_terms: Vec<&Term> = terms_grouped_by_field
+            .get(&field)
+            .unwrap()
+            .iter()
+            .filter(|(_, need_pos)| !**need_pos)
+            .map(|(term, _)| term)
+            .collect();
+        if no_pos_terms.len() <= term_threshold {
+            continue;
+        }
+        let automaton = ExactSetAutomaton::try_from_terms(no_pos_terms)?;
+        automatons_grouped_by_field
+            .entry(field)
+            .or_default()
+            .insert(Automaton::TermSet(automaton));
+        // Remove the no-position terms: the automaton covers their SSTable lookup + postings.
+        // Terms still needing positions are kept for warm_up_terms.
+        let field_terms = terms_grouped_by_field.get_mut(&field).unwrap();
+        field_terms.retain(|_, need_pos| *need_pos);
+        if field_terms.is_empty() {
+            terms_grouped_by_field.remove(&field);
         }
     }
+    Ok(())
 }
 
-impl<'a> QueryAstVisitor<'a> for ExtractTermSetFields<'_> {
-    type Err = anyhow::Error;
-
-    fn visit_term_set(&mut self, term_set_query: &'a TermSetQuery) -> anyhow::Result<()> {
-        for field in term_set_query.terms_per_field.keys() {
-            if let Some((field, _field_entry, _path)) =
-                find_field_or_hit_dynamic(field, self.schema)
-            {
-                self.term_dict_fields_to_warm_up.insert(field);
-            } else {
-                anyhow::bail!("field does not exist: {}", field);
+/// Merges all `Automaton::Regex` entries that target the same field and json path into a single
+/// multi-pattern `Automaton::Regex`.
+///
+/// During warmup, each `Automaton::Regex` triggers one term-dictionary traversal. By collapsing all
+/// regexes sharing a `(field, path)` into a single entry, warmup can build one combined automaton
+/// (matching the union of the patterns) and traverse the term dictionary once per field+path
+/// instead of once per regex. The union is a safe over-approximation: the actual per-regex queries
+/// still perform exact matching at execution time, so results are unchanged.
+///
+/// Entries with different json paths are kept separate (the path is applied via `JsonPathPrefix`
+/// and cannot be shared). `Automaton::TermSet` entries are left untouched.
+fn coalesce_regexes_by_field(automatons_grouped_by_field: &mut HashMap<Field, HashSet<Automaton>>) {
+    for automatons in automatons_grouped_by_field.values_mut() {
+        let mut regexes_by_path: HashMap<Option<JsonPath>, Vec<String>> = HashMap::new();
+        let mut others: Vec<Automaton> = Vec::new();
+        for automaton in automatons.drain() {
+            match automaton {
+                Automaton::Regex(path, patterns) => {
+                    regexes_by_path.entry(path).or_default().extend(patterns);
+                }
+                other => others.push(other),
             }
         }
-        Ok(())
+        for (path, mut patterns) in regexes_by_path {
+            patterns.sort();
+            patterns.dedup();
+            automatons.insert(Automaton::Regex(path, patterns));
+        }
+        automatons.extend(others);
     }
-}
-
-fn extract_term_set_query_fields(
-    query_ast: &QueryAst,
-    schema: &Schema,
-) -> anyhow::Result<HashSet<Field>> {
-    let mut visitor = ExtractTermSetFields::new(schema);
-    visitor.visit(query_ast)?;
-    Ok(visitor.term_dict_fields_to_warm_up)
 }
 
 /// Converts a `prefix` term into the equivalent term range.
@@ -389,7 +460,7 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
                 Err(e) => return Err(e),
             };
 
-        self.add_automaton(field, Automaton::Regex(path, regex));
+        self.add_automaton(field, Automaton::Regex(path, vec![regex]));
         Ok(())
     }
 
@@ -400,7 +471,7 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
             Err(InvalidQuery::FieldDoesNotExist { .. }) => return Ok(()),
             Err(e) => return Err(e),
         };
-        self.add_automaton(field, Automaton::Regex(path, regex));
+        self.add_automaton(field, Automaton::Regex(path, vec![regex]));
         Ok(())
     }
 }
@@ -427,8 +498,9 @@ mod test {
 
     use quickwit_common::shared_consts::FIELD_PRESENCE_FIELD_NAME;
     use quickwit_query::query_ast::{
-        BuildTantivyAstContext, FullTextMode, FullTextParams, PhrasePrefixQuery, QueryAstVisitor,
-        UserInputQuery, query_ast_from_user_text,
+        BoolQuery, BuildTantivyAstContext, FullTextMode, FullTextParams, PhrasePrefixQuery,
+        QueryAst, QueryAstVisitor, RegexQuery, UserInputQuery, WildcardQuery,
+        query_ast_from_user_text,
     };
     use quickwit_query::{
         BooleanOperand, MatchAllOrNone, create_default_quickwit_tokenizer_manager,
@@ -437,7 +509,7 @@ mod test {
     use tantivy::schema::{DateOptions, DateTimePrecision, FAST, INDEXED, STORED, Schema, TEXT};
 
     use super::{ExtractPrefixTermRanges, build_query};
-    use crate::{DYNAMIC_FIELD_NAME, SOURCE_FIELD_NAME, TermRange};
+    use crate::{Automaton, DYNAMIC_FIELD_NAME, SOURCE_FIELD_NAME, TermRange};
 
     enum TestExpectation<'a> {
         Err(&'a str),
@@ -881,26 +953,96 @@ mod test {
 
     #[test]
     fn test_build_query_warmup_info() {
-        let query_with_set = query_ast_from_user_text("desc: IN [hello]", None)
+        let query_with_set = query_ast_from_user_text("desc: IN [alpha beta gamma delta]", None)
             .parse_user_query(&[])
             .unwrap();
-        let query_without_set = query_ast_from_user_text("desc:hello", None)
+        let query_with_small_set = query_ast_from_user_text("desc: IN [beta]", None)
+            .parse_user_query(&[])
+            .unwrap();
+        let query_with_many_terms =
+            query_ast_from_user_text("desc:(hello OR world OR extra OR big)", None)
+                .parse_user_query(&[])
+                .unwrap();
+        let query_with_single_term = query_ast_from_user_text("desc:hello", None)
             .parse_user_query(&[])
             .unwrap();
 
         let schema = make_schema(true);
         let context = BuildTantivyAstContext::for_test(&schema);
 
-        let (_, warmup_info) = build_query(query_with_set, &context, None).unwrap();
-        assert_eq!(warmup_info.term_dict_fields.len(), 1);
-        assert!(
-            warmup_info
-                .term_dict_fields
-                .contains(&tantivy::schema::Field::from_field_id(2))
-        );
+        for query in [query_with_many_terms, query_with_set] {
+            let (_, warmup_info) = build_query(query, &context, None).unwrap();
+            assert!(warmup_info.terms_grouped_by_field.is_empty());
+            assert_eq!(warmup_info.automatons_grouped_by_field.len(), 1);
+            let automatons = warmup_info
+                .automatons_grouped_by_field
+                .values()
+                .next()
+                .unwrap();
+            assert_eq!(automatons.len(), 1);
+            assert!(matches!(
+                automatons.iter().next().unwrap(),
+                Automaton::TermSet(_)
+            ));
+        }
 
-        let (_, warmup_info) = build_query(query_without_set, &context, None).unwrap();
-        assert!(warmup_info.term_dict_fields.is_empty());
+        for query in [query_with_small_set, query_with_single_term] {
+            let (_, warmup_info) = build_query(query, &context, None).unwrap();
+            assert!(warmup_info.automatons_grouped_by_field.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_build_query_warmup_info_term_set_with_other_queries() {
+        // Verify that:
+        // - fields with >= 3 non-positional terms are coalesced into an automaton
+        // - positional terms on the same field remain in terms_grouped_by_field
+        // - fields with fewer than 3 non-positional terms are unaffected
+        let query_ast = query_ast_from_user_text(
+            r#"desc: IN [alpha beta gamma] AND desc:"world extra" AND title:baz"#,
+            None,
+        )
+        .parse_user_query(&[])
+        .unwrap();
+
+        let schema = make_schema(false);
+        let context = BuildTantivyAstContext::for_test(&schema);
+        let (_, warmup_info) = build_query(query_ast, &context, None).unwrap();
+
+        let desc_field = schema.get_field("desc").unwrap();
+        let title_field = schema.get_field("title").unwrap();
+
+        // desc: 3 non-positional terms (alpha, beta, gamma) are coalesced into an automaton
+        let desc_automatons = warmup_info
+            .automatons_grouped_by_field
+            .get(&desc_field)
+            .expect("desc should have an automaton");
+        assert_eq!(desc_automatons.len(), 1);
+        assert!(matches!(
+            desc_automatons.iter().next().unwrap(),
+            Automaton::TermSet(_)
+        ));
+
+        // desc: phrase terms "world" and "extra" stay as positional terms
+        let desc_terms = warmup_info
+            .terms_grouped_by_field
+            .get(&desc_field)
+            .expect("desc positional terms should still be present");
+        assert_eq!(desc_terms.len(), 2);
+        assert!(desc_terms.values().all(|&need_pos| need_pos));
+
+        // title: only 1 non-positional term (below threshold), stays in terms_grouped_by_field
+        assert!(
+            !warmup_info
+                .automatons_grouped_by_field
+                .contains_key(&title_field)
+        );
+        let title_terms = warmup_info
+            .terms_grouped_by_field
+            .get(&title_field)
+            .expect("title terms should be present");
+        assert_eq!(title_terms.len(), 1);
+        assert!(title_terms.values().all(|&need_pos| !need_pos));
     }
 
     #[test]
@@ -953,5 +1095,194 @@ mod test {
         let mut expected = std::collections::HashMap::new();
         expected.insert(field, expected_inner);
         assert_eq!(extractor1.term_ranges_to_warm_up, expected);
+    }
+
+    /// Builds a bool query made of one regex clause per `(field, regex)` pair.
+    fn regex_bool_query(clauses: &[(String, &str)]) -> QueryAst {
+        let must = clauses
+            .iter()
+            .map(|(field, regex)| {
+                QueryAst::Regex(RegexQuery {
+                    field: field.clone(),
+                    regex: regex.to_string(),
+                })
+            })
+            .collect();
+        QueryAst::Bool(BoolQuery {
+            must,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_build_query_coalesces_regexes_on_same_field() {
+        let schema = make_schema(false);
+        let context = BuildTantivyAstContext::for_test(&schema);
+
+        // Several regexes (including a duplicate) targeting the same field collapse into a single
+        // automaton holding the deduplicated, sorted set of patterns.
+        let clauses: Vec<(String, &str)> = vec![
+            ("title".to_string(), "abc.*"),
+            ("title".to_string(), "xyz"),
+            ("title".to_string(), "foo.*"),
+            ("title".to_string(), "abc.*"),
+        ];
+        let query_ast = regex_bool_query(&clauses);
+        let (_, warmup_info) = build_query(query_ast, &context, None).unwrap();
+
+        assert_eq!(warmup_info.automatons_grouped_by_field.len(), 1);
+        let automatons = warmup_info
+            .automatons_grouped_by_field
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(automatons.len(), 1);
+        let Automaton::Regex(path, patterns) = automatons.iter().next().unwrap() else {
+            panic!("expected a regex automaton");
+        };
+        assert!(path.is_none());
+        assert_eq!(
+            patterns,
+            &vec!["abc.*".to_string(), "foo.*".to_string(), "xyz".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_query_keeps_regexes_on_different_fields_separate() {
+        let schema = make_schema(false);
+        let context = BuildTantivyAstContext::for_test(&schema);
+
+        let clauses: Vec<(String, &str)> = vec![
+            ("title".to_string(), "abc.*"),
+            ("desc".to_string(), "xyz.*"),
+        ];
+        let query_ast = regex_bool_query(&clauses);
+        let (_, warmup_info) = build_query(query_ast, &context, None).unwrap();
+
+        assert_eq!(warmup_info.automatons_grouped_by_field.len(), 2);
+        for automatons in warmup_info.automatons_grouped_by_field.values() {
+            assert_eq!(automatons.len(), 1);
+            assert!(matches!(
+                automatons.iter().next().unwrap(),
+                Automaton::Regex(None, patterns) if patterns.len() == 1
+            ));
+        }
+    }
+
+    #[test]
+    fn test_build_query_rejects_too_many_regex_fields() {
+        let schema = make_schema(true);
+
+        // 21 distinct fields targeted by regexes: rejected.
+        let clauses: Vec<(String, &str)> =
+            (0..21).map(|i| (format!("field_{i}"), "abc.*")).collect();
+        let query_ast = regex_bool_query(&clauses);
+        let err = build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("distinct fields with regexes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_query_accepts_exactly_twenty_regex_fields() {
+        let schema = make_schema(true);
+
+        // Exactly 20 distinct fields: accepted.
+        let clauses: Vec<(String, &str)> =
+            (0..20).map(|i| (format!("field_{i}"), "abc.*")).collect();
+        let query_ast = regex_bool_query(&clauses);
+        assert!(build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None).is_ok());
+    }
+
+    #[test]
+    fn test_build_query_accepts_many_regexes_on_same_field() {
+        let schema = make_schema(false);
+
+        // 50 regexes all targeting the same field: accepted, since only one
+        // distinct field is involved.
+        let clauses: Vec<(String, &str)> =
+            (0..50).map(|_| ("title".to_string(), "abc.*")).collect();
+        let query_ast = regex_bool_query(&clauses);
+        assert!(build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None).is_ok());
+    }
+
+    /// Builds a bool query made of wildcards.
+    fn wildcard_bool_query(clauses: &[(String, &str)]) -> QueryAst {
+        let must = clauses
+            .iter()
+            .map(|(field, value)| {
+                QueryAst::Wildcard(WildcardQuery {
+                    field: field.clone(),
+                    value: value.to_string(),
+                    lenient: false,
+                    case_insensitive: false,
+                })
+            })
+            .collect();
+        QueryAst::Bool(BoolQuery {
+            must,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_build_query_rejects_too_many_wilcard_fields() {
+        let schema = make_schema(true);
+
+        // 21 distinct fields targeted by wilcards: rejected.
+        let clauses: Vec<(String, &str)> =
+            (0..21).map(|i| (format!("field_{i}"), "abc*")).collect();
+        let query_ast = wildcard_bool_query(&clauses);
+        let err = build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("distinct fields with regexes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Builds a bool query made of both regexes and wildcards.
+    fn regex_wildcard_bool_query(clauses: &[(String, &str)]) -> QueryAst {
+        let must = clauses
+            .iter()
+            .flat_map(|(field, value)| {
+                let wildcard = QueryAst::Wildcard(WildcardQuery {
+                    field: format!("{}_wild", field),
+                    value: value.to_string(),
+                    lenient: false,
+                    case_insensitive: false,
+                });
+                let regex = QueryAst::Regex(RegexQuery {
+                    field: format!("{}_re", field),
+                    regex: value.to_string(),
+                });
+                vec![wildcard, regex]
+            })
+            .collect();
+        QueryAst::Bool(BoolQuery {
+            must,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_build_query_rejects_too_many_wilcard_or_regex_fields() {
+        let schema = make_schema(true);
+
+        // 21 distinct fields targeted by wilcards: rejected.
+        let clauses: Vec<(String, &str)> =
+            (0..11).map(|i| (format!("field_{i}"), "abc*")).collect();
+        let query_ast = regex_wildcard_bool_query(&clauses);
+        let err = build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("distinct fields with regexes"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -159,7 +159,9 @@ impl IndexingPipeline {
         let indexing_pipelines_gauge = crate::metrics::INDEXER_METRICS
             .indexing_pipelines
             .with_label_values([&params.pipeline_id.index_uid.index_id]);
-        let indexing_pipelines_gauge_guard = OwnedGaugeGuard::from_gauge(indexing_pipelines_gauge);
+        let mut indexing_pipelines_gauge_guard =
+            OwnedGaugeGuard::from_gauge(indexing_pipelines_gauge);
+        indexing_pipelines_gauge_guard.add(1);
         let params_fingerprint = params.params_fingerprint;
         IndexingPipeline {
             params,
@@ -409,6 +411,7 @@ impl IndexingPipeline {
             self.params.indexing_settings.clone(),
             self.params.cooperative_indexing_permits.clone(),
             index_serializer_mailbox,
+            self.params.is_delete_task_service_disabled,
         );
         let (indexer_mailbox, indexer_handle) = ctx
             .spawn_actor()
@@ -600,6 +603,7 @@ pub struct IndexingPipelineParams {
     pub params_fingerprint: u64,
 
     pub event_broker: EventBroker,
+    pub is_delete_task_service_disabled: bool,
 }
 
 #[cfg(test)]
@@ -639,7 +643,7 @@ mod tests {
         mut num_fails: usize,
         test_file: &str,
     ) -> anyhow::Result<()> {
-        let node_id = NodeId::from("test-node");
+        let node_id = NodeId::from_str("test-node");
         let index_uid = IndexUid::for_test("test-index", 2);
         let pipeline_id = IndexingPipelineId {
             node_id,
@@ -729,6 +733,7 @@ mod tests {
             merge_planner_mailbox,
             event_broker: EventBroker::default(),
             params_fingerprint: 42u64,
+            is_delete_task_service_disabled: false,
         };
         let pipeline = IndexingPipeline::new(pipeline_params);
         let (_pipeline_mailbox, pipeline_handle) = universe.spawn_builder().spawn(pipeline);
@@ -769,8 +774,11 @@ mod tests {
         test_indexing_pipeline_num_fails_before_success(1, "data/test_corpus.json.gz").await
     }
 
-    async fn indexing_pipeline_simple(test_file: &str) -> anyhow::Result<()> {
-        let node_id = NodeId::from("test-node");
+    async fn indexing_pipeline_simple(
+        test_file: &str,
+        is_delete_task_service_disabled: bool,
+    ) -> anyhow::Result<()> {
+        let node_id = NodeId::from_str("test-node");
         let index_uid: IndexUid = IndexUid::for_test("test-index", 1);
         let pipeline_id = IndexingPipelineId {
             node_id,
@@ -803,10 +811,16 @@ mod tests {
                 Ok(IndexMetadataResponse::try_from_index_metadata(&index_metadata).unwrap())
             });
         let index_uid_clone = index_uid.clone();
-        mock_metastore
-            .expect_last_delete_opstamp()
-            .withf(move |last_delete_opstamp| last_delete_opstamp.index_uid() == &index_uid_clone)
-            .returning(move |_| Ok(LastDeleteOpstampResponse::new(10)));
+        if is_delete_task_service_disabled {
+            mock_metastore.expect_last_delete_opstamp().never();
+        } else {
+            mock_metastore
+                .expect_last_delete_opstamp()
+                .withf(move |last_delete_opstamp| {
+                    last_delete_opstamp.index_uid() == &index_uid_clone
+                })
+                .returning(move |_| Ok(LastDeleteOpstampResponse::new(10)));
+        }
         let index_uid_clone = index_uid.clone();
         mock_metastore
             .expect_stage_splits()
@@ -853,6 +867,7 @@ mod tests {
             merge_planner_mailbox,
             event_broker: Default::default(),
             params_fingerprint: 42u64,
+            is_delete_task_service_disabled,
         };
         let pipeline = IndexingPipeline::new(pipeline_params);
         let (_pipeline_mailbox, pipeline_handler) = universe.spawn_builder().spawn(pipeline);
@@ -867,17 +882,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_indexing_pipeline_simple() -> anyhow::Result<()> {
-        indexing_pipeline_simple("data/test_corpus.json").await
+        indexing_pipeline_simple("data/test_corpus.json", false).await
+    }
+
+    #[tokio::test]
+    async fn test_indexing_pipeline_without_delete_task_service() -> anyhow::Result<()> {
+        indexing_pipeline_simple("data/test_corpus.json", true).await
     }
 
     #[tokio::test]
     async fn test_indexing_pipeline_simple_gz() -> anyhow::Result<()> {
-        indexing_pipeline_simple("data/test_corpus.json.gz").await
+        indexing_pipeline_simple("data/test_corpus.json.gz", false).await
     }
 
     #[tokio::test]
     async fn test_merge_pipeline_does_not_stop_on_indexing_pipeline_failure() {
-        let node_id = NodeId::from("test-node");
+        let node_id = NodeId::from_str("test-node");
         let pipeline_id = IndexingPipelineId {
             node_id,
             index_uid: IndexUid::new_with_random_ulid("test-index"),
@@ -954,6 +974,7 @@ mod tests {
             merge_planner_mailbox: merge_planner_mailbox.clone(),
             event_broker: Default::default(),
             params_fingerprint: 42u64,
+            is_delete_task_service_disabled: false,
         };
         let indexing_pipeline = IndexingPipeline::new(indexing_pipeline_params);
         let (_indexing_pipeline_mailbox, indexing_pipeline_handler) =
@@ -982,7 +1003,7 @@ mod tests {
     }
 
     async fn indexing_pipeline_all_failures_handling(test_file: &str) -> anyhow::Result<()> {
-        let node_id = NodeId::from("test-node");
+        let node_id = NodeId::from_str("test-node");
         let index_uid: IndexUid = IndexUid::for_test("test-index", 2);
         let pipeline_id = IndexingPipelineId {
             node_id,
@@ -1082,6 +1103,7 @@ mod tests {
             merge_planner_mailbox,
             params_fingerprint: 42u64,
             event_broker: Default::default(),
+            is_delete_task_service_disabled: false,
         };
         let pipeline = IndexingPipeline::new(pipeline_params);
         let (_pipeline_mailbox, pipeline_handler) = universe.spawn_builder().spawn(pipeline);

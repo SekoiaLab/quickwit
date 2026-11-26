@@ -24,9 +24,12 @@ use quickwit_proto::search::{
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tracing::{debug, error, info, warn};
 
+use crate::metrics::SEARCH_METRICS;
 use crate::retry::search::LeafSearchRetryPolicy;
 use crate::retry::{DefaultRetryPolicy, RetryPolicy, retry_client};
-use crate::{SearchJobPlacer, SearchServiceClient, merge_resource_stats_it};
+use crate::{
+    SearchJobPlacer, SearchServiceClient, merge_resource_stats_it, merge_splits_by_outcome_it,
+};
 
 /// Maximum number of put requests emitted to perform a replicated given PUT KV.
 const MAX_PUT_KV_ATTEMPTS: usize = 6;
@@ -112,7 +115,21 @@ impl ClusterClient {
             "Leaf search response error: `{:?}`. Retry once to execute {:?} with {:?}",
             response_res, retry_request, client
         );
+        let num_retried_splits: usize = retry_request
+            .leaf_requests
+            .iter()
+            .map(|leaf_req| leaf_req.split_offsets.len())
+            .sum();
         let retry_result = client.leaf_search(retry_request).await;
+        let (num_rescued_splits, num_failed_splits) =
+            split_retry_outcomes(num_retried_splits, &retry_result);
+        let split_retries_total = &SEARCH_METRICS.leaf_search_split_retries_total;
+        split_retries_total
+            .with_label_values(["rescued"])
+            .inc_by(num_rescued_splits as u64);
+        split_retries_total
+            .with_label_values(["failed"])
+            .inc_by(num_failed_splits as u64);
         response_res = merge_original_with_retry_leaf_search_results(response_res, retry_result);
         response_res
     }
@@ -232,6 +249,18 @@ fn merge_intermediate_aggregation(left: &[u8], right: &[u8]) -> crate::Result<Ve
     Ok(serialized)
 }
 
+/// Returns the number of retried splits that succeeded (rescued) and that failed again.
+fn split_retry_outcomes(
+    num_retried_splits: usize,
+    retry_result: &crate::Result<LeafSearchResponse>,
+) -> (usize, usize) {
+    let num_failed_splits = match retry_result {
+        Ok(retry_response) => retry_response.failed_splits.len().min(num_retried_splits),
+        Err(_) => num_retried_splits,
+    };
+    (num_retried_splits - num_failed_splits, num_failed_splits)
+}
+
 /// Merge two leaf search response.
 ///
 /// # Quirk
@@ -260,9 +289,16 @@ fn merge_original_with_retry_leaf_search_response(
         (Some(left), None) => Some(left),
         (None, None) => None,
     };
+
     let resource_stats = merge_resource_stats_it([
         &original_response.resource_stats,
         &retry_response.resource_stats,
+    ]);
+    // Splits with "cancel_" outcome will be retried, so they will typically be
+    // counted twice in the outcome breakdown.
+    let splits_by_outcome = merge_splits_by_outcome_it([
+        original_response.splits_by_outcome,
+        retry_response.splits_by_outcome,
     ]);
     Ok(LeafSearchResponse {
         intermediate_aggregation_result,
@@ -274,6 +310,7 @@ fn merge_original_with_retry_leaf_search_response(
         num_successful_splits: original_response.num_successful_splits
             + retry_response.num_successful_splits,
         resource_stats,
+        splits_by_outcome,
     })
 }
 
@@ -328,6 +365,7 @@ mod tests {
                 timestamp_start: None,
                 timestamp_end: None,
                 num_docs: 0,
+                soft_deleted_doc_ids: Vec::new(),
             }],
             ..Default::default()
         }
@@ -355,6 +393,7 @@ mod tests {
                         timestamp_start: None,
                         timestamp_end: None,
                         num_docs: 0,
+                        soft_deleted_doc_ids: Vec::new(),
                     },
                     SplitIdAndFooterOffsets {
                         split_id: "split_2".to_string(),
@@ -363,6 +402,7 @@ mod tests {
                         timestamp_start: None,
                         timestamp_end: None,
                         num_docs: 0,
+                        soft_deleted_doc_ids: Vec::new(),
                     },
                 ],
             }],
@@ -584,6 +624,27 @@ mod tests {
         .unwrap_err();
         assert_eq!(merge_error.to_string(), "internal error: `error`");
         Ok(())
+    }
+
+    #[test]
+    fn test_split_retry_outcomes() {
+        let retry_response = LeafSearchResponse {
+            failed_splits: vec![SplitSearchError {
+                error: "error".to_string(),
+                split_id: "split_2".to_string(),
+                retryable_error: true,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(split_retry_outcomes(3, &Ok(retry_response)), (2, 1));
+        assert_eq!(
+            split_retry_outcomes(3, &Ok(LeafSearchResponse::default())),
+            (3, 0)
+        );
+        assert_eq!(
+            split_retry_outcomes(3, &Err(SearchError::Internal("error".to_string()))),
+            (0, 3)
+        );
     }
 
     #[tokio::test]

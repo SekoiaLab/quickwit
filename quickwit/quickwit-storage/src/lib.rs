@@ -51,6 +51,7 @@ mod prefix_storage;
 mod ram_storage;
 mod split;
 mod split_cache;
+mod stable_deref_bytes;
 mod storage_factory;
 mod storage_resolver;
 mod versioned_component;
@@ -64,13 +65,14 @@ pub use self::bundle_storage::{BundleStorage, BundleStorageFileOffsets};
 #[cfg(any(test, feature = "testsuite"))]
 pub use self::cache::MockStorageCache;
 pub use self::cache::{
-    ByteRangeCache, MemorySizedCache, QuickwitCache, StorageCache, wrap_storage_with_cache,
+    ByteRangeCache, DiskSizedCache, MemorySizedCache, QuickwitCache, StorageCache,
+    TieredSizedCache, wrap_storage_with_cache,
 };
 pub use self::local_file_storage::{LocalFileStorage, LocalFileStorageFactory};
 #[cfg(feature = "azure")]
 pub use self::object_storage::{AzureBlobStorage, AzureBlobStorageFactory};
 pub use self::object_storage::{
-    MultiPartPolicy, S3CompatibleObjectStorage, S3CompatibleObjectStorageFactory,
+    MultiPartPolicy, S3CompatibleObjectStorage, S3CompatibleObjectStorageFactory, S3NodeOptions,
 };
 #[cfg(feature = "gcs")]
 pub use self::opendal_storage::GoogleCloudStorageFactory;
