@@ -60,9 +60,10 @@ const MAX_DOWNLOAD_BYTES_PER_SEC_ENV_KEY: &str = "QW_S3_MAX_DOWNLOAD_BYTES_PER_S
 /// request does not wait for its own first window when bandwidth is available, and a refunded
 /// first window always fits.
 ///
-/// After a period below the rate, downloads can exceed it by up to the burst: 10ms of traffic, or
-/// 1% over a second.
-const BURST_DURATION: Duration = Duration::from_millis(10);
+/// After a period below the rate, downloads can exceed it by up to the burst: 50ms of traffic, or
+/// 5% over a second. A larger burst lets more of the sub-second spikes of searches through
+/// without waiting, at the cost of larger short-term excesses over the rate.
+const BURST_DURATION: Duration = Duration::from_millis(50);
 
 /// How often the waiting acquisitions get the bytes refilled since the last refill.
 const REFILL_PERIOD: Duration = Duration::from_millis(1);
@@ -628,8 +629,8 @@ mod tests {
         assert!(parse_max_download_bytes_per_sec(Some("fast")).is_err());
     }
 
-    /// The burst of the limiters of the tests: their rates are low enough for the burst to be a
-    /// first window.
+    /// The burst of the limiters of the tests running at 10MB/s or less: at those rates, the burst
+    /// is a first window.
     const BURST: u64 = FIRST_WINDOW_NUM_BYTES;
 
     /// Returns the time to wait for `num_bytes` at `bytes_per_sec`.
@@ -654,7 +655,7 @@ mod tests {
         }
         assert_around(
             start.elapsed(),
-            duration_of(100_000_000 - BURST, 100_000_000),
+            duration_of(100_000_000 - limiter.burst_num_bytes, 100_000_000),
         );
     }
 
@@ -666,7 +667,7 @@ mod tests {
         limiter.acquire(50_000_000).await;
         assert_around(
             start.elapsed(),
-            duration_of(50_000_000 - BURST, 100_000_000),
+            duration_of(50_000_000 - limiter.burst_num_bytes, 100_000_000),
         );
     }
 
