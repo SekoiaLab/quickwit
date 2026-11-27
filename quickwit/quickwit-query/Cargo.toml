@@ -33,6 +33,7 @@ quickwit-proto = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tikv-jemallocator = { workspace = true }
 proptest = { workspace = true }
 time = { workspace = true }
 
@@ -40,4 +41,8 @@ quickwit-common = { workspace = true, features = ["testsuite"] }
 
 [[bench]]
 name = "tokenizers_bench"
+harness = false
+
+[[bench]]
+name = "json_number_wildcard_bench"
 harness = false

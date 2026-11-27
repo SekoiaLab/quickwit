@@ -47,6 +47,10 @@ pub fn query_complexity_factor_or_default(search_request: &SearchRequest) -> f32
 /// indexes, can spend minutes of CPU in planning/validation alone, so we bound
 /// their number upfront.
 ///
+/// A wildcard that a number can match (such as `2??`) counts as two: on a JSON
+/// field, it compiles a second automaton, for the numbers of the field. Without
+/// the schema, it counts as two on any field.
+///
 /// This must be called on the *resolved* query AST: user input queries can
 /// expand into regex/wildcard leaves during resolution.
 pub fn check_automaton_query_count(query_ast: &QueryAst) -> Result<(), SearchError> {
@@ -96,8 +100,12 @@ impl<'a> QueryAstVisitor<'a> for AutomatonQueryCounter {
         self.count_one()
     }
 
-    fn visit_wildcard(&mut self, _wildcard_query: &'a WildcardQuery) -> Result<(), Self::Err> {
-        self.count_one()
+    fn visit_wildcard(&mut self, wildcard_query: &'a WildcardQuery) -> Result<(), Self::Err> {
+        self.count_one()?;
+        if wildcard_query.can_match_numbers() {
+            self.count_one()?;
+        }
+        Ok(())
     }
 }
 
@@ -166,6 +174,17 @@ mod tests {
             ..Default::default()
         }
         .into();
+        assert!(check_automaton_query_count_with_limit(&ast, 2).is_err());
+    }
+
+    #[test]
+    fn test_automaton_query_count_counts_number_wildcards_twice() {
+        let ast: QueryAst = BoolQuery {
+            should: vec![wildcard("2??"), wildcard("*b*")],
+            ..Default::default()
+        }
+        .into();
+        assert!(check_automaton_query_count_with_limit(&ast, 3).is_ok());
         assert!(check_automaton_query_count_with_limit(&ast, 2).is_err());
     }
 

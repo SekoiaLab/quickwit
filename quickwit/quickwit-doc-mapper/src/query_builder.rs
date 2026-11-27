@@ -19,8 +19,9 @@ use std::sync::{Arc, LazyLock};
 
 use quickwit_proto::types::SplitId;
 use quickwit_query::query_ast::{
-    BuildTantivyAstContext, FieldPresenceQuery, FullTextQuery, PhrasePrefixQuery, QueryAst,
-    QueryAstTransformer, QueryAstVisitor, RangeQuery, RegexQuery, TermSetQuery, WildcardQuery,
+    BuildTantivyAstContext, FieldPresenceQuery, FullTextQuery, JsonNumberWildcard,
+    PhrasePrefixQuery, QueryAst, QueryAstTransformer, QueryAstVisitor, RangeQuery, RegexQuery,
+    TermSetQuery, WildcardQuery,
 };
 use quickwit_query::tokenizers::TokenizerManager;
 use quickwit_query::{InvalidQuery, JsonPath, find_field_or_hit_dynamic};
@@ -231,11 +232,23 @@ pub(crate) fn build_query(
 
     coalesce_regexes_by_field(&mut automatons_grouped_by_field);
 
+    // The text and the number automatons of a JSON path count as one: they walk distinct parts of
+    // its terms.
     let regex_field_count = automatons_grouped_by_field
-        .values()
-        .flatten()
-        .filter(|automaton| matches!(automaton, Automaton::Regex(_, _)))
-        .count();
+        .iter()
+        .flat_map(|(field, automatons)| {
+            automatons
+                .iter()
+                .filter_map(move |automaton| match automaton {
+                    Automaton::Regex(path, _) => {
+                        Some((*field, path.as_ref().map(JsonPath::without_type_code)))
+                    }
+                    Automaton::JsonNumberWildcard(path, _) => Some((*field, Some(path.clone()))),
+                    Automaton::TermSet(_) => None,
+                })
+        })
+        .collect::<HashSet<_>>()
+        .len();
     if regex_field_count > *MAX_REGEX_QUERY_FIELDS {
         let error_msg = format!(
             "query targets {} distinct fields with regexes, but at most {} are allowed",
@@ -320,15 +333,24 @@ fn coalesce_multi_term_fields_into_automatons(
 /// still perform exact matching at execution time, so results are unchanged.
 ///
 /// Entries with different json paths are kept separate (the path is applied via `JsonPathPrefix`
-/// and cannot be shared). `Automaton::TermSet` entries are left untouched.
+/// and cannot be shared). `Automaton::JsonNumberWildcard` entries are merged the same way, per
+/// json path. `Automaton::TermSet` entries are left untouched.
 fn coalesce_regexes_by_field(automatons_grouped_by_field: &mut HashMap<Field, HashSet<Automaton>>) {
     for automatons in automatons_grouped_by_field.values_mut() {
         let mut regexes_by_path: HashMap<Option<JsonPath>, Vec<String>> = HashMap::new();
+        let mut number_wildcards_by_path: HashMap<JsonPath, Vec<JsonNumberWildcard>> =
+            HashMap::new();
         let mut others: Vec<Automaton> = Vec::new();
         for automaton in automatons.drain() {
             match automaton {
                 Automaton::Regex(path, patterns) => {
                     regexes_by_path.entry(path).or_default().extend(patterns);
+                }
+                Automaton::JsonNumberWildcard(path, wildcards) => {
+                    number_wildcards_by_path
+                        .entry(path)
+                        .or_default()
+                        .extend(wildcards);
                 }
                 other => others.push(other),
             }
@@ -337,6 +359,11 @@ fn coalesce_regexes_by_field(automatons_grouped_by_field: &mut HashMap<Field, Ha
             patterns.sort();
             patterns.dedup();
             automatons.insert(Automaton::Regex(path, patterns));
+        }
+        for (path, mut wildcards) in number_wildcards_by_path {
+            wildcards.sort();
+            wildcards.dedup();
+            automatons.insert(Automaton::JsonNumberWildcard(path, wildcards));
         }
         automatons.extend(others);
     }
@@ -460,6 +487,14 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
                 Err(e) => return Err(e),
             };
 
+        if let Some((number_path, number_wildcard)) =
+            wildcard_query.to_json_number_wildcard(path.as_ref())
+        {
+            self.add_automaton(
+                field,
+                Automaton::JsonNumberWildcard(number_path, vec![number_wildcard]),
+            );
+        }
         self.add_automaton(field, Automaton::Regex(path, vec![regex]));
         Ok(())
     }
@@ -1167,6 +1202,114 @@ mod test {
                 Automaton::Regex(None, patterns) if patterns.len() == 1
             ));
         }
+    }
+
+    #[test]
+    fn test_build_query_warms_up_the_numbers_of_json_wildcards() {
+        let schema = make_schema(true);
+        let context = BuildTantivyAstContext::for_test(&schema);
+        let wildcard = |field: &str, value: &str| {
+            QueryAst::Wildcard(WildcardQuery {
+                field: field.to_string(),
+                value: value.to_string(),
+                lenient: false,
+                case_insensitive: false,
+            })
+        };
+
+        let (_, warmup_info) =
+            build_query(wildcard("json_text.status", "2??"), &context, None).unwrap();
+        // The numbers are matched on the term dictionary, not on the fast fields.
+        assert!(warmup_info.fast_fields.is_empty());
+        let automatons =
+            &warmup_info.automatons_grouped_by_field[&schema.get_field("json_text").unwrap()];
+        assert_eq!(automatons.len(), 2);
+        assert!(automatons.iter().any(|automaton| matches!(
+            automaton,
+            Automaton::JsonNumberWildcard(path, _) if &path[..] == b"status\0"
+        )));
+        assert!(
+            automatons
+                .iter()
+                .any(|automaton| matches!(automaton, Automaton::Regex(Some(_), _)))
+        );
+
+        // No number can match a letter, and a text field has no number.
+        for (field, value) in [("json_text.status", "2?a"), ("title", "2??")] {
+            let (_, warmup_info) = build_query(wildcard(field, value), &context, None).unwrap();
+            let automatons: Vec<&Automaton> = warmup_info
+                .automatons_grouped_by_field
+                .values()
+                .flatten()
+                .collect();
+            assert_eq!(automatons.len(), 1, "{field}: {value}");
+            assert!(matches!(automatons[0], Automaton::Regex(..)));
+        }
+    }
+
+    #[test]
+    fn test_build_query_coalesces_number_wildcards_on_same_path() {
+        let schema = make_schema(true);
+        let context = BuildTantivyAstContext::for_test(&schema);
+        let wildcard = |field: &str, value: &str| {
+            QueryAst::Wildcard(WildcardQuery {
+                field: field.to_string(),
+                value: value.to_string(),
+                lenient: false,
+                case_insensitive: false,
+            })
+        };
+        let query_ast = QueryAst::Bool(BoolQuery {
+            should: vec![
+                wildcard("json_text.status", "2??"),
+                wildcard("json_text.status", "3??"),
+                wildcard("json_text.status", "*04"),
+                wildcard("json_text.status", "2??"),
+            ],
+            ..Default::default()
+        });
+        let (_, warmup_info) = build_query(query_ast, &context, None).unwrap();
+        let automatons =
+            &warmup_info.automatons_grouped_by_field[&schema.get_field("json_text").unwrap()];
+        // One pass on the text terms of the path, and one on its number terms.
+        assert_eq!(automatons.len(), 2);
+        for automaton in automatons {
+            match automaton {
+                Automaton::Regex(_, patterns) => assert_eq!(patterns.len(), 3),
+                Automaton::JsonNumberWildcard(_, wildcards) => assert_eq!(wildcards.len(), 3),
+                Automaton::TermSet(_) => panic!("unexpected term set"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_query_counts_json_number_wildcards_with_their_field() {
+        let schema = make_schema(true);
+        let wildcards_on_fields = |num_fields: usize| {
+            QueryAst::Bool(BoolQuery {
+                must: (0..num_fields)
+                    .map(|i| {
+                        QueryAst::Wildcard(WildcardQuery {
+                            field: format!("field_{i}"),
+                            value: "2*".to_string(),
+                            lenient: false,
+                            case_insensitive: false,
+                        })
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+        };
+        // The text and number automatons of a path count as one field.
+        let context = BuildTantivyAstContext::for_test(&schema);
+        assert!(build_query(wildcards_on_fields(20), &context, None).is_ok());
+        let err = build_query(wildcards_on_fields(21), &context, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("distinct fields with regexes"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

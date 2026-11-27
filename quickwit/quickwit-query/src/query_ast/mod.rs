@@ -23,6 +23,7 @@ mod bool_query;
 mod cache_node;
 mod field_presence;
 mod full_text_query;
+mod json_number_wildcard;
 mod phrase_prefix_query;
 mod range_query;
 mod regex_query;
@@ -38,6 +39,9 @@ pub use bool_query::BoolQuery;
 pub use cache_node::{CacheNode, HitSet, PredicateCache, PredicateCacheInjector};
 pub use field_presence::FieldPresenceQuery;
 pub use full_text_query::{FullTextMode, FullTextParams, FullTextQuery};
+pub use json_number_wildcard::{
+    JsonNumberWildcard, JsonNumberWildcardAutomaton, JsonNumberWildcardState,
+};
 pub use phrase_prefix_query::PhrasePrefixQuery;
 pub use range_query::RangeQuery;
 pub use regex_query::{AutomatonQuery, JsonPathPrefix, RegexQuery};
@@ -348,6 +352,12 @@ impl JsonPath {
         term.append_type_and_str("");
         // Skip the first byte: it is a JSON-field marker that is not stored in the dictionary.
         JsonPath(term.value().as_serialized()[1..].to_owned())
+    }
+
+    /// Returns the prefix shared by the terms of every type of the JSON path: the path without
+    /// its trailing type code.
+    pub fn without_type_code(&self) -> Self {
+        JsonPath(self.0[..self.0.len().saturating_sub(1)].to_owned())
     }
 }
 
