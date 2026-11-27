@@ -20,8 +20,8 @@ use std::sync::RwLock;
 use bytesize::ByteSize;
 use once_cell::sync::Lazy;
 use quickwit_common::metrics::{
-    GaugeGuard, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, new_counter,
-    new_counter_vec, new_gauge, new_gauge_vec, new_histogram_vec,
+    GaugeGuard, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    new_counter, new_counter_vec, new_gauge, new_gauge_vec, new_histogram, new_histogram_vec,
 };
 use quickwit_config::CachePolicy;
 
@@ -45,6 +45,8 @@ pub struct StorageMetrics {
     pub object_storage_get_slice_in_flight_num_bytes: IntGauge,
     pub object_storage_get_object_connections_in_use: IntGaugeVec<1>,
     pub object_storage_get_object_connections_waiting: IntGaugeVec<1>,
+    pub object_storage_download_limiter_waiting: IntGauge,
+    pub object_storage_download_limiter_wait_seconds: Histogram,
     pub object_storage_download_num_bytes: IntCounterVec<2>,
     pub object_storage_download_errors: IntCounterVec<2>,
     pub object_storage_upload_num_bytes: IntCounterVec<1>,
@@ -128,7 +130,8 @@ impl Default for StorageMetrics {
                 "object_storage_get_object_connections_in_use",
                 "Number of GetObject attempts holding a connection permit (see \
                  QW_S3_MAX_GET_OBJECT_CONNECTIONS), from sending the request until the body is \
-                 fully read or dropped, by bucket. Retry backoff is not included.",
+                 fully read or dropped, by bucket. Retry backoff is not included, nor the wait \
+                 for the download bandwidth limiter once the permit is acquired.",
                 "storage",
                 &[],
                 ["bucket"],
@@ -139,6 +142,24 @@ impl Default for StorageMetrics {
                 "storage",
                 &[],
                 ["bucket"],
+            ),
+            object_storage_download_limiter_waiting: new_gauge(
+                "object_storage_download_limiter_waiting",
+                "Number of S3 downloads waiting for the download bandwidth limiter \
+                 (`QW_S3_MAX_DOWNLOAD_BYTES_PER_SEC`): GetObject requests reserving their first \
+                 window, with a connection permit already acquired, and bodies being read past \
+                 their first window.",
+                "storage",
+                &[],
+            ),
+            object_storage_download_limiter_wait_seconds: new_histogram(
+                "object_storage_download_limiter_wait_seconds",
+                "Time spent waiting for the S3 download bandwidth limiter, by acquisitions that \
+                 could not proceed right away.",
+                "storage",
+                vec![
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+                ],
             ),
             object_storage_download_num_bytes: new_counter_vec(
                 "object_storage_download_num_bytes",
