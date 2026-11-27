@@ -311,9 +311,12 @@ impl DownloadLimiter {
     async fn acquire(&self, num_bytes: u64) {
         // The largest acquisitions are a first window or an oversized frame plus a quantum.
         let num_permits = num_bytes.min(u32::MAX as u64) as u32;
-        if num_permits == 0 || self.try_acquire(num_permits) {
+        if num_permits == 0 {
             return;
         }
+        // Refills before taking the bytes: the bytes earned while the bucket was full must be
+        // discarded while it still is. Taking first, they would be added once the bucket has been
+        // emptied, letting a second burst through.
         self.refill();
         if self.try_acquire(num_permits) {
             return;
@@ -678,6 +681,19 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::ZERO);
         limiter.acquire(1_000_000).await;
         assert_around(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_download_limiter_full_bucket_does_not_accumulate() {
+        // The bucket starts full, then stays idle: the bytes earned meanwhile are discarded, so
+        // only one burst goes through without waiting.
+        let limiter = DownloadLimiter::new(1_000_000);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let start = Instant::now();
+        limiter.acquire(BURST).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        limiter.acquire(BURST).await;
+        assert_around(start.elapsed(), duration_of(BURST, 1_000_000));
     }
 
     #[tokio::test(start_paused = true)]
