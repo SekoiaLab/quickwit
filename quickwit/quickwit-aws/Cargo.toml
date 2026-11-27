@@ -20,7 +20,9 @@ aws-smithy-async = { workspace = true }
 aws-smithy-http-client = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
+http-body = { workspace = true }
 mini-moka = { workspace = true }
 once_cell = { workspace = true }
 rand = { workspace = true }
