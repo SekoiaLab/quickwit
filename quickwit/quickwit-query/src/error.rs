@@ -42,6 +42,11 @@ pub enum InvalidQuery {
     JsonFieldRootNotSearchable { full_path: String },
     #[error("user query should have been parsed")]
     UserQueryNotParsed,
+    #[error(
+        "regex and wildcard queries require more than {limit_bytes} bytes of automatons. use \
+         fewer or simpler patterns, for instance without leading wildcards"
+    )]
+    AutomatonMemoryLimitExceeded { limit_bytes: usize },
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

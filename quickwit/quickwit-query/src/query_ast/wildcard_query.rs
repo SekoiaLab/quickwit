@@ -186,6 +186,9 @@ impl BuildTantivyAst for WildcardQuery {
         };
         let regex =
             tantivy_fst::Regex::new(&regex).context("failed to parse regex built from wildcard")?;
+        if let Some(automaton_memory_budget) = context.automaton_memory_budget {
+            automaton_memory_budget.charge(regex.memory_usage())?;
+        }
         let regex_automaton_with_path = JsonPathPrefix {
             prefix: path.unwrap_or_default(),
             automaton: regex.into(),
