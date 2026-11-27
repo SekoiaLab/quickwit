@@ -12,40 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Process-wide limits on S3 downloads: the number of GetObject requests in flight and the
-//! download bandwidth. Both are shared by all buckets and all S3 storages of the process, and
-//! both serve requests in FIFO order.
+//! Process-wide limits on S3 downloads, shared by all buckets: the number of GetObject requests
+//! in flight (`QW_S3_MAX_GET_OBJECT_CONNECTIONS`) and the download bandwidth
+//! (`QW_S3_MAX_DOWNLOAD_BYTES_PER_SEC`, for instance `4GB`), both unlimited when unset.
 //!
-//! A GetObject request is admitted ([`admit_get_object`]) once it holds a connection permit and,
-//! when the bandwidth is limited, the first window of its response, in that order: the limiter
-//! only grants bandwidth to requests that can use it right away. The body of the response then
-//! holds the permit until it ends or is dropped ([`GetObjectAdmission::into_body`]).
-//!
-//! The bandwidth is limited by a single token bucket ([`DownloadLimiter`]).
-//!
-//! Where the bytes are charged matters. Delaying the reads of a response body only slows its
-//! sender down once the socket receive buffer of the connection is full: up to a receive window
-//! of data crosses the network at full speed whether or not the body is read. Many byte ranges
-//! fetched by searches are smaller than that. So every GET is charged in two parts:
-//! - before the request is sent, the bytes that will arrive regardless of reads, at most
-//!   [`FIRST_WINDOW_NUM_BYTES`]. They are refunded if no response arrives;
-//! - the rest of the body as it is read, [`READ_QUANTUM_NUM_BYTES`] at a time. Past the first
-//!   window, TCP flow control slows the sender down to the rate at which the body is read.
-//!
-//! When a body ends, the bytes acquired for it but not received are refunded. When it is dropped
-//! midway, they are not: they may be sitting in the socket buffer already.
-//!
-//! The bucket can go into debt: an acquisition only waits for the balance to be non-negative, then
-//! subtracts its whole size. A request larger than the burst is therefore admitted as soon as the
-//! previous debt is repaid, and the long-run rate is exact.
-//!
-//! Configured with `QW_S3_MAX_GET_OBJECT_CONNECTIONS` and `QW_S3_MAX_DOWNLOAD_BYTES_PER_SEC` (for
-//! instance `4GB`), both unlimited when unset.
+//! - Before a GetObject request is sent, [`admit_get_object`] waits for a connection permit, then
+//!   reserves the first window of the response. The first window is the part of the response that
+//!   arrives whether or not the body is read, at most [`FIRST_WINDOW_NUM_BYTES`]. The reservation
+//!   is given back if no response arrives.
+//! - The response body ([`GetObjectAdmission::into_body`]) keeps the connection permit until the
+//!   body ends or is dropped. The bytes beyond the first window are acquired as the body is read,
+//!   [`READ_QUANTUM_NUM_BYTES`] at a time: a frame that is not covered yet is held back until it
+//!   is. When the body ends, the bytes acquired but not received are given back.
+//! - The bandwidth limit is a token bucket ([`DownloadLimiter`]) built on a semaphore with one
+//!   permit per byte. It is refilled according to the elapsed time, up to a burst of
+//!   [`BURST_DURATION`]. Waiting acquisitions are served in FIFO order, and each refill wakes all
+//!   the acquisitions it satisfies at once. While acquisitions are waiting, one of them (the refill
+//!   leader) refills the bucket every [`REFILL_PERIOD`].
 
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -66,10 +54,18 @@ const MAX_GET_OBJECT_CONNECTIONS_ENV_KEY: &str = "QW_S3_MAX_GET_OBJECT_CONNECTIO
 
 const MAX_DOWNLOAD_BYTES_PER_SEC_ENV_KEY: &str = "QW_S3_MAX_DOWNLOAD_BYTES_PER_SEC";
 
-/// Number of bytes that can accumulate while no download is running, as a duration at the
-/// configured rate. It must exceed the resolution of the tokio timer (1ms): a waiter that
-/// oversleeps would otherwise lose the bytes refilled meanwhile.
+/// Number of bytes that can accumulate while downloads use less than the configured rate, as a
+/// duration at that rate. It must exceed [`REFILL_PERIOD`] by a wide margin: refills arriving late
+/// would otherwise be capped. The burst is also at least [`FIRST_WINDOW_NUM_BYTES`], so that a
+/// request does not wait for its own first window when bandwidth is available, and a refunded
+/// first window always fits.
+///
+/// After a period below the rate, downloads can exceed it by up to the burst: 10ms of traffic, or
+/// 1% over a second.
 const BURST_DURATION: Duration = Duration::from_millis(10);
+
+/// How often the waiting acquisitions get the bytes refilled since the last refill.
+const REFILL_PERIOD: Duration = Duration::from_millis(1);
 
 /// Number of bytes of a response that can arrive before its body is read: the receive window of
 /// the connection, plus the read-ahead buffer of the HTTP client (about 400KB).
@@ -233,104 +229,126 @@ struct ConnectionPermit {
     _in_use_guard: OwnedGaugeGuard,
 }
 
-/// A token bucket counting bytes, whose waiters are served in FIFO order.
+/// A token bucket counting bytes: a semaphore holding one permit per byte, refilled at the
+/// configured rate, up to a burst.
+///
+/// See the module documentation for how acquisitions wait and how the bucket is refilled.
 struct DownloadLimiter {
     bytes_per_sec: u64,
-    burst_num_bytes: i64,
-    /// Serializes the acquisitions: the holder is the head of the queue and the only one waiting
-    /// for the balance to become non-negative. The tokio mutex is fair, so the others are served
-    /// in the order they arrived.
-    queue: tokio::sync::Mutex<()>,
-    /// Never held across an await point, so refunds can be made from `Drop`.
-    balance: Mutex<Balance>,
-}
-
-struct Balance {
-    num_bytes: i64,
-    refilled_at: Instant,
+    /// See [`BURST_DURATION`].
+    burst_num_bytes: u64,
+    /// The bytes available, and the FIFO queue of the acquisitions waiting for more.
+    permits: Semaphore,
+    /// Time from which bytes are earned at the configured rate.
+    clock_start: Instant,
+    /// Bytes earned since `clock_start` that have been added to the bucket, or discarded because
+    /// it was full.
+    num_refilled_bytes: AtomicU64,
+    /// Held by the refill leader: the waiting acquisition that refills the bucket periodically on
+    /// behalf of all the waiting acquisitions. The others queue on it to take over.
+    refill_leader: tokio::sync::Mutex<()>,
 }
 
 impl DownloadLimiter {
     fn new(bytes_per_sec: u64) -> Self {
         let burst_num_bytes = (bytes_per_sec as u128 * BURST_DURATION.as_nanos() / 1_000_000_000)
-            .clamp(1, i64::MAX as u128) as i64;
+            .max(FIRST_WINDOW_NUM_BYTES as u128)
+            .min(Semaphore::MAX_PERMITS as u128) as u64;
         DownloadLimiter {
             bytes_per_sec,
             burst_num_bytes,
-            queue: tokio::sync::Mutex::new(()),
-            balance: Mutex::new(Balance {
-                num_bytes: burst_num_bytes,
-                refilled_at: Instant::now(),
-            }),
+            permits: Semaphore::new(burst_num_bytes as usize),
+            clock_start: Instant::now(),
+            num_refilled_bytes: AtomicU64::new(0),
+            refill_leader: tokio::sync::Mutex::new(()),
         }
     }
 
-    fn lock_balance(&self) -> std::sync::MutexGuard<'_, Balance> {
-        self.balance
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Charges `num_bytes` if the balance is non-negative. Otherwise, returns how long to wait
-    /// before it will be.
-    fn try_charge(&self, num_bytes: u64) -> Result<(), Duration> {
-        let now = Instant::now();
-        let mut balance = self.lock_balance();
-        let elapsed_nanos = now
-            .saturating_duration_since(balance.refilled_at)
-            .as_nanos();
-        let refill = (elapsed_nanos * self.bytes_per_sec as u128 / 1_000_000_000)
-            .min(i64::MAX as u128) as i64;
-        balance.num_bytes = balance
-            .num_bytes
-            .saturating_add(refill)
-            .min(self.burst_num_bytes);
-        balance.refilled_at = now;
-        if balance.num_bytes >= 0 {
-            balance.num_bytes = balance
-                .num_bytes
-                .saturating_sub(num_bytes.min(i64::MAX as u64) as i64);
-            return Ok(());
+    /// Adds the bytes earned since the last refill.
+    ///
+    /// The bytes earned since `clock_start` are a pure function of the time. A refill raises
+    /// `num_refilled_bytes` to that number and adds the difference: concurrent refills add
+    /// disjoint amounts, and since nothing is rounded but the total, nothing is lost however often
+    /// the bucket is refilled.
+    fn refill(&self) {
+        let elapsed_nanos = self.clock_start.elapsed().as_nanos();
+        let num_earned_bytes = (elapsed_nanos * self.bytes_per_sec as u128 / 1_000_000_000)
+            .min(u64::MAX as u128) as u64;
+        let num_refilled_bytes = self
+            .num_refilled_bytes
+            .fetch_max(num_earned_bytes, Ordering::AcqRel);
+        if num_earned_bytes > num_refilled_bytes {
+            self.add(num_earned_bytes - num_refilled_bytes);
         }
-        let deficit = balance.num_bytes.unsigned_abs() as u128;
-        let wait_nanos = (deficit * 1_000_000_000).div_ceil(self.bytes_per_sec as u128);
-        Err(Duration::from_nanos(wait_nanos.min(u64::MAX as u128) as u64))
     }
 
-    /// Adds `num_bytes` to the balance, without waiting: positive to give back bytes acquired
-    /// but not downloaded, negative to charge bytes downloaded but not acquired.
-    fn adjust(&self, num_bytes: i64) {
-        let mut balance = self.lock_balance();
-        balance.num_bytes = balance
-            .num_bytes
-            .saturating_add(num_bytes)
-            .min(self.burst_num_bytes);
+    /// Adds `num_bytes` to the bucket, up to the burst. The semaphore hands them to the
+    /// acquisitions at the front of its queue, if any.
+    ///
+    /// The cap does not shortchange the waiting acquisitions: while some are waiting, the
+    /// semaphore has handed every permit to them, so none is available and the whole burst can be
+    /// added at once, ten times what a refill period earns.
+    fn add(&self, num_bytes: u64) {
+        let num_available = self.permits.available_permits() as u64;
+        let num_added = num_bytes.min(self.burst_num_bytes.saturating_sub(num_available));
+        if num_added > 0 {
+            self.permits.add_permits(num_added as usize);
+        }
     }
 
-    /// Waits for the turn of this acquisition and for the balance to be non-negative, then
-    /// charges `num_bytes`. Dropping the future before it completes charges nothing.
+    fn try_acquire(&self, num_permits: u32) -> bool {
+        match self.permits.try_acquire_many(num_permits) {
+            Ok(permit) => {
+                permit.forget();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Waits for `num_bytes`, at most `u32::MAX`. Dropping the future before it completes charges
+    /// nothing.
     async fn acquire(&self, num_bytes: u64) {
-        // Fast path: nobody is waiting and the balance is non-negative.
-        if let Ok(_queue_guard) = self.queue.try_lock()
-            && self.try_charge(num_bytes).is_ok()
-        {
+        // The largest acquisitions are a first window or an oversized frame plus a quantum.
+        let num_permits = num_bytes.min(u32::MAX as u64) as u32;
+        if num_permits == 0 || self.try_acquire(num_permits) {
+            return;
+        }
+        self.refill();
+        if self.try_acquire(num_permits) {
             return;
         }
         let start = Instant::now();
         let mut waiting_guard =
             GaugeGuard::from_gauge(&STORAGE_METRICS.object_storage_download_limiter_waiting);
         waiting_guard.add(1);
-        let _queue_guard = self.queue.lock().await;
-        while let Err(wait) = self.try_charge(num_bytes) {
-            tokio::time::sleep(wait).await;
+        let acquire = self.permits.acquire_many(num_permits);
+        tokio::pin!(acquire);
+        tokio::select! {
+            biased;
+            permit_res = &mut acquire => {
+                permit_res.expect("the semaphore should never be closed").forget();
+            }
+            never = self.lead_refills() => match never {},
         }
         STORAGE_METRICS
             .object_storage_download_limiter_wait_seconds
             .observe(start.elapsed().as_secs_f64());
     }
 
+    /// Waits to become the refill leader, then refills the bucket every [`REFILL_PERIOD`]. Never
+    /// returns: it is dropped when its acquisition completes, which hands the leadership over to
+    /// the next waiting acquisition.
+    async fn lead_refills(&self) -> std::convert::Infallible {
+        let _leader_guard = self.refill_leader.lock().await;
+        loop {
+            tokio::time::sleep(REFILL_PERIOD).await;
+            self.refill();
+        }
+    }
+
     /// Acquires the first window of a GET before it is sent: [`FIRST_WINDOW_NUM_BYTES`], or the
-    /// size of the response if it is known to be smaller. The bytes are refunded if the
+    /// size of the response if it is known to be smaller. The bytes are given back if the
     /// returned reservation is dropped before a response arrives, for instance when the request
     /// fails or is cancelled.
     async fn reserve(&'static self, num_bytes_opt: Option<u64>) -> DownloadReservation {
@@ -355,79 +373,78 @@ struct DownloadReservation {
 impl DownloadReservation {
     /// The response has arrived: its body is charged from the reserved bytes, then as it is read.
     fn into_throttle(mut self) -> Throttle {
-        let credit = std::mem::take(&mut self.num_bytes).min(i64::MAX as u64) as i64;
         Throttle {
             limiter: self.limiter,
-            credit,
-            acquire_fut_opt: None,
+            credit: std::mem::take(&mut self.num_bytes),
+            held_frame_opt: None,
         }
     }
 }
 
 impl Drop for DownloadReservation {
     fn drop(&mut self) {
-        if self.num_bytes > 0 {
-            self.limiter
-                .adjust(self.num_bytes.min(i64::MAX as u64) as i64);
-        }
+        self.limiter.add(self.num_bytes);
     }
 }
 
 type AcquireFuture = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
 
-/// Charges the bytes of a response body to a [`DownloadLimiter`].
+/// A frame larger than the credit, held until the bytes it lacks are acquired.
+struct HeldFrame {
+    frame: Frame<Bytes>,
+    num_bytes: u64,
+    num_acquired_bytes: u64,
+    acquire_fut: AcquireFuture,
+}
+
+/// Charges the frames of a response body to a [`DownloadLimiter`].
 struct Throttle {
     limiter: &'static DownloadLimiter,
-    /// Bytes acquired and not received yet. A frame can be larger than the credit, in which case
-    /// it goes negative and the next acquisition pays back the difference.
-    credit: i64,
-    /// The acquisition in progress and its number of bytes.
-    acquire_fut_opt: Option<(AcquireFuture, u64)>,
+    /// Bytes acquired and not received yet.
+    credit: u64,
+    held_frame_opt: Option<HeldFrame>,
 }
 
 impl Throttle {
-    /// Waits for more bytes from the limiter if the credit is exhausted.
-    ///
-    /// A credit of exactly zero does not acquire anything: it is the common case of a body that
-    /// fit in its reservation, whose end has not been polled yet. Acquiring then would make it
-    /// wait in the queue only to give the bytes back at the end of the body. If more bytes come,
-    /// the credit goes negative and the next acquisition pays them back.
-    fn poll_acquire(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.credit >= 0 {
-            return Poll::Ready(());
+    /// Charges `frame` to the credit. Returns it if the credit covers it. Otherwise, holds it and
+    /// starts acquiring the bytes it lacks, plus [`READ_QUANTUM_NUM_BYTES`] for the next frames:
+    /// see [`Self::poll_held_frame`].
+    fn charge(&mut self, frame: Frame<Bytes>) -> Option<Frame<Bytes>> {
+        let num_bytes = frame.data_ref().map(|data| data.len() as u64).unwrap_or(0);
+        if num_bytes <= self.credit {
+            self.credit -= num_bytes;
+            return Some(frame);
         }
         let limiter = self.limiter;
-        let num_bytes = READ_QUANTUM_NUM_BYTES + self.credit.unsigned_abs();
-        let (acquire_fut, num_bytes) = self.acquire_fut_opt.get_or_insert_with(|| {
-            let acquire_fut: AcquireFuture =
-                Box::pin(async move { limiter.acquire(num_bytes).await });
-            (acquire_fut, num_bytes)
+        let num_acquired_bytes = num_bytes - self.credit + READ_QUANTUM_NUM_BYTES;
+        let acquire_fut: AcquireFuture =
+            Box::pin(async move { limiter.acquire(num_acquired_bytes).await });
+        self.held_frame_opt = Some(HeldFrame {
+            frame,
+            num_bytes,
+            num_acquired_bytes,
+            acquire_fut,
         });
-        ready!(acquire_fut.as_mut().poll(cx));
-        self.credit = self.credit.saturating_add(*num_bytes as i64);
-        self.acquire_fut_opt = None;
-        Poll::Ready(())
+        None
     }
 
-    fn consume(&mut self, num_bytes: usize) {
-        self.credit = self.credit.saturating_sub(num_bytes as i64);
+    /// Returns the held frame, if any, once the bytes it lacked are acquired.
+    fn poll_held_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Frame<Bytes>>> {
+        let Some(held_frame) = &mut self.held_frame_opt else {
+            return Poll::Ready(None);
+        };
+        ready!(held_frame.acquire_fut.as_mut().poll(cx));
+        let held_frame = self
+            .held_frame_opt
+            .take()
+            .expect("the frame should be held");
+        self.credit = self.credit + held_frame.num_acquired_bytes - held_frame.num_bytes;
+        Poll::Ready(Some(held_frame.frame))
     }
 
-    /// The body has ended: gives back the bytes acquired but not received, or charges the bytes
-    /// received but not acquired.
-    fn settle(mut self) {
-        self.limiter.adjust(std::mem::take(&mut self.credit));
-    }
-}
-
-impl Drop for Throttle {
-    fn drop(&mut self) {
-        // Dropped midway: the bytes received but not acquired are charged. Those acquired but not
-        // received are not given back, they may be in the socket buffer already. An acquisition in
-        // progress is dropped with `acquire_fut_opt` and charges nothing.
-        if self.credit < 0 {
-            self.limiter.adjust(self.credit);
-        }
+    /// The body has ended: gives back the bytes acquired but not received.
+    fn settle(self) {
+        self.limiter.add(self.credit);
     }
 }
 
@@ -454,11 +471,15 @@ impl AdmittedBody {
         ByteStream::new(SdkBody::from_body_1_x(body))
     }
 
-    fn end(&mut self) {
-        if let Some(throttle) = self.throttle_opt.take() {
-            throttle.settle();
+    /// Releases the admission if the inner body has ended. Called after every frame, since a
+    /// consumer may stop polling once `is_end_stream` returns true.
+    fn end_if_ended(&mut self, frame_opt: &Option<Result<Frame<Bytes>, BoxError>>) {
+        if frame_opt.is_none() || http_body::Body::is_end_stream(&self.inner) {
+            if let Some(throttle) = self.throttle_opt.take() {
+                throttle.settle();
+            }
+            self.connection_permit_opt = None;
         }
-        self.connection_permit_opt = None;
     }
 }
 
@@ -471,19 +492,23 @@ impl http_body::Body for AdmittedBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = self.get_mut();
-        if let Some(throttle) = &mut this.throttle_opt {
-            ready!(throttle.poll_acquire(cx));
-        }
-        let frame_opt = ready!(Pin::new(&mut this.inner).poll_frame(cx));
-        if let Some(throttle) = &mut this.throttle_opt
-            && let Some(Ok(frame)) = &frame_opt
-            && let Some(data) = frame.data_ref()
-        {
-            throttle.consume(data.len());
-        }
-        if frame_opt.is_none() || http_body::Body::is_end_stream(&this.inner) {
-            this.end();
-        }
+        let frame_opt = match &mut this.throttle_opt {
+            // A frame held until its bytes are acquired is yielded before polling the next one:
+            // meanwhile, the connection is not read, and TCP flow control slows the sender down.
+            Some(throttle) if throttle.held_frame_opt.is_some() => {
+                ready!(throttle.poll_held_frame(cx)).map(Ok)
+            }
+            Some(throttle) => match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
+                Some(Ok(frame)) => match throttle.charge(frame) {
+                    Some(frame) => Some(Ok(frame)),
+                    // Polls the acquisition right away, so that it registers the waker.
+                    None => ready!(throttle.poll_held_frame(cx)).map(Ok),
+                },
+                frame_or_error_opt => frame_or_error_opt,
+            },
+            None => ready!(Pin::new(&mut this.inner).poll_frame(cx)),
+        };
+        this.end_if_ended(&frame_opt);
         Poll::Ready(frame_opt)
     }
 
@@ -498,8 +523,8 @@ impl http_body::Body for AdmittedBody {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -600,44 +625,74 @@ mod tests {
         assert!(parse_max_download_bytes_per_sec(Some("fast")).is_err());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_download_limiter_enforces_rate() {
-        // 100MB/s, so a 1MB burst.
-        let limiter = DownloadLimiter::new(100_000_000);
-        let start = Instant::now();
-        // The burst, then 99MB at 100MB/s.
-        for _ in 0..100 {
-            limiter.acquire(1_000_000).await;
-        }
-        let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(980), "{elapsed:?}");
-        assert!(elapsed <= Duration::from_millis(1_000), "{elapsed:?}");
+    /// The burst of the limiters of the tests: their rates are low enough for the burst to be a
+    /// first window.
+    const BURST: u64 = FIRST_WINDOW_NUM_BYTES;
+
+    /// Returns the time to wait for `num_bytes` at `bytes_per_sec`.
+    fn duration_of(num_bytes: u64, bytes_per_sec: u64) -> Duration {
+        Duration::from_secs_f64(num_bytes as f64 / bytes_per_sec as f64)
+    }
+
+    fn assert_around(elapsed: Duration, expected: Duration) {
+        assert!(
+            elapsed.abs_diff(expected) <= Duration::from_millis(2),
+            "elapsed {elapsed:?}, expected {expected:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_download_limiter_admits_request_larger_than_burst() {
+    async fn test_download_limiter_enforces_rate() {
         let limiter = DownloadLimiter::new(100_000_000);
         let start = Instant::now();
-        // Larger than the burst: admitted right away, then repaid by the next acquisition.
+        // The burst, then the rest at 100MB/s.
+        for _ in 0..100 {
+            limiter.acquire(1_000_000).await;
+        }
+        assert_around(
+            start.elapsed(),
+            duration_of(100_000_000 - BURST, 100_000_000),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_download_limiter_request_larger_than_burst() {
+        let limiter = DownloadLimiter::new(100_000_000);
+        let start = Instant::now();
+        // Waits for the bytes beyond the burst.
         limiter.acquire(50_000_000).await;
+        assert_around(
+            start.elapsed(),
+            duration_of(50_000_000 - BURST, 100_000_000),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_download_limiter_refills_while_idle_up_to_burst() {
+        let limiter = DownloadLimiter::new(1_000_000);
+        limiter.acquire(BURST).await;
+        // Idle for longer than needed to refill the burst: only the burst accumulates.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let start = Instant::now();
+        limiter.acquire(BURST).await;
         assert_eq!(start.elapsed(), Duration::ZERO);
-        limiter.acquire(1).await;
-        let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(490), "{elapsed:?}");
-        assert!(elapsed <= Duration::from_millis(500), "{elapsed:?}");
+        limiter.acquire(1_000_000).await;
+        assert_around(start.elapsed(), Duration::from_secs(1));
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_download_limiter_serves_waiters_in_order() {
         let limiter = leak(DownloadLimiter::new(1_000_000));
-        // Puts the bucket 1s in debt.
-        limiter.acquire(1_010_000).await;
+        limiter.acquire(BURST).await;
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
         for task_id in 0..10 {
             let order = order.clone();
+            // Decreasing sizes: served by size rather than by arrival, they would complete in
+            // reverse order.
+            let num_bytes = 100_000 - task_id * 5_000;
             handles.push(tokio::spawn(async move {
-                limiter.acquire(10_000).await;
+                limiter.acquire(num_bytes).await;
                 order.lock().unwrap().push(task_id);
             }));
             // Lets the task enqueue before the next one.
@@ -649,57 +704,103 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), (0..10).collect::<Vec<_>>());
     }
 
-    /// Returns how long an acquisition of 1 byte waits, which is how long the debt of the limiter
-    /// takes to be repaid.
-    async fn debt_duration(limiter: &DownloadLimiter) -> Duration {
+    #[tokio::test(start_paused = true)]
+    async fn test_download_limiter_grants_waiters_together() {
+        // 100 waiters of 10KB at 1MB/s: each refill of 1ms covers one waiter, so they complete
+        // 1ms apart, the last one after 1s.
+        let limiter = leak(DownloadLimiter::new(1_000_000));
+        limiter.acquire(BURST).await;
         let start = Instant::now();
-        limiter.acquire(1).await;
-        start.elapsed()
+        let handles: Vec<_> = (0..100)
+            .map(|_| tokio::spawn(async move { limiter.acquire(10_000).await }))
+            .collect();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_around(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_download_limiter_refills_in_whole_bytes_without_loss() {
+        // 1 byte every 3 microseconds: refilling every microsecond earns a fraction of a byte
+        // each time, which must not be lost.
+        let limiter = DownloadLimiter::new(333_333);
+        limiter.acquire(BURST).await;
+        let start = Instant::now();
+        for _ in 0..30_000 {
+            tokio::time::advance(Duration::from_micros(1)).await;
+            limiter.refill();
+        }
+        // 30ms earned 10_000 bytes.
+        assert_eq!(limiter.permits.available_permits(), 9_999);
+        assert_eq!(start.elapsed(), Duration::from_millis(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_throttled_body_holds_frame_until_acquired() {
+        let limiter = leak(DownloadLimiter::new(1_000_000));
+        limiter.acquire(BURST).await;
+        let reservation = limiter.reserve(Some(1_000)).await;
+        let start = Instant::now();
+        // A single 2MB frame, 1KB of which is covered by the reservation: it is yielded once the
+        // bytes it lacks are acquired, plus a quantum.
+        let mut body = throttle(reservation, ByteStream::from(vec![7u8; 2_000_000]));
+        let frame = body.next().await.unwrap().unwrap();
+        assert_eq!(frame.len(), 2_000_000);
+        assert_around(
+            start.elapsed(),
+            duration_of(2_000_000 - 1_000 + READ_QUANTUM_NUM_BYTES, 1_000_000),
+        );
+        // The body has ended: the quantum was given back.
+        assert!(body.next().await.is_none());
+        let start = Instant::now();
+        limiter.acquire(READ_QUANTUM_NUM_BYTES).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_download_limiter_cancelled_acquisition_charges_nothing() {
+        let limiter = leak(DownloadLimiter::new(1_000_000));
+        limiter.acquire(BURST).await;
+        // Cancelled after 1s, halfway through.
+        let acquire_res =
+            tokio::time::timeout(Duration::from_secs(1), limiter.acquire(2_000_000)).await;
+        assert!(acquire_res.is_err());
+        // The bytes refilled for the cancelled acquisition are available.
+        let start = Instant::now();
+        limiter.acquire(900_000).await;
+        assert!(start.elapsed() <= Duration::from_millis(1));
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_download_reservation_first_window() {
-        // 1MB/s, so a 10KB burst.
         let limiter = leak(DownloadLimiter::new(1_000_000));
-        // A 50MB range only reserves its first window.
+        let start = Instant::now();
+        // A 50MB range only reserves its first window, which the burst covers.
         let reservation = limiter.reserve(Some(50_000_000)).await;
         let _body = throttle(reservation, ByteStream::default());
-        let debt = debt_duration(limiter).await;
-        let expected = Duration::from_secs_f64((FIRST_WINDOW_NUM_BYTES - 10_000) as f64 / 1e6);
-        assert!(
-            debt.abs_diff(expected) <= Duration::from_millis(1),
-            "{debt:?}"
-        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        limiter.acquire(1_000_000).await;
+        assert_around(start.elapsed(), Duration::from_secs(1));
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_download_reservation_refunded_without_response() {
         let limiter = leak(DownloadLimiter::new(1_000_000));
         drop(limiter.reserve(None).await);
-        assert_eq!(debt_duration(limiter).await, Duration::ZERO);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_download_limiter_cancelled_acquisition_charges_nothing() {
-        let limiter = leak(DownloadLimiter::new(1_000_000));
-        limiter.acquire(2_000_000).await;
-        // Waits for the 2s debt, cancelled after 1s.
-        let acquire_res =
-            tokio::time::timeout(Duration::from_secs(1), limiter.acquire(5_000_000)).await;
-        assert!(acquire_res.is_err());
         let start = Instant::now();
-        limiter.acquire(1).await;
-        let elapsed = start.elapsed();
-        assert!(elapsed <= Duration::from_millis(1_001), "{elapsed:?}");
+        limiter.acquire(BURST).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
-    /// Reads `body` with a reservation for a response of `num_bytes_opt`, then checks that
-    /// exactly `body_num_bytes` were charged at 10MB/s: the next acquisition goes through once
-    /// they are paid, minus the 100KB burst.
+    /// Reads `body` with a reservation for a response of `num_bytes_opt` at 10MB/s, then checks
+    /// that the bytes charged are `body_num_bytes`: the next acquisition goes through once they
+    /// are paid, minus the burst, give or take the quantum acquired ahead and given back at the
+    /// end of the body.
     async fn assert_body_charged(
         num_bytes_opt: Option<u64>,
         body: ByteStream,
-        body_num_bytes: usize,
+        body_num_bytes: u64,
     ) {
         let limiter = leak(DownloadLimiter::new(10_000_000));
         let start = Instant::now();
@@ -709,15 +810,24 @@ mod tests {
             .await
             .unwrap()
             .into_bytes();
-        assert_eq!(bytes.len(), body_num_bytes);
-        debt_duration(limiter).await;
+        assert_eq!(bytes.len() as u64, body_num_bytes);
+        limiter.acquire(1).await;
         let elapsed = start.elapsed();
-        let expected =
-            Duration::from_secs_f64(body_num_bytes.saturating_sub(100_000) as f64 / 10e6);
+        let min_elapsed = duration_of(body_num_bytes.saturating_sub(BURST), 10_000_000);
+        let max_elapsed = duration_of(
+            (body_num_bytes + READ_QUANTUM_NUM_BYTES).saturating_sub(BURST),
+            10_000_000,
+        ) + Duration::from_millis(2);
         assert!(
-            elapsed.abs_diff(expected) <= Duration::from_millis(2),
-            "{body_num_bytes}: {elapsed:?}"
+            elapsed >= min_elapsed && elapsed <= max_elapsed,
+            "{body_num_bytes}: {elapsed:?} not in {min_elapsed:?}..{max_elapsed:?}"
         );
+        // The unused part of the reservation was given back.
+        if body_num_bytes < BURST {
+            let start = Instant::now();
+            limiter.acquire(BURST - body_num_bytes - 1).await;
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -730,7 +840,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_throttled_body_charges_single_frame_body() {
-        // A single frame overdrawing the credit, settled when the body reports its end.
+        // A single frame overdrawing the credit, charged as debt when the body reports its end.
         let body = ByteStream::from(vec![7u8; 50_000_000]);
         assert_body_charged(Some(50_000_000), body, 50_000_000).await;
         // A range that fits in its reservation: no acquisition beyond it.
@@ -740,29 +850,28 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_throttled_body_paces_reads() {
-        // 10MB/s, so a 100KB burst.
         let limiter = leak(DownloadLimiter::new(10_000_000));
         let start = Instant::now();
         let reservation = limiter.reserve(None).await;
         let mut body = throttle(reservation, streamed_body(30_000_000, 64_000));
-        // The first window comes without waiting.
+        // The frames within the first window come without waiting.
         let mut num_bytes_read = 0;
-        while num_bytes_read < FIRST_WINDOW_NUM_BYTES as usize {
-            num_bytes_read += body.next().await.unwrap().unwrap().len();
+        while num_bytes_read + 64_000 <= FIRST_WINDOW_NUM_BYTES {
+            num_bytes_read += body.next().await.unwrap().unwrap().len() as u64;
         }
         assert_eq!(start.elapsed(), Duration::ZERO);
-        // The rest is paced: reading 10MB more ends once everything read so far, first window
-        // included, is paid, minus the 100KB burst and give or take the quantum acquired ahead.
-        while num_bytes_read < FIRST_WINDOW_NUM_BYTES as usize + 10_000_000 {
-            num_bytes_read += body.next().await.unwrap().unwrap().len();
+        // The rest is paced: reading 10MB more takes about 1s, give or take the quantum acquired
+        // ahead.
+        while num_bytes_read < FIRST_WINDOW_NUM_BYTES + 10_000_000 {
+            num_bytes_read += body.next().await.unwrap().unwrap().len() as u64;
         }
         let elapsed = start.elapsed();
-        let paid_num_bytes = (num_bytes_read - 100_000) as f64;
-        let min_elapsed =
-            Duration::from_secs_f64((paid_num_bytes - READ_QUANTUM_NUM_BYTES as f64) / 10e6);
-        let max_elapsed = Duration::from_secs_f64(paid_num_bytes / 10e6);
-        assert!(elapsed >= min_elapsed, "{elapsed:?}");
-        assert!(elapsed <= max_elapsed, "{elapsed:?}");
+        let min_elapsed = duration_of(num_bytes_read - BURST - READ_QUANTUM_NUM_BYTES, 10_000_000);
+        let max_elapsed = duration_of(num_bytes_read - BURST + READ_QUANTUM_NUM_BYTES, 10_000_000);
+        assert!(
+            elapsed >= min_elapsed && elapsed <= max_elapsed,
+            "{elapsed:?} not in {min_elapsed:?}..{max_elapsed:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -772,9 +881,83 @@ mod tests {
         let mut body = throttle(reservation, streamed_body(5_000, 1_000));
         body.next().await.unwrap().unwrap();
         drop(body);
-        // The reserved first window stays charged.
-        let first_window = Duration::from_secs_f64(FIRST_WINDOW_NUM_BYTES as f64 / 1e6);
-        assert!(debt_duration(limiter).await >= first_window - Duration::from_millis(10));
+        // The reserved first window stays charged: the bucket is empty.
+        let start = Instant::now();
+        limiter.acquire(1_000_000).await;
+        assert_around(start.elapsed(), Duration::from_secs(1));
+    }
+
+    /// Measures how many acquisitions per second the limiter serves on a busy runtime when the
+    /// bandwidth is not the bottleneck: busy tasks keep the workers occupied, so woken tasks wait
+    /// to be scheduled, as on a loaded searcher. Run with:
+    /// `cargo test --release -p quickwit-storage --lib download_limiter_loaded_runtime --
+    /// --ignored --nocapture`
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn download_limiter_loaded_runtime() {
+        const NUM_BUSY_TASKS: usize = 16;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for _ in 0..NUM_BUSY_TASKS {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    spin(std::time::Duration::from_micros(200));
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+        // Never binding: 1TB/s.
+        let limiter = leak(DownloadLimiter::new(1_000_000_000_000));
+        for (label, limiter_opt) in [("no limiter", None), ("limiter", Some(limiter))] {
+            run_requests(label, limiter_opt).await;
+        }
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    fn spin(duration: std::time::Duration) {
+        let spin_start = std::time::Instant::now();
+        while spin_start.elapsed() < duration {
+            std::hint::spin_loop();
+        }
+    }
+
+    async fn run_requests(label: &str, limiter_opt: Option<&'static DownloadLimiter>) {
+        const NUM_REQUESTS: usize = 2_000;
+        const ACQUISITIONS_PER_REQUEST: usize = 20;
+
+        let max_waiting = Arc::new(AtomicU64::new(0));
+        let start = std::time::Instant::now();
+        let handles: Vec<_> = (0..NUM_REQUESTS)
+            .map(|_| {
+                let max_waiting = max_waiting.clone();
+                tokio::spawn(async move {
+                    for _ in 0..ACQUISITIONS_PER_REQUEST {
+                        if let Some(limiter) = limiter_opt {
+                            limiter.acquire(256_000).await;
+                        }
+                        let waiting = STORAGE_METRICS
+                            .object_storage_download_limiter_waiting
+                            .get();
+                        max_waiting.fetch_max(waiting.max(0) as u64, Ordering::Relaxed);
+                        // Sending the request continues the same poll: a waiter woken by the
+                        // acquisition runs on this worker once the poll ends at the earliest.
+                        spin(std::time::Duration::from_micros(50));
+                        // The download itself.
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+        let num_acquisitions = NUM_REQUESTS * ACQUISITIONS_PER_REQUEST;
+        println!(
+            "{label}: {num_acquisitions} requests in {elapsed:?} = {:.0}/s, max waiting {}",
+            num_acquisitions as f64 / elapsed.as_secs_f64(),
+            max_waiting.load(Ordering::Relaxed),
+        );
     }
 
     /// Measures the CPU cost of the limiter. Run with:
