@@ -1184,6 +1184,110 @@ async fn test_search_dynamic_mode() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Returns the sorted `id`s of the documents matching the query.
+async fn search_ids(test_sandbox: &TestSandbox, query_ast: QueryAst) -> Vec<u64> {
+    let search_request = SearchRequest {
+        index_id_patterns: vec![test_sandbox.index_uid().index_id.to_string()],
+        query_ast: serde_json::to_string(&query_ast).unwrap(),
+        max_hits: 100,
+        ..Default::default()
+    };
+    let search_response = single_node_search(
+        search_request,
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await
+    .unwrap();
+    let mut ids: Vec<u64> = search_response
+        .hits
+        .iter()
+        .map(|hit| {
+            let doc: JsonValue = serde_json::from_str(&hit.json).unwrap();
+            doc["id"].as_u64().unwrap()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn test_search_wildcard_matches_numbers_of_dynamic_fields() -> anyhow::Result<()> {
+    // The dynamic mapping of the Sekoia event indices.
+    let doc_mapping_yaml = r#"
+            field_mappings: []
+            mode: dynamic
+            dynamic_mapping:
+                indexed: true
+                stored: true
+                tokenizer: raw
+                expand_dots: true
+                fast:
+                    normalizer: raw
+        "#;
+    let test_sandbox = TestSandbox::create(
+        "search_wildcard_dynamic_numbers",
+        doc_mapping_yaml,
+        "{}",
+        &[],
+    )
+    .await?;
+    // Numbers in one split, text in another.
+    test_sandbox
+        .add_documents(vec![
+            json!({"id": 1, "http": {"status": 200}}),
+            json!({"id": 2, "http": {"status": 404}}),
+            json!({"id": 3, "http": {"status": 200.5}}),
+            json!({"id": 4, "http": {"status": u64::MAX}}),
+            json!({"id": 5, "http": {"status": -12}}),
+            json!({"id": 6, "http": {"status": 2}}),
+        ])
+        .await?;
+    test_sandbox
+        .add_documents(vec![
+            json!({"id": 7, "http": {"status": "200"}}),
+            json!({"id": 8, "http": {"status": "2ab"}}),
+            json!({"id": 9, "http": {"other": 200}}),
+        ])
+        .await?;
+
+    let wildcard = |value: &str| {
+        QueryAst::Wildcard(quickwit_query::query_ast::WildcardQuery {
+            field: "http.status".to_string(),
+            value: value.to_string(),
+            lenient: false,
+            case_insensitive: false,
+        })
+    };
+    for (value, expected_ids) in [
+        ("2??", vec![1, 7, 8]),
+        ("2*", vec![1, 3, 6, 7, 8]),
+        ("*04", vec![2]),
+        ("4?4", vec![2]),
+        ("-1?", vec![5]),
+        ("200.5", vec![3]),
+        ("1844674407370955161?", vec![4]),
+        ("2?b", vec![8]),
+        ("3*", vec![]),
+    ] {
+        assert_eq!(
+            search_ids(&test_sandbox, wildcard(value)).await,
+            expected_ids,
+            "http.status: {value}"
+        );
+    }
+    // Through the query language.
+    let query_ast = query_ast_from_user_text("http.status:2*", None)
+        .parse_user_query(&[])
+        .unwrap();
+    assert_eq!(
+        search_ids(&test_sandbox, query_ast).await,
+        vec![1, 3, 6, 7, 8]
+    );
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_search_dynamic_mode_expand_dots() -> anyhow::Result<()> {
     let doc_mapping_yaml = r#"

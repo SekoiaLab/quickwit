@@ -40,6 +40,7 @@ pub(crate) use field_mapping_entry::{
 pub(crate) use field_mapping_entry::{QuickwitNumericOptions, QuickwitTextOptions};
 pub use field_mapping_type::FieldMappingType;
 use quickwit_query::JsonPath;
+use quickwit_query::query_ast::JsonNumberWildcard;
 use serde_json::Value as JsonValue;
 use tantivy::Term;
 use tantivy::schema::{Field, FieldType};
@@ -86,6 +87,10 @@ pub enum Automaton {
     Regex(Option<JsonPath>, Vec<String>),
     /// An exact-match automaton for a TermSet query.
     TermSet(ExactSetAutomaton),
+    /// One or more wildcards matched against the numbers of a JSON field. They are warmed up as a
+    /// single automaton matching any of them. The path is the prefix shared by the terms of every
+    /// type of the field (no type code).
+    JsonNumberWildcard(JsonPath, Vec<JsonNumberWildcard>),
 }
 
 /// A byte-level DFA that accepts exactly the strings in a sorted, deduplicated byte-sequence

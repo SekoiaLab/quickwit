@@ -88,6 +88,14 @@ Examples:
 - `field:quick*` will match any document where the field 'field' has a token like `quickwit` or `quickstart`, but not `qui` or `abcd`.
 - `field:h?llo` will match any document where the field 'field' has a token like `hello` or `hallo`, but not `heillo` or `hllo`.
 
+On a JSON field, the wildcard also matches the numbers whose decimal text matches it, the way a term query on a JSON field matches both `"200"` and `200`:
+- `json.status:2??` will match `200`, `299` and `"2xx"`, but not `2000` or `200.5`.
+- `json.status:*04` will match `404` and `1004`.
+
+Integers are written without leading zeros or `+` sign, and floats without exponent (`200.5`, `0.0000001`).
+
+A wildcard starting with digits (`2??`, `-1*`) skips the integers that can't match it, without reading them. Every other number of the field is read and checked: all of them for a wildcard starting with `*` or `?`, and the floats (non-integral values) whatever the wildcard. A wildcard containing a character that no number has, such as a letter, doesn't read any number.
+
 Queries with prefixes (`field:qui*`) are much more efficient than queries starting with a wildcard (`field:*wit`)
 
 

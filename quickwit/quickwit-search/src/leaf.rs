@@ -34,7 +34,8 @@ use quickwit_proto::search::{
 };
 use quickwit_query::JsonPath;
 use quickwit_query::query_ast::{
-    BoolQuery, CacheNode, QueryAst, QueryAstTransformer, RangeQuery, TermQuery,
+    BoolQuery, CacheNode, JsonNumberWildcardAutomaton, QueryAst, QueryAstTransformer, RangeQuery,
+    TermQuery,
 };
 use quickwit_query::tokenizers::TokenizerManager;
 use quickwit_storage::{
@@ -438,6 +439,39 @@ async fn warm_up_automatons(
                             )
                             .await
                             .context("failed to warm term set"),
+                        Automaton::JsonNumberWildcard(path, number_wildcards) => {
+                            let number_wildcards = number_wildcards.clone();
+                            let automaton = crate::search_thread_pool()
+                                .run_cpu_intensive_with_priority(
+                                    priority,
+                                    move || {
+                                        JsonNumberWildcardAutomaton::from_wildcards(
+                                            &number_wildcards,
+                                        )
+                                    },
+                                    "automaton_warmup_build",
+                                )
+                                .await
+                                .context("number wildcard build panicked during warmup")??;
+                            let field_path =
+                                full_path(*field, &Some(path.clone()), searcher.schema());
+                            inv_idx_clone
+                                .warm_postings_automaton(
+                                    quickwit_query::query_ast::JsonPathPrefix {
+                                        automaton: Arc::new(automaton),
+                                        prefix: path.clone(),
+                                    },
+                                    cpu_intensive_executor("automaton_warmup_select_blocks"),
+                                    cpu_intensive_executor("automaton_warmup_scan_terms"),
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "failed to warm postings from number wildcard for field \
+                                         `{field_path}`",
+                                    )
+                                })
+                        }
                     }
                 });
             }

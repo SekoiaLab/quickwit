@@ -783,6 +783,8 @@ Query matching only documents containing a non-null value for a given field.
 
 Returns documents that contain a specific prefix in a provided field.
 
+On a JSON field, such as a field of the dynamic mapping, it also matches the numbers whose decimal text matches the prefix: `{"prefix": {"http.status": "2"}}` matches the values `"200"`, `2`, `200` and `2.5`. See [wildcard queries](query-language.md#wildcard-fieldwilcard) for how numbers are written and read.
+
 #### Example
 
 ```json
@@ -811,6 +813,8 @@ Returns documents that contain a specific prefix in a provided field.
 Returns documents that contain terms matching a wildcard pattern:
 * `?` replaces one and only one term character
 * `*` replaces any number of term characters or an empty string
+
+On a JSON field, such as a field of the dynamic mapping, it also matches the numbers whose decimal text matches the pattern: `{"wildcard": {"http.status": "2??"}}` matches the values `"200"`, `200` and `299`, but not `200.5`. See [wildcard queries](query-language.md#wildcard-fieldwilcard) for how numbers are written and read.
 
 #### Example
 

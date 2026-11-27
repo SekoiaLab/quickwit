@@ -19,6 +19,8 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use tantivy::schema::{Field, FieldType, Schema as TantivySchema};
 
+use super::json_number_wildcard::{JsonNumberWildcard, can_match_numbers};
+use super::tantivy_query_ast::TantivyBoolQuery;
 use super::{BuildTantivyAst, QueryAst};
 use crate::query_ast::{AutomatonQuery, BuildTantivyAstContext, JsonPathPrefix, TantivyQueryAst};
 use crate::tokenizers::TokenizerManager;
@@ -40,7 +42,7 @@ impl From<WildcardQuery> for QueryAst {
     }
 }
 
-fn parse_wildcard_query(mut query: &str) -> Vec<SubQuery> {
+pub(super) fn parse_wildcard_query(mut query: &str) -> Vec<SubQuery> {
     let mut res = Vec::new();
     while let Some(pos) = query.find(['*', '?', '\\']) {
         if pos > 0 {
@@ -70,7 +72,7 @@ fn parse_wildcard_query(mut query: &str) -> Vec<SubQuery> {
     res
 }
 
-enum SubQuery {
+pub(super) enum SubQuery {
     Text(String),
     Wildcard,
     QuestionMark,
@@ -170,6 +172,27 @@ impl WildcardQuery {
             )),
         }
     }
+
+    /// Returns the automaton matching the numbers of a JSON field whose decimal text matches the
+    /// wildcard, if any can: the regex of `to_regex` only matches the text values of the field.
+    ///
+    /// `json_path` is the one `to_regex` returned. The returned JSON path is the prefix shared by
+    /// the terms of every type of the field, which the automaton follows.
+    pub fn to_json_number_wildcard(
+        &self,
+        json_path: Option<&JsonPath>,
+    ) -> Option<(JsonPath, JsonNumberWildcard)> {
+        let json_path = json_path?;
+        let number_wildcard =
+            JsonNumberWildcard::from_sub_queries(&parse_wildcard_query(&self.value))?;
+        Some((json_path.without_type_code(), number_wildcard))
+    }
+
+    /// Returns whether a number can match the wildcard, whatever the field: on a JSON field, such
+    /// a wildcard runs a second automaton, on the numbers of the field.
+    pub fn can_match_numbers(&self) -> bool {
+        can_match_numbers(&parse_wildcard_query(&self.value))
+    }
 }
 
 impl BuildTantivyAst for WildcardQuery {
@@ -184,23 +207,39 @@ impl BuildTantivyAst for WildcardQuery {
             }
             Err(e) => return Err(e),
         };
+        let number_wildcard = self.to_json_number_wildcard(path.as_ref());
         let regex =
             tantivy_fst::Regex::new(&regex).context("failed to parse regex built from wildcard")?;
         let regex_automaton_with_path = JsonPathPrefix {
             prefix: path.unwrap_or_default(),
             automaton: regex.into(),
         };
-        let regex_query_with_path = AutomatonQuery {
+        let regex_query_with_path: TantivyQueryAst = AutomatonQuery {
             field,
             automaton: Arc::new(regex_automaton_with_path),
+        }
+        .into();
+        let Some((number_path, number_wildcard)) = number_wildcard else {
+            return Ok(regex_query_with_path);
         };
-        Ok(regex_query_with_path.into())
+        let number_query_with_path = AutomatonQuery {
+            field,
+            automaton: Arc::new(JsonPathPrefix {
+                prefix: number_path,
+                automaton: Arc::new(number_wildcard.to_automaton()?),
+            }),
+        };
+        Ok(TantivyBoolQuery {
+            should: vec![regex_query_with_path, number_query_with_path.into()],
+            ..Default::default()
+        }
+        .into())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use tantivy::schema::{TextFieldIndexing, TextOptions};
+    use tantivy::schema::{TEXT, TextFieldIndexing, TextOptions};
 
     use super::*;
     use crate::create_default_quickwit_tokenizer_manager;
@@ -437,5 +476,72 @@ mod tests {
         let schema = single_text_field_schema("text_field", "raw");
         let (_field, _path, regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
         assert_eq!(regex, "(?i)abc123.*");
+    }
+
+    fn json_field_schema() -> TantivySchema {
+        let mut schema_builder = TantivySchema::builder();
+        let text_options = TextOptions::default()
+            .set_indexing_options(TextFieldIndexing::default().set_tokenizer("raw"));
+        schema_builder.add_json_field("json_field", text_options);
+        schema_builder.add_text_field("text_field", TEXT);
+        schema_builder.build()
+    }
+
+    fn wildcard_query(field: &str, value: &str) -> WildcardQuery {
+        WildcardQuery {
+            field: field.to_string(),
+            value: value.to_string(),
+            lenient: false,
+            case_insensitive: false,
+        }
+    }
+
+    #[test]
+    fn test_wildcard_query_to_json_number_wildcard() {
+        let schema = json_field_schema();
+        let tokenizer_manager = create_default_quickwit_tokenizer_manager();
+
+        let query = wildcard_query("json_field.status", "2??");
+        assert!(query.can_match_numbers());
+        let (_field, path, _regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
+        let (number_path, _) = query.to_json_number_wildcard(path.as_ref()).unwrap();
+        assert_eq!(number_path.0, "status\0".as_bytes());
+
+        // No number has a letter in its text.
+        let query = wildcard_query("json_field.status", "2?a");
+        assert!(!query.can_match_numbers());
+        let (_field, path, _regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
+        assert!(query.to_json_number_wildcard(path.as_ref()).is_none());
+
+        // A text field has no number.
+        let query = wildcard_query("text_field", "2??");
+        let (_field, path, _regex) = query.to_regex(&schema, &tokenizer_manager).unwrap();
+        assert!(query.to_json_number_wildcard(path.as_ref()).is_none());
+    }
+
+    #[test]
+    fn test_wildcard_query_matches_numbers_on_json_fields() {
+        let schema = json_field_schema();
+        let context = BuildTantivyAstContext::for_test(&schema);
+
+        let TantivyQueryAst::Bool(bool_query) = wildcard_query("json_field.status", "2??")
+            .build_tantivy_ast_call(&context)
+            .unwrap()
+        else {
+            panic!("expected a bool query on the text and the number terms");
+        };
+        assert_eq!(bool_query.should.len(), 2);
+        assert!(bool_query.must.is_empty());
+        assert!(bool_query.filter.is_empty());
+
+        for (field, value) in [("json_field.status", "2?a"), ("text_field", "2??")] {
+            let tantivy_ast = wildcard_query(field, value)
+                .build_tantivy_ast_call(&context)
+                .unwrap();
+            assert!(
+                matches!(tantivy_ast, TantivyQueryAst::Leaf(_)),
+                "{field}: {value}"
+            );
+        }
     }
 }
