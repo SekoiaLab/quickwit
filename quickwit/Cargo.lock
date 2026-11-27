@@ -7075,6 +7075,7 @@ dependencies = [
  "tantivy",
  "tantivy-fst",
  "thiserror 2.0.17",
+ "tikv-jemallocator",
  "time",
  "tracing",
 ]
